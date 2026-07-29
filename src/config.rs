@@ -4,17 +4,17 @@
 //! light values measured off `Dolphin_screenshot.png`; see `docs/UI_SPEC.md`
 //! for the sample points.
 //!
-//! The tables are hand-aligned, so they carry `#[rustfmt::skip]`. Keep the
-//! columns lined up when you add a row; that is the whole point.
+//! The tables are hand-aligned, and `rustfmt.toml` ignores this file so they
+//! stay that way — but `ignore` is a nightly option, so format with
+//! `cargo +nightly fmt`. Stable `cargo fmt` warns and reformats anyway.
+//! Keep the columns lined up when you add a row; that is the whole point.
 
 use ratatui::style::Color;
 
 /* Breeze palette. Truecolor: terminals that cannot do 24-bit will degrade,
  * which is their business, not ours. */
-#[rustfmt::skip]
 pub mod color {
     use super::Color;
-
     /*        name        r    g    b       used for                            */
     pub const TOOLBAR_BG: Color = Color::Rgb(244, 245, 246); /* toolbar, breadcrumb, tab strip  */
     pub const PANEL_BG  : Color = Color::Rgb(239, 240, 241); /* Places and Information panels   */
@@ -35,7 +35,6 @@ pub mod color {
 
 /* Icon stand-ins. A terminal cell is not 48x48 px; these are the closest
  * unambiguous glyphs in a standard Nerd-font-free environment. */
-#[rustfmt::skip]
 pub mod glyph {
     /*        name           escape                 glyph  where it appears */
     pub const FOLDER       : &str = "\u{1f5c0}"; /* 🗀  directory entry      */
@@ -71,17 +70,16 @@ pub mod glyph {
 }
 
 /* Panel geometry and tunables. */
-#[rustfmt::skip] pub const PLACES_WIDTH        : u16   = 22  ; /* Places panel columns, the screenshot's 150 px */
-#[rustfmt::skip] pub const INFO_WIDTH          : u16   = 30  ; /* Information panel columns (F11)               */
-#[rustfmt::skip] pub const DEFAULT_ZOOM        : usize = 3   ; /* index into ZOOM_LEVELS at startup             */
-#[rustfmt::skip] pub const TYPEAHEAD_TIMEOUT_MS: u128  = 1000; /* type-ahead buffer life without a keystroke    */
-#[rustfmt::skip] pub const WATCH_DEBOUNCE_MS   : u64   = 120 ; /* coalescing window for inotify storms          */
-#[rustfmt::skip] pub const TICK_MS             : u64   = 40  ; /* event loop tick; listing/thumbnail poll rate  */
-#[rustfmt::skip] pub const DRAG_THRESHOLD      : u16   = 1   ; /* cells of movement before a drag begins        */
-#[rustfmt::skip] pub const THUMB_CACHE_CAP     : usize = 512 ; /* decoded thumbnails held in memory             */
+pub const PLACES_WIDTH        : u16   = 22  ; /* Places panel columns, the screenshot's 150 px */
+pub const INFO_WIDTH          : u16   = 30  ; /* Information panel columns (F11)               */
+pub const DEFAULT_ZOOM        : usize = 3   ; /* index into ZOOM_LEVELS at startup             */
+pub const TYPEAHEAD_TIMEOUT_MS: u128  = 1000; /* type-ahead buffer life without a keystroke    */
+pub const WATCH_DEBOUNCE_MS   : u64   = 120 ; /* coalescing window for inotify storms          */
+pub const TICK_MS             : u64   = 40  ; /* event loop tick; listing/thumbnail poll rate  */
+pub const DRAG_THRESHOLD      : u16   = 1   ; /* cells of movement before a drag begins        */
+pub const THUMB_CACHE_CAP     : usize = 512 ; /* decoded thumbnails held in memory             */
 
 /* Dolphin's zoom slider has ten stops. Compact and Details derive from these. */
-#[rustfmt::skip]
 pub const ZOOM_LEVELS: [(u16, u16); 10] = [
     /* w   h  */
       (10, 3 ),
@@ -97,9 +95,7 @@ pub const ZOOM_LEVELS: [(u16, u16); 10] = [
 ];
 
 /* File classification by extension. */
-#[rustfmt::skip]
 pub const IMAGE_EXTS  : &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp", "ico", "tif", "tiff"];
-#[rustfmt::skip]
 pub const ARCHIVE_EXTS: &[&str] = &["tar", "gz", "tgz", "bz2", "xz", "zst", "zip", "7z", "rar"];
 
 // ---------------------------------------------------------------------------
@@ -111,30 +107,29 @@ use crossterm::event::{KeyCode as K, KeyModifiers as M};
 /* Everything the user can ask for. Adding a feature means adding a variant
  * here and a row in the tables below — the keymap is data, not a match arm
  * buried in the event loop. */
-#[rustfmt::skip]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
     /* navigation */
-    Back        ,
-    Forward     ,
-    GoUp        ,
-    GoHome      ,
-    Open        ,
-    OpenInNewTab,
-    Refresh     ,
+    Back           ,
+    Forward        ,
+    GoUp           ,
+    GoHome         ,
+    Open           ,
+    OpenInNewTab   ,
+    Refresh        ,
     /* cursor */
-    MoveDown    ,
-    MoveUp      ,
-    MoveLeft    ,
-    MoveRight   ,
-    Top         ,
-    Bottom      ,
-    HalfPageDown,
-    HalfPageUp  ,
-    PageDown    ,
-    PageUp      ,
-    RowStart    ,
-    RowEnd      ,
+    MoveDown       ,
+    MoveUp         ,
+    MoveLeft       ,
+    MoveRight      ,
+    Top            ,
+    Bottom         ,
+    HalfPageDown   ,
+    HalfPageUp     ,
+    PageDown       ,
+    PageUp         ,
+    RowStart       ,
+    RowEnd         ,
     /* selection */
     ToggleSelect   ,
     SelectAll      ,
@@ -142,20 +137,20 @@ pub enum Action {
     EnterVisual    ,
     EnterVisualLine,
     /* file operations */
-    Copy      ,
-    Cut       ,
-    Paste     ,
-    Trash     ,
-    DeletePerm,
-    Rename    ,
-    NewFolder ,
-    NewFile   ,
-    Undo      ,
-    Properties,
-    Compress  ,
-    Extract   ,
-    EmptyTrash,
-    Restore   ,
+    Copy           ,
+    Cut            ,
+    Paste          ,
+    Trash          ,
+    DeletePerm     ,
+    Rename         ,
+    NewFolder      ,
+    NewFile        ,
+    Undo           ,
+    Properties     ,
+    Compress       ,
+    Extract        ,
+    EmptyTrash     ,
+    Restore        ,
     /* view */
     ViewIcons      ,
     ViewCompact    ,
@@ -179,29 +174,28 @@ pub enum Action {
     ToggleSortOrder,
     ToggleDirsFirst,
     /* tabs */
-    NewTab  ,
-    CloseTab,
-    NextTab ,
-    PrevTab ,
+    NewTab         ,
+    CloseTab       ,
+    NextTab        ,
+    PrevTab        ,
     /* modes */
-    EnterCommand ,
-    EnterSearch  ,
-    SearchNext   ,
-    SearchPrev   ,
-    EnterPathEdit,
+    EnterCommand   ,
+    EnterSearch    ,
+    SearchNext     ,
+    SearchPrev     ,
+    EnterPathEdit  ,
     /* misc */
-    TerminalPanel,
-    TerminalHere ,
-    DragOut      ,
-    DropIn       ,
-    OpenMenu     ,
-    OpenViewMenu ,
-    OpenSortMenu ,
-    Help         ,
-    QuitAll      ,
+    TerminalPanel  ,
+    TerminalHere   ,
+    DragOut        ,
+    DropIn         ,
+    OpenMenu       ,
+    OpenViewMenu   ,
+    OpenSortMenu   ,
+    Help           ,
+    QuitAll        ,
 }
 
-#[rustfmt::skip]
 pub struct Bind {
     pub code  : K     , /* the key itself                    */
     pub mods  : M     , /* modifiers that must match exactly */
@@ -213,7 +207,6 @@ const fn b(code: K, mods: M, action: Action) -> Bind {
 }
 
 /* Dolphin's native shortcuts. Active in every non-text mode, alongside vim. */
-#[rustfmt::skip]
 pub const DOLPHIN_KEYS: &[Bind] = &[
     /* key          modifiers                   action                 */
     b(K::Left     , M::ALT                    , Action::Back           ),
@@ -272,7 +265,6 @@ pub const DOLPHIN_KEYS: &[Bind] = &[
 /* The vim layer. Consulted first, so `h`/`j`/`k`/`l` are motions; any
  * printable key that lands in neither table falls through to Dolphin's
  * type-ahead jump-to-name. */
-#[rustfmt::skip]
 pub const VIM_KEYS: &[Bind] = &[
     /* key          modifiers   action                 */
     b(K::Char('h'), M::NONE   , Action::MoveLeft       ),
@@ -308,7 +300,6 @@ pub const VIM_KEYS: &[Bind] = &[
 ];
 
 /* Two-key sequences: press the leader, then the follower. */
-#[rustfmt::skip]
 pub const CHORDS: &[(char, char, Action)] = &[
     /* lead  then  action              */
       ('g', 'g' , Action::Top         ),
@@ -325,5 +316,4 @@ pub const CHORDS: &[(char, char, Action)] = &[
 ];
 
 /* Leaders that must wait for a second key rather than acting immediately. */
-#[rustfmt::skip]
 pub const CHORD_LEADERS: &[char] = &['g', 'z', 'c'];
