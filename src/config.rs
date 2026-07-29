@@ -42,25 +42,25 @@ pub mod glyph {
     pub const FILE         : &str = "\u{1f5cb}"; /* 🗋  regular file         */
     pub const SYMLINK      : &str = "\u{2937}" ; /* ⤷  link                 */
     pub const HOME         : &str = "\u{2302}" ; /* ⌂  Places: Home         */
-    pub const TRASH        : &str = "\u{1f5d1}"; /* 🗑  Places: Trash        */
+    pub const TRASH        : &str = "\u{1f5d1}"; /* 🗑  Places: Trash       */
     pub const NETWORK      : &str = "\u{25cc}" ; /* ◌  Places: Network      */
     pub const DEVICE       : &str = "\u{25a3}" ; /* ▣  Places: Devices      */
-    pub const CLOCK        : &str = "\u{1f5d3}"; /* 🗓  Places: Recent       */
+    pub const CLOCK        : &str = "\u{1f5d3}"; /* 🗓  Places: Recent      */
     pub const DOWNLOAD     : &str = "\u{2913}" ; /* ⤓  Places: Downloads    */
     pub const DOCUMENT     : &str = "\u{1f5ce}"; /* 🗎  Places: Documents    */
     pub const MUSIC        : &str = "\u{266a}" ; /* ♪  Places: Music        */
-    pub const PICTURE      : &str = "\u{1f5bb}"; /* 🖻  Places: Pictures      */
-    pub const VIDEO        : &str = "\u{1f5b7}"; /* 🖷  Places: Videos        */
-    pub const ARCHIVE      : &str = "\u{1f5c3}"; /* 🗃  archive file         */
+    pub const PICTURE      : &str = "\u{1f5bb}"; /* 🖻  Places: Pictures     */
+    pub const VIDEO        : &str = "\u{1f5b7}"; /* 🖷  Places: Videos       */
+    pub const ARCHIVE      : &str = "\u{1f5c3}"; /* 🗃  archive file        */
     pub const BACK         : &str = "\u{2190}" ; /* ←  toolbar              */
     pub const FORWARD      : &str = "\u{2192}" ; /* →  toolbar              */
     pub const UP           : &str = "\u{2191}" ; /* ↑  toolbar              */
     pub const VIEW_ICONS   : &str = "\u{25a6}" ; /* ▦  toolbar view button  */
-    pub const VIEW_COMPACT : &str = "\u{2630}" ; /* ☰  toolbar view button  */
+    pub const VIEW_COMPACT : &str = "\u{2630}" ; /* ☰  toolbar view button */
     pub const VIEW_DETAILS : &str = "\u{2261}" ; /* ≡  toolbar view button  */
     pub const SPLIT        : &str = "\u{25a5}" ; /* ▥  toolbar Split        */
-    pub const SEARCH       : &str = "\u{1f50d}"; /* 🔍  toolbar Search       */
-    pub const MENU         : &str = "\u{2630}" ; /* ☰  toolbar hamburger    */
+    pub const SEARCH       : &str = "\u{1f50d}"; /* 🔍  toolbar Search      */
+    pub const MENU         : &str = "\u{2630}" ; /* ☰  toolbar hamburger   */
     pub const DROPDOWN     : &str = "\u{25be}" ; /* ▾  split-button arrow   */
     pub const CRUMB_SEP    : &str = "\u{203a}" ; /* ›  breadcrumb separator */
     pub const SORT_ASC     : &str = "\u{25b4}" ; /* ▴  Details column head  */
@@ -104,107 +104,7 @@ pub const ARCHIVE_EXTS: &[&str] = &["tar", "gz", "tgz", "bz2", "xz", "zst", "zip
 
 use crossterm::event::{KeyCode as K, KeyModifiers as M};
 
-/* Everything the user can ask for. Adding a feature means adding a variant
- * here and a row in the tables below — the keymap is data, not a match arm
- * buried in the event loop. */
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Action {
-    /* navigation */
-    Back           ,
-    Forward        ,
-    GoUp           ,
-    GoHome         ,
-    Open           ,
-    OpenInNewTab   ,
-    Refresh        ,
-    /* cursor */
-    MoveDown       ,
-    MoveUp         ,
-    MoveLeft       ,
-    MoveRight      ,
-    Top            ,
-    Bottom         ,
-    HalfPageDown   ,
-    HalfPageUp     ,
-    PageDown       ,
-    PageUp         ,
-    RowStart       ,
-    RowEnd         ,
-    /* selection */
-    ToggleSelect   ,
-    SelectAll      ,
-    InvertSelect   ,
-    EnterVisual    ,
-    EnterVisualLine,
-    /* file operations */
-    Copy           ,
-    Cut            ,
-    Paste          ,
-    Trash          ,
-    DeletePerm     ,
-    Rename         ,
-    NewFolder      ,
-    NewFile        ,
-    Undo           ,
-    Properties     ,
-    Compress       ,
-    Extract        ,
-    EmptyTrash     ,
-    Restore        ,
-    /* view */
-    ViewIcons      ,
-    ViewCompact    ,
-    ViewDetails    ,
-    CycleView      ,
-    ToggleHidden   ,
-    ZoomIn         ,
-    ZoomOut        ,
-    ToggleSplit    ,
-    SwapPane       ,
-    TogglePlaces   ,
-    ToggleInfo     ,
-    ToggleFilterBar,
-    ToggleGrouping ,
-    ToggleExpand   ,
-    /* sorting */
-    SortName       ,
-    SortSize       ,
-    SortDate       ,
-    SortType       ,
-    ToggleSortOrder,
-    ToggleDirsFirst,
-    /* tabs */
-    NewTab         ,
-    CloseTab       ,
-    NextTab        ,
-    PrevTab        ,
-    /* modes */
-    EnterCommand   ,
-    EnterSearch    ,
-    SearchNext     ,
-    SearchPrev     ,
-    EnterPathEdit  ,
-    /* misc */
-    TerminalPanel  ,
-    TerminalHere   ,
-    DragOut        ,
-    DropIn         ,
-    OpenMenu       ,
-    OpenViewMenu   ,
-    OpenSortMenu   ,
-    Help           ,
-    QuitAll        ,
-}
-
-pub struct Bind {
-    pub code  : K     , /* the key itself                    */
-    pub mods  : M     , /* modifiers that must match exactly */
-    pub action: Action, /* what it does                      */
-}
-
-const fn b(code: K, mods: M, action: Action) -> Bind {
-    Bind { code, mods, action }
-}
+use crate::vim::{b, Action, Bind};
 
 /* Dolphin's native shortcuts. Active in every non-text mode, alongside vim. */
 pub const DOLPHIN_KEYS: &[Bind] = &[
