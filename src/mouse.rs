@@ -1,0 +1,450 @@
+//! Mouse handling. Everything the toolbar, breadcrumb, headers, places panel
+//! and status bar draw is clickable, hit-tested against the rects the last
+//! render actually produced.
+
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
+
+use crate::app::{App, Drag, Focus, MenuKind, Mode, ViewMode, ZoomBurst};
+use crate::config;
+use crate::drag;
+use crate::places::Target;
+use crate::vim;
+use crate::vim::Action;
+
+fn hit(r: Rect, x: u16, y: u16) -> bool {
+    r.width > 0 && r.height > 0 && x >= r.x && x < r.right() && y >= r.y && y < r.bottom()
+}
+
+/// Double-click window. Dolphin selects on the first click and opens on the
+/// second — verified on a stock install with no `SingleClick` key set in
+/// kdeglobals. We do the same.
+const DOUBLE_MS: u64 = 400;
+
+pub fn handle(app: &mut App, m: MouseEvent) {
+    let (x, y) = (m.column, m.row);
+    let ctrl = m.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = m.modifiers.contains(KeyModifiers::SHIFT);
+
+    match m.kind {
+        MouseEventKind::ScrollDown => scroll(app, x, y, 1, ctrl),
+        MouseEventKind::ScrollUp => scroll(app, x, y, -1, ctrl),
+        MouseEventKind::Down(MouseButton::Left) => press(app, x, y, ctrl, shift),
+        MouseEventKind::Down(MouseButton::Middle) => middle(app, x, y),
+        MouseEventKind::Down(MouseButton::Right) => {
+            hit_pane(app, x, y);
+            app.mode = Mode::Menu(MenuKind::Hamburger);
+            app.menu_sel = 0;
+        }
+        MouseEventKind::Drag(MouseButton::Left) => dragging(app, x, y),
+        MouseEventKind::Up(MouseButton::Left) => release(app, x, y, shift, ctrl),
+        _ => {}
+    }
+}
+
+fn scroll(app: &mut App, x: u16, y: u16, dir: isize, ctrl: bool) {
+    // Ctrl+Scroll is Dolphin's zoom, everywhere in the view.
+    if ctrl {
+        zoom_at(app, x, y, -dir);
+        return;
+    }
+    if app.places_visible && hit(app.hits.places, x, y) {
+        let n = app.places.len();
+        let next = (app.places_sel as isize + dir).clamp(0, n as isize - 1) as usize;
+        if app.places[next].is_selectable() {
+            app.places_sel = next;
+        }
+        return;
+    }
+    if let Some(i) = pane_at(app, x, y) {
+        let p = &mut app.tabs[app.tab].panes[i];
+        let step = match p.view {
+            ViewMode::Details => 3,
+            _ => 1,
+        };
+        // The selection does not follow the viewport: in Dolphin the wheel
+        // moves the view and leaves the current item exactly where it is, off
+        // screen if that is where it ends up. Scrolling is looking around, not
+        // choosing. The bound is the last screenful, so the wheel cannot run
+        // off into blank space.
+        let max = p.max_offset() as isize;
+        p.offset = (p.offset as isize + dir * step).clamp(0, max) as usize;
+    }
+}
+
+/// Zoom about the item under the pointer, the way an image viewer does: the
+/// item you are pointing at stays on screen, at the same height in the pane.
+///
+/// Dolphin anchors at the top left, which makes "look closer at *this* file"
+/// two motions — zoom, then hunt for it again in a grid that just reflowed.
+/// See docs/DECISIONS.md.
+fn zoom_at(app: &mut App, x: u16, y: u16, delta: isize) {
+    if app.pane().view != ViewMode::Icons {
+        return app.zoom(delta);
+    }
+    // A gesture already under way keeps its anchor. Re-reading the pointer on
+    // every notch would anchor on whatever the reflow happened to slide under
+    // it, which is what made the cursor hop.
+    let live = app
+        .zoom_burst
+        .as_ref()
+        .is_some_and(|b| b.at.elapsed() < Duration::from_millis(config::ZOOM_SETTLE_MS));
+    let anchor = match &app.zoom_burst {
+        Some(b) if live => b.anchor,
+        // Zoom applies to the active pane, so only the active pane can be
+        // anchored. Empty space gives us nothing to anchor on either.
+        _ => match hit_item(app, x, y) {
+            Some((i, vis)) if i == app.tab().active => vis,
+            _ => return app.zoom(delta),
+        },
+    };
+    let p = app.pane();
+    let (old_cols, old_rows) = (p.grid_cols.max(1) as usize, p.grid_rows.max(1) as usize);
+    // Read the anchor's row off the layout it is in now, not the one the
+    // gesture started in: each notch put it where it belongs, so this keeps it
+    // at the same fraction of the pane all the way through.
+    let screen_row = (anchor / old_cols).saturating_sub(p.offset);
+    let area = p.area;
+
+    app.zoom(delta);
+    app.zoom_burst = Some(ZoomBurst {
+        anchor,
+        zoom_in: delta > 0,
+        x,
+        y,
+        at: Instant::now(),
+    });
+
+    let p = app.pane_mut();
+    let (cols, rows, _) = crate::ui::icon_grid(area, p.zoom);
+    p.offset = crate::app::anchored_offset(
+        anchor,
+        screen_row,
+        old_rows,
+        cols as usize,
+        rows as usize,
+        p.len(),
+    );
+    // Zooming in is aiming: the cursor rides the anchor so the item growing
+    // under the pointer is also the one selected. Zooming out is only widening
+    // the view, and taking the selection along would be a jump nobody asked
+    // for — whatever was selected stays selected, on screen or not.
+    if delta > 0 {
+        p.cursor = anchor;
+    }
+}
+
+fn press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
+    // An open menu swallows the click: inside picks, outside dismisses.
+    if let Mode::Menu(kind) = app.mode.clone() {
+        let items = vim::menu_items(&kind);
+        if let Some(i) = menu_index(app, x, y, items.len()) {
+            let a = items[i].1;
+            app.mode = Mode::Normal;
+            vim::act(app, a, 1);
+        } else {
+            app.mode = Mode::Normal;
+        }
+        return;
+    }
+    if let Mode::CrumbMenu(seg) = app.mode.clone() {
+        let items = vim::crumb_siblings(app, seg);
+        if let Some(i) = menu_index(app, x, y, items.len()) {
+            let d = items[i].clone();
+            app.mode = Mode::Normal;
+            app.goto(Target::Dir(d), true);
+        } else {
+            app.mode = Mode::Normal;
+        }
+        return;
+    }
+    if matches!(app.mode, Mode::Properties | Mode::Help | Mode::Confirm(_)) {
+        app.mode = Mode::Normal;
+        return;
+    }
+
+    // Toolbar.
+    let h = app.hits.clone();
+    if hit(h.back, x, y) {
+        return app.back();
+    }
+    if hit(h.forward, x, y) {
+        return app.forward();
+    }
+    if hit(h.view_cycle, x, y) {
+        return vim::act(app, Action::CycleView, 1);
+    }
+    if hit(h.view_menu, x, y) {
+        app.mode = Mode::Menu(MenuKind::ViewMode);
+        app.menu_sel = 0;
+        return;
+    }
+    if hit(h.split, x, y) {
+        return app.toggle_split();
+    }
+    if hit(h.search, x, y) {
+        return vim::act(app, Action::EnterSearch, 1);
+    }
+    if hit(h.menu, x, y) {
+        app.mode = Mode::Menu(MenuKind::Hamburger);
+        app.menu_sel = 0;
+        return;
+    }
+    for (r, seg) in &h.crumb_arrows {
+        if hit(*r, x, y) {
+            app.mode = Mode::CrumbMenu(*seg);
+            app.menu_sel = 0;
+            return;
+        }
+    }
+    for (r, p) in &h.crumbs {
+        if hit(*r, x, y) {
+            let p = p.clone();
+            return app.goto(Target::Dir(p), true);
+        }
+    }
+    // Clicking the empty part of the location bar edits it, as in Dolphin.
+    if hit(h.path_bar, x, y) && app.mode != Mode::PathEdit {
+        return vim::act(app, Action::EnterPathEdit, 1);
+    }
+    for (i, r) in h.tabs.iter().enumerate() {
+        if hit(*r, x, y) {
+            app.tab = i;
+            return;
+        }
+    }
+    if hit(h.zoom_slider, x, y) {
+        let rel = (x - h.zoom_slider.x) as usize;
+        app.zoom_to(rel);
+        return;
+    }
+    // Details column headers sort, and re-sort in reverse on a second click.
+    for (r, key) in &h.headers {
+        if hit(*r, x, y) {
+            let k = *key;
+            return app.set_sort(k);
+        }
+    }
+    if app.places_visible && hit(h.places, x, y) {
+        let i = (y - h.places.y) as usize;
+        if let Some(row) = app.places.get(i) {
+            if let Some(t) = row.target().cloned() {
+                app.places_sel = i;
+                app.focus = Focus::Places;
+                app.goto(t, true);
+                app.focus = Focus::View;
+            }
+        }
+        return;
+    }
+
+    // The file view.
+    let Some((pane_idx, vis)) = hit_item(app, x, y) else {
+        if let Some(i) = pane_at(app, x, y) {
+            app.tabs[app.tab].active = i;
+            app.focus = Focus::View;
+            if !ctrl && !shift {
+                app.tabs[app.tab].panes[i].selected.clear();
+            }
+        }
+        return;
+    };
+    app.tabs[app.tab].active = pane_idx;
+    app.focus = Focus::View;
+
+    let path = app.pane().at(vis).map(|e| e.path.clone());
+    let Some(path) = path else { return };
+
+    if ctrl {
+        let p = app.pane_mut();
+        if !p.selected.remove(&path) {
+            p.selected.insert(path.clone());
+        }
+        p.cursor = vis;
+        p.anchor = vis;
+    } else if shift {
+        let anchor = app.pane().anchor;
+        let (a, b) = (anchor.min(vis), anchor.max(vis));
+        let range: Vec<PathBuf> = (a..=b)
+            .filter_map(|i| app.pane().at(i).map(|e| e.path.clone()))
+            .collect();
+        let p = app.pane_mut();
+        p.selected.clear();
+        p.selected.extend(range);
+        p.cursor = vis;
+    } else {
+        let was_selected = app.pane().selected.contains(&path);
+        let double = app
+            .last_click
+            .is_some_and(|(t, v)| v == vis && t.elapsed() < Duration::from_millis(DOUBLE_MS));
+        if double {
+            app.pane_mut().cursor = vis;
+            app.last_click = None;
+            app.activate();
+            return;
+        }
+        let p = app.pane_mut();
+        p.cursor = vis;
+        p.anchor = vis;
+        if !was_selected {
+            p.selected.clear();
+        }
+        // Arm a drag: it only becomes one once the pointer actually moves.
+        let paths = if p.selected.is_empty() {
+            vec![path.clone()]
+        } else {
+            p.selected_paths()
+        };
+        app.drag = Some(Drag {
+            paths,
+            at: (x, y),
+            origin: (x, y),
+            started: false,
+        });
+    }
+    app.last_click = Some((Instant::now(), vis));
+}
+
+fn middle(app: &mut App, x: u16, y: u16) {
+    // Middle-click a folder to open it in a new tab, as Dolphin does.
+    if let Some((pane_idx, vis)) = hit_item(app, x, y) {
+        app.tabs[app.tab].active = pane_idx;
+        if let Some(e) = app.pane().at(vis).cloned() {
+            if e.is_dir() {
+                app.new_tab(e.path);
+            }
+        }
+        return;
+    }
+    if app.places_visible && hit(app.hits.places, x, y) {
+        let i = (y - app.hits.places.y) as usize;
+        if let Some(Target::Dir(d)) = app.places.get(i).and_then(|r| r.target()).cloned() {
+            app.new_tab(d);
+        }
+    }
+}
+
+fn dragging(app: &mut App, x: u16, y: u16) {
+    let Some(d) = app.drag.as_mut() else { return };
+    d.at = (x, y);
+    let moved = x.abs_diff(d.origin.0) + y.abs_diff(d.origin.1);
+    if moved > config::DRAG_THRESHOLD {
+        d.started = true;
+    }
+}
+
+fn release(app: &mut App, x: u16, y: u16, shift: bool, ctrl: bool) {
+    let Some(d) = app.drag.as_ref() else { return };
+    if !d.started {
+        app.drag = None;
+        return;
+    }
+
+    // Dropping on a Places entry moves/copies into that place.
+    if app.places_visible && hit(app.hits.places, x, y) {
+        let i = (y - app.hits.places.y) as usize;
+        if let Some(Target::Dir(dir)) = app.places.get(i).and_then(|r| r.target()).cloned() {
+            return drag::drop_internal(app, dir, shift, ctrl);
+        }
+        app.drag = None;
+        return;
+    }
+
+    // Dropping on a folder puts the items inside it; anywhere else in a pane
+    // drops into that pane's directory — which is how split-view transfer works.
+    if let Some((pane_idx, vis)) = hit_item(app, x, y) {
+        let target = app.tabs[app.tab].panes[pane_idx]
+            .at(vis)
+            .filter(|e| e.is_dir())
+            .map(|e| e.path.clone())
+            .unwrap_or_else(|| app.tabs[app.tab].panes[pane_idx].cwd.clone());
+        return drag::drop_internal(app, target, shift, ctrl);
+    }
+    if let Some(i) = pane_at(app, x, y) {
+        let dir = app.tabs[app.tab].panes[i].cwd.clone();
+        return drag::drop_internal(app, dir, shift, ctrl);
+    }
+    app.drag = None;
+}
+
+// ---------------------------------------------------------------------------
+// Hit-testing
+// ---------------------------------------------------------------------------
+
+fn pane_at(app: &App, x: u16, y: u16) -> Option<usize> {
+    app.tab().panes.iter().position(|p| hit(p.area, x, y))
+}
+
+fn hit_pane(app: &mut App, x: u16, y: u16) {
+    if let Some(i) = pane_at(app, x, y) {
+        app.tabs[app.tab].active = i;
+        app.focus = Focus::View;
+    }
+}
+
+/// Which visible index is under the pointer, using the same arithmetic the
+/// renderer used — the geometry is cached on the pane, not recomputed.
+fn hit_item(app: &App, x: u16, y: u16) -> Option<(usize, usize)> {
+    let idx = pane_at(app, x, y)?;
+    let p = &app.tab().panes[idx];
+    let (dx, dy) = (x - p.area.x, y - p.area.y);
+    let vis = match p.view {
+        ViewMode::Icons => {
+            // The grid is centred, so its left edge is not the pane's.
+            let c = x.saturating_sub(p.grid_x) / p.cell_w.max(1);
+            let r = dy / p.cell_h.max(1);
+            // The grid rarely fills the pane exactly: past the last row and
+            // right of the last column is empty space, not a phantom item.
+            if x < p.grid_x || c >= p.grid_cols || r >= p.grid_rows {
+                return None;
+            }
+            p.offset * p.grid_cols as usize + r as usize * p.grid_cols as usize + c as usize
+        }
+        ViewMode::Compact => {
+            let c = dx / p.cell_w.max(1);
+            p.offset * p.grid_rows as usize + c as usize * p.grid_rows as usize + dy as usize
+        }
+        ViewMode::Details => {
+            if dy == 0 {
+                return None; // the header row
+            }
+            p.offset + ((dy - 1) / p.cell_h.max(1)) as usize
+        }
+    };
+    (vis < p.len()).then_some((idx, vis))
+}
+
+/// Row index inside whichever popup is open, or None when the click missed.
+fn menu_index(app: &App, x: u16, y: u16, len: usize) -> Option<usize> {
+    let r = app.hits.menu_popup;
+    if !hit(r, x, y) {
+        return None;
+    }
+    let i = (y - r.y) as usize;
+    (i < len).then_some(i)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+
+    #[test]
+    fn hit_rejects_zero_sized_rects() {
+        assert!(!hit(Rect::new(0, 0, 0, 0), 0, 0));
+        assert!(hit(Rect::new(2, 3, 4, 1), 5, 3));
+        assert!(!hit(Rect::new(2, 3, 4, 1), 6, 3));
+    }
+
+    #[test]
+    fn details_header_row_is_not_an_item() {
+        let mut app = App::new(std::env::temp_dir());
+        app.pane_mut().view = ViewMode::Details;
+        app.pane_mut().area = Rect::new(0, 0, 80, 20);
+        app.pane_mut().cell_h = 1;
+        assert_eq!(hit_item(&app, 5, 0), None);
+    }
+}
