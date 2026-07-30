@@ -15,7 +15,7 @@ use ratatui::style::Color;
  * which is their business, not ours. */
 pub mod color {
     use super::Color;
-    /*        name        r    g    b       used for                            */
+    /*        name        r    g    b       used for                                            */
     pub const TOOLBAR_BG: Color = Color::Rgb(244, 245, 246); /* toolbar, breadcrumb, tab strip  */
     pub const PANEL_BG  : Color = Color::Rgb(239, 240, 241); /* Places and Information panels   */
     pub const VIEW_BG   : Color = Color::Rgb(255, 255, 255); /* the file view itself            */
@@ -31,42 +31,48 @@ pub mod color {
     pub const CUT       : Color = Color::Rgb(160, 165, 170); /* cut items, ghosted as in Dolphin*/
     pub const ERROR     : Color = Color::Rgb(218, 68 , 83 ); /* status bar errors               */
     pub const GAUGE_FULL: Color = Color::Rgb(200, 205, 210); /* used part of a device capacity  */
+    pub const OFFLINE   : Color = Color::Rgb(246, 116, 0  ); /* unmounted device, Breeze carrot */
 }
 
 /* Icon stand-ins. A terminal cell is not 48x48 px; these are the closest
- * unambiguous glyphs in a standard Nerd-font-free environment. */
+ * unambiguous glyphs available. The Private Use Area ones need a Nerd Font
+ * patched terminal font; without one they render as tofu — swap them for a
+ * plain Unicode glyph and recompile, that is the whole fallback story. */
 pub mod glyph {
-    /*        name           escape                 glyph  where it appears */
-    pub const FOLDER       : &str = "\u{1f5c0}"; /* 🗀  directory entry      */
-    pub const FOLDER_OPEN  : &str = "\u{1f5c1}"; /* 🗁  expanded in Details  */
-    pub const FILE         : &str = "\u{1f5cb}"; /* 🗋  regular file         */
-    pub const SYMLINK      : &str = "\u{2937}" ; /* ⤷  link                 */
-    pub const HOME         : &str = "\u{2302}" ; /* ⌂  Places: Home         */
-    pub const TRASH        : &str = "\u{1f5d1}"; /* 🗑  Places: Trash       */
-    pub const NETWORK      : &str = "\u{25cc}" ; /* ◌  Places: Network      */
-    pub const DEVICE       : &str = "\u{25a3}" ; /* ▣  Places: Devices      */
-    pub const CLOCK        : &str = "\u{1f5d3}"; /* 🗓  Places: Recent      */
-    pub const DOWNLOAD     : &str = "\u{2913}" ; /* ⤓  Places: Downloads    */
-    pub const DOCUMENT     : &str = "\u{1f5ce}"; /* 🗎  Places: Documents    */
-    pub const MUSIC        : &str = "\u{266a}" ; /* ♪  Places: Music        */
-    pub const PICTURE      : &str = "\u{1f5bb}"; /* 🖻  Places: Pictures     */
-    pub const VIDEO        : &str = "\u{1f5b7}"; /* 🖷  Places: Videos       */
-    pub const ARCHIVE      : &str = "\u{1f5c3}"; /* 🗃  archive file        */
-    pub const BACK         : &str = "\u{2190}" ; /* ←  toolbar              */
-    pub const FORWARD      : &str = "\u{2192}" ; /* →  toolbar              */
-    pub const UP           : &str = "\u{2191}" ; /* ↑  toolbar              */
-    pub const VIEW_ICONS   : &str = "\u{25a6}" ; /* ▦  toolbar view button  */
-    pub const VIEW_COMPACT : &str = "\u{2630}" ; /* ☰  toolbar view button */
-    pub const VIEW_DETAILS : &str = "\u{2261}" ; /* ≡  toolbar view button  */
-    pub const SPLIT        : &str = "\u{25a5}" ; /* ▥  toolbar Split        */
-    pub const SEARCH       : &str = "\u{1f50d}"; /* 🔍  toolbar Search      */
-    pub const MENU         : &str = "\u{2630}" ; /* ☰  toolbar hamburger   */
-    pub const DROPDOWN     : &str = "\u{25be}" ; /* ▾  split-button arrow   */
-    pub const CRUMB_SEP    : &str = "\u{203a}" ; /* ›  breadcrumb separator */
-    pub const SORT_ASC     : &str = "\u{25b4}" ; /* ▴  Details column head  */
-    pub const SORT_DESC    : &str = "\u{25be}" ; /* ▾  Details column head  */
-    pub const EXPAND_CLOSED: &str = "\u{25b8}" ; /* ▸  collapsed folder     */
-    pub const EXPAND_OPEN  : &str = "\u{25be}" ; /* ▾  expanded folder      */
+    /*        name           escape                 glyph  where it appears      */
+    pub const FOLDER       : &str = "\u{ea83}" ; /*   directory entry            */
+    pub const FOLDER_EMPTY : &str = "\u{eaf7}" ; /*   directory with no children */
+    pub const FOLDER_OPEN  : &str = "\u{1f5c1}"; /* 🗁 expanded in Details        */
+    pub const FILE         : &str = "\u{1f5cb}"; /* 🗋 regular file               */
+    pub const SYMLINK      : &str = "\u{2937}" ; /* ⤷ link                       */
+    pub const HOME         : &str = "\u{f02dc}"; /* 󰋜 Places: Home               */
+    pub const TRASH        : &str = "\u{f014}" ; /*   Places: Trash              */
+    pub const NETWORK      : &str = "\u{f0556}"; /* 󰕖 Places: Network            */
+    pub const DEVICE       : &str = "\u{f02ca}"; /* 󰋊 a mounted partition        */
+    pub const DEVICE_OFF   : &str = "\u{f104c}"; /* 󱁌 unmounted, unreachable     */
+    pub const DEVICE_USB   : &str = "\u{f11f0}"; /* 󱇰 removable media            */
+    pub const EJECT        : &str = "\u{f01ea}"; /* 󰇪 unmount a removable        */
+    pub const CLOCK        : &str = "\u{f0e17}"; /* 󰸗 Places: Recent             */
+    pub const DOWNLOAD     : &str = "\u{f409}" ; /*   Downloads                  */
+    pub const DOCUMENT     : &str = "\u{eaf0}" ; /*   Documents                  */
+    pub const MUSIC        : &str = "\u{266a}" ; /* ♪ Places: Music              */
+    pub const PICTURE      : &str = "\u{1f5bb}"; /* 🖻  Places: Pictures          */
+    pub const VIDEO        : &str = "\u{1f5b7}"; /* 🖷  Places: Videos            */
+    pub const ARCHIVE      : &str = "\u{1f5c3}"; /* 🗃 archive file              */
+    pub const BACK         : &str = "\u{efc3}" ; /*   toolbar back               */
+    pub const FORWARD      : &str = "\u{edfb}" ; /*   toolbar forward            */
+    pub const VIEW_ICONS   : &str = "\u{f0570}"; /* 󰕰 toolbar view button        */
+    pub const VIEW_COMPACT : &str = "\u{f02be}"; /* 󰊾 toolbar view button        */
+    pub const VIEW_DETAILS : &str = "\u{ef81}" ; /*   toolbar view button        */
+    pub const SPLIT        : &str = "\u{f4b4}" ; /*   toolbar Split              */
+    pub const SEARCH       : &str = "\u{1f50d}"; /* 🔍 toolbar Search            */
+    pub const MENU         : &str = "\u{2630}" ; /* ☰ toolbar hamburger         */
+    pub const DROPDOWN     : &str = "\u{25be}" ; /* ▾  split-button arrow        */
+    pub const CRUMB_SEP    : &str = "\u{203a}" ; /* ›  breadcrumb separator      */
+    pub const SORT_ASC     : &str = "\u{25b4}" ; /* ▴  Details column head       */
+    pub const SORT_DESC    : &str = "\u{25be}" ; /* ▾  Details column head       */
+    pub const EXPAND_CLOSED: &str = "\u{25b8}" ; /* ▸  collapsed folder          */
+    pub const EXPAND_OPEN  : &str = "\u{25be}" ; /* ▾  expanded folder           */
 }
 
 /* Panel geometry and tunables. */
@@ -78,20 +84,40 @@ pub const WATCH_DEBOUNCE_MS   : u64   = 120 ; /* coalescing window for inotify s
 pub const TICK_MS             : u64   = 40  ; /* event loop tick; listing/thumbnail poll rate  */
 pub const DRAG_THRESHOLD      : u16   = 1   ; /* cells of movement before a drag begins        */
 pub const THUMB_CACHE_CAP     : usize = 512 ; /* decoded thumbnails held in memory             */
+pub const CELL_GAP            : u16   = 2   ; /* blank columns between icon-view tiles         */
+pub const NAME_LINES          : u16   = 3   ; /* rows a name may wrap over in the icon view    */
+pub const ZOOM_SETTLE_MS      : u64   = 200 ; /* quiet wheel before a zoom gesture re-anchors   */
+pub const DISK_POLL_MS        : u64   = 2000; /* how often the status bar re-measures free space*/
 
-/* Dolphin's zoom slider has ten stops. Compact and Details derive from these. */
+/* Dolphin's zoom slider has ten stops. Compact and Details derive from these.
+ * These are *pitch*: each cell keeps a blank row on top and CELL_GAP blank
+ * columns, which is where the cursor frame is drawn. Content is therefore
+ * (w - CELL_GAP) by (h - 1), and the first stop is the 13x4 the layout was
+ * designed around — one icon row and three of name. */
 pub const ZOOM_LEVELS: [(u16, u16); 10] = [
     /* w   h  */
-      (10, 3 ),
-      (12, 4 ),
-      (14, 5 ),
-      (16, 6 ),
-      (18, 7 ),
-      (22, 9 ),
-      (26, 11),
-      (30, 13),
-      (36, 16),
-      (44, 20),
+      (15, 5 ),
+      (17, 6 ),
+      (19, 7 ),
+      (21, 8 ),
+      (24, 9 ),
+      (28, 11),
+      (32, 13),
+      (38, 16),
+      (44, 19),
+      (52, 23),
+];
+
+/* Dolphin badges the XDG user directories in the view, not just in Places.
+ * Matched by name and only directly under $HOME, so a Downloads you made
+ * somewhere else stays a plain folder. */
+pub const HOME_FOLDER_ICONS: &[(&str, &str)] = &[
+    /* name         glyph          */
+      ("Documents", glyph::DOCUMENT),
+      ("Downloads", glyph::DOWNLOAD),
+      ("Music"    , glyph::MUSIC   ),
+      ("Pictures" , glyph::PICTURE ),
+      ("Videos"   , glyph::VIDEO   ),
 ];
 
 /* File classification by extension. */
