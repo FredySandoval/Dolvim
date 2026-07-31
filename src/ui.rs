@@ -410,18 +410,18 @@ fn view(f: &mut Frame, app: &mut App, area: Rect, idx: usize) {
         area,
     );
     {
-        let p = &mut app.tabs[app.tab].panes[idx];
+        let p = app.pane_at_mut(idx);
         p.area = area;
     }
 
-    let mode = app.tabs[app.tab].panes[idx].view;
+    let mode = app.pane_at(idx).view;
     match mode {
         ViewMode::Icons => icons_view(f, app, area, idx, is_active),
         ViewMode::Compact => compact_view(f, app, area, idx, is_active),
         ViewMode::Details => details_view(f, app, area, idx, is_active),
     }
 
-    let p = &app.tabs[app.tab].panes[idx];
+    let p = app.pane_at(idx);
     if p.loading && p.entries.is_empty() {
         centred(
             f.buffer_mut(),
@@ -519,12 +519,12 @@ pub fn icon_grid(area: Rect, zoom: usize) -> (u16, u16, u16) {
 }
 
 fn icons_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool) {
-    let (cw, ch) = config::ZOOM_LEVELS[app.tabs[app.tab].panes[idx].zoom];
-    let (cols, rows, mx) = icon_grid(area, app.tabs[app.tab].panes[idx].zoom);
+    let (cw, ch) = config::ZOOM_LEVELS[app.pane_at(idx).zoom];
+    let (cols, rows, mx) = icon_grid(area, app.pane_at(idx).zoom);
     let cut = app.clipboard.cut;
     let cut_set = app.clipboard.paths.clone();
     {
-        let p = &mut app.tabs[app.tab].panes[idx];
+        let p = app.pane_at_mut(idx);
         p.grid_cols = cols;
         p.grid_rows = rows;
         p.cell_w = cw;
@@ -533,8 +533,8 @@ fn icons_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool
         let cur_row = p.cursor / cols as usize;
         reveal(p, cur_row, rows as usize);
     }
-    let p_len = app.tabs[app.tab].panes[idx].visible.len();
-    let offset = app.tabs[app.tab].panes[idx].offset;
+    let p_len = app.pane_at(idx).visible.len();
+    let offset = app.pane_at(idx).offset;
     let first = offset * cols as usize;
 
     let gap = config::CELL_GAP.min(cw.saturating_sub(3));
@@ -563,11 +563,11 @@ fn icons_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool
             continue;
         }
         let e = {
-            let p = &app.tabs[app.tab].panes[idx];
+            let p = app.pane_at(idx);
             p.entries[p.visible[vis]].clone()
         };
         let is_cut = cut && cut_set.contains(&e.path);
-        let st = entry_style(&app.tabs[app.tab].panes[idx], vis, is_cut);
+        let st = entry_style(app.pane_at(idx), vis, is_cut);
 
         // Selection fill covers the whole cell.
         if st.bg == Some(color::SELECTION) {
@@ -623,7 +623,7 @@ fn icons_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool
             f.buffer_mut().set_string(x, y, part, st);
         }
 
-        if vis == app.tabs[app.tab].panes[idx].cursor {
+        if vis == app.pane_at(idx).cursor {
             // One row taller than the cell: the frame's bottom edge borrows the
             // blank row that the cell below opens with.
             let h = (ch + 1).min(area.bottom().saturating_sub(y0));
@@ -637,14 +637,14 @@ fn icons_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool
 }
 
 fn compact_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool) {
-    let (cw, _) = config::ZOOM_LEVELS[app.tabs[app.tab].panes[idx].zoom];
+    let (cw, _) = config::ZOOM_LEVELS[app.pane_at(idx).zoom];
     let cw = (cw + 4).min(area.width.max(1));
     let rows = area.height.max(1);
     let cols = (area.width / cw).max(1);
     let cut = app.clipboard.cut;
     let cut_set = app.clipboard.paths.clone();
     {
-        let p = &mut app.tabs[app.tab].panes[idx];
+        let p = app.pane_at_mut(idx);
         p.grid_cols = cols;
         p.grid_rows = rows;
         p.cell_w = cw;
@@ -653,8 +653,8 @@ fn compact_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
         let cur_col = p.cursor / rows as usize;
         reveal(p, cur_col, cols as usize);
     }
-    let p_len = app.tabs[app.tab].panes[idx].visible.len();
-    let offset = app.tabs[app.tab].panes[idx].offset;
+    let p_len = app.pane_at(idx).visible.len();
+    let offset = app.pane_at(idx).offset;
     let first = offset * rows as usize;
 
     for slot in 0..(cols as usize * rows as usize) {
@@ -669,11 +669,11 @@ fn compact_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
             continue;
         }
         let e = {
-            let p = &app.tabs[app.tab].panes[idx];
+            let p = app.pane_at(idx);
             p.entries[p.visible[vis]].clone()
         };
         let is_cut = cut && cut_set.contains(&e.path);
-        let st = entry_style(&app.tabs[app.tab].panes[idx], vis, is_cut);
+        let st = entry_style(app.pane_at(idx), vis, is_cut);
         let w = cw.min(area.right() - x);
         let cell = Rect::new(x, y, w, 1);
         if st.bg == Some(color::SELECTION) {
@@ -682,7 +682,7 @@ fn compact_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
         let text = format!("{} {}", e.glyph(), e.name);
         f.buffer_mut()
             .set_string(x, y, clip(&text, w.saturating_sub(1) as usize), st);
-        if vis == app.tabs[app.tab].panes[idx].cursor {
+        if vis == app.pane_at(idx).cursor {
             cursor_row(f.buffer_mut(), cell, active);
         }
     }
@@ -696,7 +696,7 @@ fn detail_columns(width: u16) -> [u16; 4] {
 }
 
 fn details_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool) {
-    let zoom = app.tabs[app.tab].panes[idx].zoom;
+    let zoom = app.pane_at(idx).zoom;
     // "zoom changes row height only between fixed steps" — three steps.
     let row_h: u16 = match zoom {
         0..=4 => 1,
@@ -712,12 +712,12 @@ fn details_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
     );
     let rows = (list.height / row_h).max(1);
     let cols = detail_columns(area.width);
-    let sort = app.tabs[app.tab].panes[idx].sort;
+    let sort = app.pane_at(idx).sort;
     let cut = app.clipboard.cut;
     let cut_set = app.clipboard.paths.clone();
 
     {
-        let p = &mut app.tabs[app.tab].panes[idx];
+        let p = app.pane_at_mut(idx);
         p.grid_cols = 1;
         p.grid_rows = rows;
         p.cell_w = area.width;
@@ -754,8 +754,8 @@ fn details_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
         hx += cols[i] + 1;
     }
 
-    let p_len = app.tabs[app.tab].panes[idx].visible.len();
-    let offset = app.tabs[app.tab].panes[idx].offset;
+    let p_len = app.pane_at(idx).visible.len();
+    let offset = app.pane_at(idx).offset;
     for r in 0..rows as usize {
         let vis = offset + r;
         if vis >= p_len {
@@ -766,11 +766,11 @@ fn details_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
             break;
         }
         let e = {
-            let p = &app.tabs[app.tab].panes[idx];
+            let p = app.pane_at(idx);
             p.entries[p.visible[vis]].clone()
         };
         let is_cut = cut && cut_set.contains(&e.path);
-        let st = entry_style(&app.tabs[app.tab].panes[idx], vis, is_cut);
+        let st = entry_style(app.pane_at(idx), vis, is_cut);
         let row = Rect::new(area.x, y, area.width, row_h.min(list.bottom() - y));
         if st.bg == Some(color::SELECTION) {
             fill(f.buffer_mut(), row, color::SELECTION);
@@ -819,7 +819,7 @@ fn details_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
             }
         }
 
-        if vis == app.tabs[app.tab].panes[idx].cursor {
+        if vis == app.pane_at(idx).cursor {
             cursor_row(f.buffer_mut(), row, active);
         }
     }

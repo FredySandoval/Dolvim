@@ -2,6 +2,7 @@
 //! a state change.
 
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -12,6 +13,16 @@ use crate::ops;
 use crate::places::{self, Target};
 
 pub fn key(app: &mut App, k: KeyEvent) {
+    // The transfer popup is modal, as Dolphin's is. Letting keys through means
+    // you can navigate away from a live copy, or start a second one on top of
+    // `app.progress` and orphan the first thread with no way to see or stop it.
+    if let Some(p) = &app.progress {
+        if k.code == KeyCode::Esc {
+            p.cancel.store(true, Ordering::Relaxed);
+        }
+        return;
+    }
+
     match app.mode.clone() {
         Mode::Normal | Mode::Visual => normal(app, k),
         Mode::Confirm(c) => confirm(app, k, c),
@@ -200,7 +211,6 @@ pub enum Action {
     TogglePlaces,
     ToggleInfo,
     ToggleFilterBar,
-    ToggleGrouping,
     ToggleExpand,
     /* sorting */
     SortName,
@@ -494,10 +504,6 @@ pub fn act(app: &mut App, a: Action, n: usize) {
                 app.pane_mut().filter.clear();
                 app.pane_mut().refilter();
             }
-        }
-        Action::ToggleGrouping => {
-            let g = !app.pane().grouping;
-            app.pane_mut().grouping = g;
         }
         Action::ToggleExpand => app.toggle_expand(),
 

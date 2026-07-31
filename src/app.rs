@@ -138,7 +138,6 @@ pub struct Pane {
     pub zoom: usize,
     pub sort: Sort,
     pub show_hidden: bool,
-    pub grouping: bool,
     pub filter: String,
     pub expanded: HashSet<PathBuf>,
     pub history: Vec<PathBuf>,
@@ -176,7 +175,6 @@ impl Pane {
             zoom: config::DEFAULT_ZOOM,
             sort: Sort::default(),
             show_hidden: false,
-            grouping: false,
             filter: String::new(),
             expanded: HashSet::new(),
             hist_pos: 0,
@@ -511,6 +509,16 @@ impl App {
         self.tab_mut().pane_mut()
     }
 
+    /// A pane of the current tab by index, for the renderer and the hit-tests,
+    /// which work on both panes of a split rather than only the active one.
+    pub fn pane_at(&self, i: usize) -> &Pane {
+        &self.tabs[self.tab].panes[i]
+    }
+
+    pub fn pane_at_mut(&mut self, i: usize) -> &mut Pane {
+        &mut self.tabs[self.tab].panes[i]
+    }
+
     pub fn split_on(&self) -> bool {
         self.tab().panes.len() > 1
     }
@@ -531,7 +539,6 @@ impl App {
     pub fn reload(&mut self) {
         let seq = self.pane().seq + 1;
         let target = self.pane().target.clone();
-        let cwd = self.pane().cwd.clone();
         {
             let p = self.pane_mut();
             p.seq = seq;
@@ -545,11 +552,10 @@ impl App {
             }
             Target::Trash => {
                 let entries = ops::list_trash();
-                self.apply_listing(cwd, seq, entries, None);
+                self.apply_listing(seq, entries, None);
             }
             Target::Network => {
                 self.apply_listing(
-                    cwd,
                     seq,
                     Vec::new(),
                     Some("Network browsing is not implemented".into()),
@@ -557,17 +563,16 @@ impl App {
             }
             Target::RecentDays(days) => {
                 let entries = recent(&places::home(), days);
-                self.apply_listing(cwd, seq, entries, None);
+                self.apply_listing(seq, entries, None);
             }
         }
     }
 
-    fn apply_listing(&mut self, path: PathBuf, seq: u64, entries: Vec<Entry>, err: Option<String>) {
+    fn apply_listing(&mut self, seq: u64, entries: Vec<Entry>, err: Option<String>) {
         let p = self.pane_mut();
         if p.seq != seq {
             return;
         }
-        let _ = path;
         p.error = err;
         p.loading = false;
         p.set_entries(entries);

@@ -15,23 +15,23 @@ use ratatui::style::Color;
  * which is their business, not ours. */
 pub mod color {
     use super::Color;
-    /*        name        r    g    b       used for                                            */
+    /*        name                            r    g    b       used for                        */
     pub const TOOLBAR_BG: Color = Color::Rgb(244, 245, 246); /* toolbar, breadcrumb, tab strip  */
     pub const PANEL_BG  : Color = Color::Rgb(239, 240, 241); /* Places and Information panels   */
     pub const VIEW_BG   : Color = Color::Rgb(255, 255, 255); /* the file view itself            */
     pub const SELECTION : Color = Color::Rgb(194, 224, 245); /* selected row / cell fill        */
-    pub const ACCENT    : Color = Color::Rgb(61 , 174, 233); /* focus bar, active tab underline */
-    pub const TEXT      : Color = Color::Rgb(35 , 38 , 41 ); /* default foreground              */
+    pub const ACCENT    : Color = Color::Rgb( 61, 174, 233); /* focus bar, active tab underline */
+    pub const TEXT      : Color = Color::Rgb( 35,  38,  41); /* default foreground              */
     pub const DIM       : Color = Color::Rgb(127, 140, 141); /* headings, disabled toolbar keys */
     pub const SEPARATOR : Color = Color::Rgb(220, 220, 220); /* the 1 px splitter lines         */
-    pub const FOLDER    : Color = Color::Rgb(61 , 174, 233); /* directory entries               */
-    pub const FILE      : Color = Color::Rgb(99 , 104, 109); /* regular file entries            */
-    pub const SYMLINK   : Color = Color::Rgb(26 , 138, 190); /* symbolic links                  */
-    pub const EXEC      : Color = Color::Rgb(58 , 156, 74 ); /* executables                     */
+    pub const FOLDER    : Color = Color::Rgb( 61, 174, 233); /* directory entries               */
+    pub const FILE      : Color = Color::Rgb( 99, 104, 109); /* regular file entries            */
+    pub const SYMLINK   : Color = Color::Rgb( 26, 138, 190); /* symbolic links                  */
+    pub const EXEC      : Color = Color::Rgb( 58, 156,  74); /* executables                     */
     pub const CUT       : Color = Color::Rgb(160, 165, 170); /* cut items, ghosted as in Dolphin*/
-    pub const ERROR     : Color = Color::Rgb(218, 68 , 83 ); /* status bar errors               */
+    pub const ERROR     : Color = Color::Rgb(218,  68 , 83); /* status bar errors               */
     pub const GAUGE_FULL: Color = Color::Rgb(200, 205, 210); /* used part of a device capacity  */
-    pub const OFFLINE   : Color = Color::Rgb(246, 116, 0  ); /* unmounted device, Breeze carrot */
+    pub const OFFLINE   : Color = Color::Rgb(246, 116,   0); /* unmounted device, Breeze carrot */
 }
 
 /* Icon stand-ins. A terminal cell is not 48x48 px; these are the closest
@@ -122,7 +122,7 @@ pub const HOME_FOLDER_ICONS: &[(&str, &str)] = &[
 
 /* File classification by extension. */
 pub const IMAGE_EXTS  : &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp", "ico", "tif", "tiff"];
-pub const ARCHIVE_EXTS: &[&str] = &["tar", "gz", "tgz", "bz2", "xz", "zst", "zip", "7z", "rar"];
+pub const ARCHIVE_EXTS: &[&str] = &["tar", "gz" , "tgz" , "bz2", "xz" , "zst" , "zip", "7z" , "rar"];
 
 // ---------------------------------------------------------------------------
 // Keymap
@@ -175,7 +175,6 @@ pub const DOLPHIN_KEYS: &[Bind] = &[
     b(K::F(9)     , M::NONE                   , Action::TogglePlaces   ),
     b(K::F(11)    , M::NONE                   , Action::ToggleInfo     ),
     b(K::Char('i'), M::CONTROL                , Action::ToggleFilterBar),
-    b(K::Char('g'), M::CONTROL                , Action::ToggleGrouping ),
     b(K::Char('t'), M::CONTROL                , Action::NewTab         ),
     b(K::Char('w'), M::CONTROL                , Action::CloseTab       ),
     b(K::Tab      , M::CONTROL                , Action::NextTab        ),

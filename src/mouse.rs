@@ -25,6 +25,12 @@ fn hit(r: Rect, x: u16, y: u16) -> bool {
 const DOUBLE_MS: u64 = 400;
 
 pub fn handle(app: &mut App, m: MouseEvent) {
+    // Modal, for the reason given in `vim::key` — a click can reach Paste
+    // through the menu just as a key can, so blocking only the keyboard would
+    // leave the orphaned-transfer hole open.
+    if app.progress.is_some() {
+        return;
+    }
     let (x, y) = (m.column, m.row);
     let ctrl = m.modifiers.contains(KeyModifiers::CONTROL);
     let shift = m.modifiers.contains(KeyModifiers::SHIFT);
@@ -60,7 +66,7 @@ fn scroll(app: &mut App, x: u16, y: u16, dir: isize, ctrl: bool) {
         return;
     }
     if let Some(i) = pane_at(app, x, y) {
-        let p = &mut app.tabs[app.tab].panes[i];
+        let p = app.pane_at_mut(i);
         let step = match p.view {
             ViewMode::Details => 3,
             _ => 1,
@@ -247,7 +253,7 @@ fn press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
             app.tabs[app.tab].active = i;
             app.focus = Focus::View;
             if !ctrl && !shift {
-                app.tabs[app.tab].panes[i].selected.clear();
+                app.pane_at_mut(i).selected.clear();
             }
         }
         return;
@@ -356,15 +362,16 @@ fn release(app: &mut App, x: u16, y: u16, shift: bool, ctrl: bool) {
     // Dropping on a folder puts the items inside it; anywhere else in a pane
     // drops into that pane's directory — which is how split-view transfer works.
     if let Some((pane_idx, vis)) = hit_item(app, x, y) {
-        let target = app.tabs[app.tab].panes[pane_idx]
+        let target = app
+            .pane_at(pane_idx)
             .at(vis)
             .filter(|e| e.is_dir())
             .map(|e| e.path.clone())
-            .unwrap_or_else(|| app.tabs[app.tab].panes[pane_idx].cwd.clone());
+            .unwrap_or_else(|| app.pane_at(pane_idx).cwd.clone());
         return drag::drop_internal(app, target, shift, ctrl);
     }
     if let Some(i) = pane_at(app, x, y) {
-        let dir = app.tabs[app.tab].panes[i].cwd.clone();
+        let dir = app.pane_at(i).cwd.clone();
         return drag::drop_internal(app, dir, shift, ctrl);
     }
     app.drag = None;
@@ -389,7 +396,7 @@ fn hit_pane(app: &mut App, x: u16, y: u16) {
 /// renderer used — the geometry is cached on the pane, not recomputed.
 fn hit_item(app: &App, x: u16, y: u16) -> Option<(usize, usize)> {
     let idx = pane_at(app, x, y)?;
-    let p = &app.tab().panes[idx];
+    let p = app.pane_at(idx);
     let (dx, dy) = (x - p.area.x, y - p.area.y);
     let vis = match p.view {
         ViewMode::Icons => {
@@ -404,8 +411,15 @@ fn hit_item(app: &App, x: u16, y: u16) -> Option<(usize, usize)> {
             p.offset * p.grid_cols as usize + r as usize * p.grid_cols as usize + c as usize
         }
         ViewMode::Compact => {
+            // `cols` truncates, so the leftover columns on the right belong to
+            // no cell. Without this the index runs one column past the end and
+            // the length check below waves it through. Rows need no such guard:
+            // a compact row is one line and the grid is the full pane height.
             let c = dx / p.cell_w.max(1);
-            p.offset * p.grid_rows as usize + c as usize * p.grid_rows as usize + dy as usize
+            if c >= p.grid_cols {
+                return None;
+            }
+            (p.offset + c as usize) * p.grid_rows as usize + dy as usize
         }
         ViewMode::Details => {
             if dy == 0 {
@@ -446,5 +460,26 @@ mod tests {
         app.pane_mut().area = Rect::new(0, 0, 80, 20);
         app.pane_mut().cell_h = 1;
         assert_eq!(hit_item(&app, 5, 0), None);
+    }
+
+    /// `cols` truncates, so a compact grid leaves dead columns on the right.
+    /// Without the bound they read as a further column of items.
+    #[test]
+    fn compact_right_margin_is_not_an_item() {
+        let mut app = App::new(std::env::temp_dir());
+        let p = app.pane_mut();
+        p.view = ViewMode::Compact;
+        p.area = Rect::new(0, 0, 25, 4);
+        p.cell_w = 10;
+        p.cell_h = 1;
+        p.grid_cols = 2; // 25 / 10 — columns 20..24 belong to no cell
+        p.grid_rows = 4;
+        // More items than the two columns hold, so an out-of-range column
+        // still lands inside the listing and the length check waves it
+        // through — which is exactly how the bug hid.
+        p.visible = (0..12).collect();
+
+        assert_eq!(hit_item(&app, 19, 0), Some((0, 4)));
+        assert_eq!(hit_item(&app, 22, 0), None);
     }
 }

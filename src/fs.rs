@@ -4,8 +4,7 @@ use std::cmp::Ordering;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{channel, Sender};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -437,53 +436,71 @@ pub enum Msg {
 
 /// Spawns the listing thread and returns a handle you push requests into.
 pub struct Lister {
-    queue: Arc<Mutex<Option<(PathBuf, u64)>>>,
+    jobs: Sender<(PathBuf, u64)>,
 }
 
 impl Lister {
     pub fn new(tx: Sender<Msg>) -> Lister {
-        let queue: Arc<Mutex<Option<(PathBuf, u64)>>> = Arc::new(Mutex::new(None));
-        let q = Arc::clone(&queue);
-        thread::spawn(move || loop {
-            let job = q.lock().ok().and_then(|mut g| g.take());
-            let Some((path, seq)) = job else {
-                thread::sleep(std::time::Duration::from_millis(10));
-                continue;
-            };
-            match read_dir(&path, 0) {
-                Err(e) => {
-                    let _ = tx.send(Msg::Listed(Listing {
-                        path,
-                        seq,
-                        entries: Vec::new(),
-                        error: Some(e.to_string()),
-                    }));
+        let (jobs, rx) = channel::<(PathBuf, u64)>();
+        thread::spawn(move || {
+            // Held across iterations: a request that arrives mid-listing has to
+            // outlive the job it interrupts. The single-slot mutex this
+            // replaced could drop such a request outright, leaving the pane
+            // that asked for it `loading` with nothing ever to arrive.
+            let mut pending: Option<(PathBuf, u64)> = None;
+            loop {
+                // Blocks between requests instead of waking a hundred times a
+                // second to look at an empty slot.
+                let mut job = match pending.take() {
+                    Some(j) => j,
+                    None => match rx.recv() {
+                        Ok(j) => j,
+                        // The App is gone; so is any reason to keep listing.
+                        Err(_) => return,
+                    },
+                };
+                // Whatever piled up behind this one is already newer than it.
+                while let Ok(j) = rx.try_recv() {
+                    job = j;
                 }
-                Ok(all) => {
-                    // Stream in batches so the first screenful appears at once.
-                    let mut sent = false;
-                    for chunk in all.chunks(2000) {
-                        // A newer request supersedes this one; abandon it.
-                        if q.lock().ok().and_then(|g| g.as_ref().map(|j| j.1)) > Some(seq) {
-                            break;
+                let (path, seq) = job;
+                match read_dir(&path, 0) {
+                    Err(e) => {
+                        let _ = tx.send(Msg::Listed(Listing {
+                            path,
+                            seq,
+                            entries: Vec::new(),
+                            error: Some(e.to_string()),
+                        }));
+                    }
+                    Ok(all) => {
+                        // Stream in batches so the first screenful appears at once.
+                        let mut sent = false;
+                        for chunk in all.chunks(2000) {
+                            // A newer request supersedes this one; abandon it,
+                            // keeping the request for the next turn.
+                            while let Ok(j) = rx.try_recv() {
+                                pending = Some(j);
+                            }
+                            if pending.is_some() {
+                                break;
+                            }
+                            let _ = tx.send(Msg::Batch(path.clone(), seq, chunk.to_vec()));
+                            sent = true;
                         }
-                        let _ = tx.send(Msg::Batch(path.clone(), seq, chunk.to_vec()));
-                        sent = true;
+                        if !sent {
+                            let _ = tx.send(Msg::Batch(path.clone(), seq, Vec::new()));
+                        }
+                        let _ = tx.send(Msg::Done(path, seq));
                     }
-                    if !sent {
-                        let _ = tx.send(Msg::Batch(path.clone(), seq, Vec::new()));
-                    }
-                    let _ = tx.send(Msg::Done(path, seq));
                 }
             }
         });
-        Lister { queue }
+        Lister { jobs }
     }
 
     pub fn request(&self, path: PathBuf, seq: u64) {
-        if let Ok(mut g) = self.queue.lock() {
-            *g = Some((path, seq));
-        }
+        let _ = self.jobs.send((path, seq));
     }
 }
 
