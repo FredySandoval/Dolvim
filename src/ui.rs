@@ -92,9 +92,15 @@ fn toolbar(f: &mut Frame, app: &mut App, area: Rect) {
     let can_back = p.hist_pos > 0;
     let can_fwd = p.hist_pos + 1 < p.history.len();
 
-    // The focused toolbar button wears the same fill a selected file does.
-    let sel = |n: usize, st: Style| match app.mode {
-        Mode::Buttons(i) if i == n => st.bg(color::SELECTION),
+    // The focused toolbar button wears the same fill a selected file does. A
+    // button whose menu is open is focused too — the open menu *is* the focus.
+    let focused = match &app.mode {
+        Mode::Buttons(i) => Some(*i),
+        Mode::Menu(kind) => vim::menu_owner(kind),
+        _ => None,
+    };
+    let sel = |n: usize, st: Style| match focused {
+        Some(i) if i == n => st.bg(color::SELECTION),
         _ => st,
     };
 
@@ -962,6 +968,11 @@ fn filter_bar(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn status_bar(f: &mut Frame, app: &mut App, area: Rect) {
+    // On a one-row terminal the layout hands us a zero-height rect whose `y` is
+    // already past the buffer. Nothing here may touch it.
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
     fill(f.buffer_mut(), area, color::TOOLBAR_BG);
     let st = Style::default().bg(color::TOOLBAR_BG).fg(color::TEXT);
 
@@ -995,6 +1006,18 @@ fn status_bar(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    // The mode name leads the row, as vim's `showmode` does. It sits in its own
+    // cell rather than inside the message slot: a transient status must never
+    // be able to hide which mode owns the keyboard.
+    let tag = format!(" -- {} --  ", app.mode.name());
+    let tw = (tag.width() as u16).min(area.width);
+    f.buffer_mut().set_string(
+        area.x,
+        area.y,
+        clip(&tag, area.width as usize),
+        st.add_modifier(Modifier::BOLD),
+    );
+
     let left = if !app.status.is_empty() {
         app.status.clone()
     } else {
@@ -1017,8 +1040,12 @@ fn status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         st
     };
-    f.buffer_mut()
-        .set_string(area.x + 1, area.y, clip(&left, area.width as usize), style);
+    f.buffer_mut().set_string(
+        area.x + tw,
+        area.y,
+        clip(&left, area.width.saturating_sub(tw) as usize),
+        style,
+    );
 
     // Right side: free space, where stock Dolphin puts it.
     let free = match app.disk_space() {
@@ -1228,7 +1255,7 @@ fn help_lines() -> Vec<Line<'static>> {
         row("Enter / l", "open        Backspace / h  up"),
         row("Alt+← / Alt+→", "back / forward in history"),
         sect("Selection"),
-        row("Space  v  V", "toggle, visual, whole row"),
+        row("Space  v  V", "toggle, visual, visual by row"),
         row("Ctrl+A  Ctrl+Shift+A", "select all / invert"),
         sect("Files"),
         row("x  5x", "trash the item / n items"),
@@ -1246,7 +1273,7 @@ fn help_lines() -> Vec<Line<'static>> {
         sect("Toolbar row"),
         row("Ctrl+k / Ctrl+j", "up into the row, back down"),
         row("Ctrl+h  Ctrl+l", "nav buttons / trail / right buttons"),
-        row("h  l", "previous / next item"),
+        row("h  l", "previous / next item; a menu button opens"),
         row("j  k / Ctrl+n  Ctrl+p", "down / up an open menu"),
         row("Ctrl+y  Enter  Tab", "accept          Esc  cancel"),
         row("F4", "shell here (suspends Dolvim)"),

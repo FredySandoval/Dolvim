@@ -43,6 +43,9 @@ pub enum Focus {
 pub enum Mode {
     Normal,
     Visual,
+    /// `V`. Linewise: the range grows in whole rows of the grid. In Details a
+    /// row holds one item, so there it is the same thing as `Visual`.
+    VisualLine,
     /// `:` command line.
     Command,
     /// `/` incremental search.
@@ -69,6 +72,36 @@ pub enum Mode {
     /// Focus is on a toolbar button: an index into `config::TOOLBAR_BTNS`.
     Buttons(usize),
     Menu(MenuKind),
+}
+
+impl Mode {
+    /// Either visual: a range is being dragged and motions extend it.
+    pub fn is_visual(&self) -> bool {
+        matches!(self, Mode::Visual | Mode::VisualLine)
+    }
+
+    /// What the status bar calls this mode. The match is exhaustive so that a
+    /// new variant cannot ship without deciding what the user is told it is.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Mode::Normal => "NORMAL",
+            Mode::Visual => "VISUAL",
+            Mode::VisualLine => "V-LINE",
+            Mode::Command => "COMMAND",
+            Mode::Search => "SEARCH",
+            Mode::Filter => "FILTER",
+            Mode::PathEdit => "PATH",
+            Mode::Rename(_) | Mode::BatchRename => "RENAME",
+            Mode::NewFolder => "NEW FOLDER",
+            Mode::NewFile => "NEW FILE",
+            Mode::Confirm(_) => "CONFIRM",
+            Mode::Properties => "PROPERTIES",
+            Mode::Help => "HELP",
+            Mode::CrumbMenu(_) => "CRUMBS",
+            Mode::Buttons(_) => "TOOLBAR",
+            Mode::Menu(_) => "MENU",
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -715,6 +748,7 @@ impl App {
     // -- cursor motion -----------------------------------------------------
 
     pub fn move_cursor(&mut self, delta: isize, extend: bool) {
+        let line = self.mode == Mode::VisualLine;
         let p = self.pane_mut();
         if p.visible.is_empty() {
             return;
@@ -723,13 +757,46 @@ impl App {
         let next = (p.cursor as isize + delta).clamp(0, last) as usize;
         p.cursor = next;
         if extend {
-            let (a, b) = (p.anchor.min(next), p.anchor.max(next));
+            let (mut a, mut b) = (p.anchor.min(next), p.anchor.max(next));
+            // Linewise: grow the range out to the row edges on both sides.
+            if line {
+                let s = p.stride();
+                a -= a % s;
+                b = (b - b % s + s - 1).min(last as usize);
+            }
             let range: Vec<PathBuf> = (a..=b)
                 .filter_map(|v| p.at(v).map(|e| e.path.clone()))
                 .collect();
             p.selected.clear();
             p.selected.extend(range);
         }
+    }
+
+    /// A step along the line the index runs down — the row in Icons, the column
+    /// in Compact. It stops at the end of the line instead of spilling into the
+    /// next one, the way `l` stops at the end of a line in vim.
+    pub fn step_along(&mut self, n: isize, extend: bool) {
+        let s = self.pane().stride() as isize;
+        let i = self.pane().cursor as isize;
+        let lo = i - i % s;
+        let next = (i + n).clamp(lo, lo + s - 1);
+        self.move_cursor(next - i, extend);
+    }
+
+    /// A step across lines, keeping the position along the line. A step past
+    /// the first or last line stays where it is, as `k` does on vim's first
+    /// line — clamping the raw index instead would slide sideways to item 0.
+    /// A short final line is landed on at its end, which vim also does.
+    pub fn step_across(&mut self, n: isize, extend: bool) {
+        let s = self.pane().stride() as isize;
+        let i = self.pane().cursor as isize;
+        let last = self.pane().len() as isize - 1;
+        let line = i / s + n;
+        if last < 0 || line < 0 || line > last / s {
+            return;
+        }
+        let next = (line * s + i % s).min(last);
+        self.move_cursor(next - i, extend);
     }
 
     pub fn goto_index(&mut self, i: usize, extend: bool) {

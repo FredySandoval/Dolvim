@@ -47,7 +47,43 @@ pub fn handle(app: &mut App, m: MouseEvent) {
         }
         MouseEventKind::Drag(MouseButton::Left) => dragging(app, x, y),
         MouseEventKind::Up(MouseButton::Left) => release(app, x, y, shift, ctrl),
+        MouseEventKind::Moved => hover(app, x, y),
         _ => {}
+    }
+}
+
+/// Over one of the two toolbar buttons that drop a menu.
+fn on_menu_button(app: &App, x: u16, y: u16) -> bool {
+    hit(app.hits.view_menu, x, y) || hit(app.hits.menu, x, y)
+}
+
+/// The one thing the pointer does without a click: a toolbar button that drops
+/// a menu opens it on the way past, so the row behaves like a menu bar. It only
+/// ever opens — leaving does not close, or the menu would vanish from under a
+/// pointer on its way to the item it wants. Click or Esc dismisses, as before.
+///
+/// This is the single exception to "no hover state" in `docs/DECISIONS.md`.
+/// Nothing else tracks the pointer, and no redraw is added: the loop already
+/// draws every tick and this changes no state unless the pointer is over one
+/// of two buttons.
+fn hover(app: &mut App, x: u16, y: u16) {
+    // Never take a mode that is in the middle of something.
+    if !matches!(app.mode, Mode::Normal | Mode::Buttons(_) | Mode::Menu(_)) {
+        return;
+    }
+    let h = app.hits.clone();
+    // The caret, not the icon beside it: on a split button the icon is the
+    // action and only the caret drops the list, which is how clicking works too.
+    let want = if hit(h.view_menu, x, y) {
+        MenuKind::ViewMode
+    } else if hit(h.menu, x, y) {
+        MenuKind::Hamburger
+    } else {
+        return;
+    };
+    if app.mode != Mode::Menu(want.clone()) {
+        app.mode = Mode::Menu(want);
+        app.menu_sel = 0;
     }
 }
 
@@ -82,9 +118,11 @@ fn press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
         let items = vim::menu_items(&kind);
         if let Some(i) = menu_index(app, x, y, items.len()) {
             let a = items[i].1;
-            app.mode = Mode::Normal;
+            vim::leave_toolbar(app);
             vim::act(app, a, 1);
-        } else {
+        } else if !on_menu_button(app, x, y) {
+            // Clicking the button the menu hangs from would close it, and the
+            // next pointer motion would open it again. Leave it be.
             app.mode = Mode::Normal;
         }
         return;
@@ -93,7 +131,7 @@ fn press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
         let items = vim::crumb_siblings(app, seg);
         if let Some(i) = menu_index(app, x, y, items.len()) {
             let d = items[i].clone();
-            app.mode = Mode::Normal;
+            vim::leave_toolbar(app);
             app.goto(Target::Dir(d), true);
         } else {
             app.mode = Mode::Normal;

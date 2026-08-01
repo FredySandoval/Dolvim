@@ -24,7 +24,7 @@ pub fn key(app: &mut App, k: KeyEvent) {
     }
 
     match app.mode.clone() {
-        Mode::Normal | Mode::Visual => normal(app, k),
+        Mode::Normal | Mode::Visual | Mode::VisualLine => normal(app, k),
         Mode::Confirm(c) => confirm(app, k, c),
         // Any key dismisses an information overlay.
         Mode::Properties | Mode::Help => app.mode = Mode::Normal,
@@ -44,11 +44,11 @@ fn normal(app: &mut App, k: KeyEvent) {
         app.count.clear();
         app.pending = None;
         app.pending_delete = None;
-        if app.mode == Mode::Visual {
-            app.mode = Mode::Normal;
-        } else {
-            app.pane_mut().selected.clear();
-        }
+        // Esc ends the visual and takes the range with it: the selection
+        // belonged to the drag, not to the pane. Outside a visual it is the
+        // same key that clears a selection built with Space.
+        app.mode = Mode::Normal;
+        app.pane_mut().selected.clear();
         return;
     }
 
@@ -169,9 +169,27 @@ fn trash(app: &mut App, v: Vec<PathBuf>) {
         Err(e) => app.error(e),
     }
     // Deleting the visual range ends the visual, as `d` does in vim.
-    if app.mode == Mode::Visual {
+    if app.mode.is_visual() {
         app.mode = Mode::Normal;
     }
+}
+
+/// `v` and `V` start a range at the cursor. Pressing the key you are already in
+/// leaves visual, as in vim; pressing the other switches between charwise and
+/// linewise without disturbing the anchor.
+fn enter_visual(app: &mut App, want: Mode) {
+    if app.mode == want {
+        app.mode = Mode::Normal;
+        return;
+    }
+    if !app.mode.is_visual() {
+        app.pane_mut().anchor = app.pane().cursor;
+        app.pane_mut().selected.clear();
+    }
+    app.mode = want;
+    // Redraw the range under the new rule: `V` has to reach the row edges even
+    // though the cursor has not moved yet.
+    app.move_cursor(0, true);
 }
 
 fn lookup(k: KeyEvent) -> Option<Action> {
@@ -212,13 +230,23 @@ fn places_key(app: &mut App, k: KeyEvent) -> bool {
     match k.code {
         KeyCode::Char('j') | KeyCode::Down => step(app, 1),
         KeyCode::Char('k') | KeyCode::Up => step(app, -1),
-        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+        // `l` points the view at the place and stays, so the panel can be walked
+        // while the view follows. `Enter` means "this one, take me there" and so
+        // hands focus over as well. A bare motion never leaves its pane; an
+        // accept key may.
+        KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
             if let Some(t) = app.places[app.places_sel].target().cloned() {
                 app.goto(t, true);
-                app.focus = Focus::View;
+                if k.code == KeyCode::Enter {
+                    app.focus = Focus::View;
+                }
             }
         }
-        KeyCode::Char('h') | KeyCode::Left | KeyCode::Tab => app.focus = Focus::View,
+        // The panel is one column deep, so there is nothing to the left of a
+        // place. Swallowed rather than ignored, or it would reach the view's
+        // cursor, which the user cannot see moving.
+        KeyCode::Char('h') | KeyCode::Left => {}
+        KeyCode::Tab => app.focus = Focus::View,
         KeyCode::F(9) => {
             app.places_visible = false;
             app.focus = Focus::View;
@@ -340,7 +368,7 @@ pub const fn b(code: KeyCode, mods: KeyModifiers, action: Action) -> Bind {
 }
 
 pub fn act(app: &mut App, a: Action, n: usize) {
-    let extend = app.mode == Mode::Visual;
+    let extend = app.mode.is_visual();
     let stride = app.pane().stride() as isize;
     let page = app.pane().page() as isize;
     match a {
@@ -360,21 +388,33 @@ pub fn act(app: &mut App, a: Action, n: usize) {
         Action::Refresh => app.reload(),
 
         // cursor
-        Action::MoveDown => app.move_cursor(stride * n as isize, extend),
-        Action::MoveUp => app.move_cursor(-stride * n as isize, extend),
-        Action::MoveRight => {
-            if app.pane().view == ViewMode::Details {
-                // `l` opens in Details, where there is no horizontal axis.
-                app.activate();
+        //
+        // A line is `stride` consecutive items. Which key walks it and which
+        // crosses it depends on how the view flows: Icons run left to right, so
+        // a line is a row and `h`/`l` walk it; Compact runs down its columns, so
+        // a line is a column and `j`/`k` walk it. Details has stride 1 and no
+        // horizontal axis at all, so `j`/`k` simply cross.
+        Action::MoveDown | Action::MoveUp => {
+            let d = if a == Action::MoveUp {
+                -(n as isize)
             } else {
-                app.move_cursor(n as isize, extend);
+                n as isize
+            };
+            if app.pane().view == ViewMode::Compact {
+                app.step_along(d, extend);
+            } else {
+                app.step_across(d, extend);
             }
         }
-        Action::MoveLeft => {
-            if app.pane().view == ViewMode::Details {
-                app.go_up();
-            } else {
-                app.move_cursor(-(n as isize), extend);
+        Action::MoveLeft | Action::MoveRight => {
+            let left = a == Action::MoveLeft;
+            let d = if left { -(n as isize) } else { n as isize };
+            match app.pane().view {
+                // `l` opens in Details, `h` goes up. There is nothing sideways.
+                ViewMode::Details if left => app.go_up(),
+                ViewMode::Details => app.activate(),
+                ViewMode::Compact => app.step_across(d, extend),
+                ViewMode::Icons => app.step_along(d, extend),
             }
         }
         Action::Top => {
@@ -412,28 +452,8 @@ pub fn act(app: &mut App, a: Action, n: usize) {
         }
         Action::SelectAll => app.select_all(),
         Action::InvertSelect => app.invert_selection(),
-        Action::EnterVisual => {
-            app.mode = Mode::Visual;
-            let c = app.pane().cursor;
-            app.pane_mut().anchor = c;
-            app.toggle_select();
-        }
-        Action::EnterVisualLine => {
-            // `V` takes the whole row in a grid, the whole listing in Details.
-            let (c, s) = (app.pane().cursor, app.pane().stride());
-            let (start, end) = if app.pane().view == ViewMode::Details {
-                (0, app.pane().len().saturating_sub(1))
-            } else {
-                (
-                    c - c % s,
-                    (c - c % s + s - 1).min(app.pane().len().saturating_sub(1)),
-                )
-            };
-            let paths: Vec<PathBuf> = (start..=end)
-                .filter_map(|i| app.pane().at(i).map(|e| e.path.clone()))
-                .collect();
-            app.pane_mut().selected.extend(paths);
-        }
+        Action::EnterVisual => enter_visual(app, Mode::Visual),
+        Action::EnterVisualLine => enter_visual(app, Mode::VisualLine),
 
         // file operations
         Action::Copy => {
@@ -565,7 +585,16 @@ pub fn act(app: &mut App, a: Action, n: usize) {
         Action::ToggleSplit => app.toggle_split(),
         Action::FocusLeft => app.focus_left(),
         Action::FocusRight => app.focus_right(),
-        Action::EnterCrumbs => enter_crumbs(app, config::NAV_BTNS - 1),
+        // Straight up, into whatever is overhead. The nav group sits over the
+        // Places panel and the trail starts where the file view does, so which
+        // one that is depends on the pane you left.
+        Action::EnterCrumbs => {
+            if app.focus == Focus::Places {
+                focus_button(app, 0);
+            } else {
+                enter_crumbs(app, config::NAV_BTNS - 1);
+            }
+        }
         Action::SwapPane => {
             if app.split_on() {
                 app.other_pane();
@@ -1068,21 +1097,32 @@ pub fn menu_items(kind: &MenuKind) -> Vec<(&'static str, Action)> {
 
 fn menu(app: &mut App, k: KeyEvent, kind: MenuKind) {
     let items = menu_items(&kind);
+    // A menu hanging off the toolbar is also a place in that row, so the row's
+    // own motions work from inside it. That takes `h` and `l`, which is why
+    // accepting is Enter and not `l`: a motion that sometimes acts is the
+    // ambiguity the breadcrumb already refuses.
+    if let Some(i) = menu_owner(&kind) {
+        if toolbar_nav(app, k, i) {
+            return;
+        }
+    }
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let n = items.len();
+    let accept = |app: &mut App| {
+        let a = items[app.menu_sel].1;
+        leave_toolbar(app);
+        act(app, a, 1);
+    };
     match k.code {
         KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Normal,
-        KeyCode::Down | KeyCode::Char('j') => {
-            app.menu_sel = (app.menu_sel + 1) % items.len();
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            app.menu_sel = (app.menu_sel + items.len() - 1) % items.len();
-        }
+        KeyCode::Char('n') if ctrl => app.menu_sel = (app.menu_sel + 1) % n,
+        KeyCode::Char('p') if ctrl => app.menu_sel = (app.menu_sel + n - 1) % n,
+        KeyCode::Char('y') if ctrl => accept(app),
+        KeyCode::Down | KeyCode::Char('j') => app.menu_sel = (app.menu_sel + 1) % n,
+        KeyCode::Up | KeyCode::Char('k') => app.menu_sel = (app.menu_sel + n - 1) % n,
         KeyCode::Home | KeyCode::Char('g') => app.menu_sel = 0,
-        KeyCode::End | KeyCode::Char('G') => app.menu_sel = items.len() - 1,
-        KeyCode::Enter | KeyCode::Char('l') => {
-            let a = items[app.menu_sel].1;
-            app.mode = Mode::Normal;
-            act(app, a, 1);
-        }
+        KeyCode::End | KeyCode::Char('G') => app.menu_sel = n - 1,
+        KeyCode::Enter | KeyCode::Tab => accept(app),
         _ => {}
     }
 }
@@ -1131,7 +1171,7 @@ fn enter_crumbs(app: &mut App, fallback: usize) {
             app.menu_sel = 0;
             app.mode = Mode::CrumbMenu(seg);
         }
-        None => app.mode = Mode::Buttons(fallback),
+        None => focus_button(app, fallback),
     }
 }
 
@@ -1139,6 +1179,53 @@ fn enter_crumbs(app: &mut App, fallback: usize) {
 /// by side — nav group, breadcrumb, right group — so Ctrl+h and Ctrl+l cross
 /// between them while bare h and l walk the buttons within one.
 fn buttons(app: &mut App, k: KeyEvent, i: usize) {
+    if toolbar_nav(app, k, i) {
+        return;
+    }
+    match k.code {
+        KeyCode::Char('y') if k.modifiers.contains(KeyModifiers::CONTROL) => press_button(app, i),
+        KeyCode::Enter | KeyCode::Tab => press_button(app, i),
+        _ => {}
+    }
+}
+
+/// The menu a toolbar button drops, if it drops one.
+fn button_menu(i: usize) -> Option<MenuKind> {
+    match config::TOOLBAR_BTNS.get(i) {
+        Some(Action::OpenViewMenu) => Some(MenuKind::ViewMode),
+        Some(Action::OpenMenu) => Some(MenuKind::Hamburger),
+        _ => None,
+    }
+}
+
+/// The button a menu hangs from. `Mode::Menu` carries no index because the same
+/// menu opens from `m` and from the right button too, so the owner is derived
+/// rather than stored — there is nothing to keep in step.
+pub fn menu_owner(kind: &MenuKind) -> Option<usize> {
+    let want = match kind {
+        MenuKind::ViewMode => Action::OpenViewMenu,
+        MenuKind::Hamburger => Action::OpenMenu,
+        MenuKind::Sort => return None,
+    };
+    config::TOOLBAR_BTNS.iter().position(|a| *a == want)
+}
+
+/// Put focus on toolbar button `i`. A button that drops a menu shows it on
+/// arrival, so the row reads like the breadcrumb, where landing on a segment
+/// *is* opening its dropdown. `Mode::Menu` is then both "the menu is open" and
+/// "focus is on its button", which is why there is no flag for either.
+fn focus_button(app: &mut App, i: usize) {
+    app.menu_sel = 0;
+    app.mode = match button_menu(i) {
+        Some(kind) => Mode::Menu(kind),
+        None => Mode::Buttons(i),
+    };
+}
+
+/// The keys that move focus around the toolbar row, for a focus resting on
+/// button `i`. Shared by a bare button and by a menu hanging off one: they are
+/// the same position in the row. True when the key was consumed.
+fn toolbar_nav(app: &mut App, k: KeyEvent, i: usize) -> bool {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     let nav = i < config::NAV_BTNS;
     let (lo, hi) = if nav {
@@ -1161,13 +1248,21 @@ fn buttons(app: &mut App, k: KeyEvent, i: usize) {
                 enter_crumbs(app, config::NAV_BTNS)
             }
         }
-        KeyCode::Char('y') if ctrl => press_button(app, i),
         KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Normal,
-        KeyCode::Left | KeyCode::Char('h') => app.mode = Mode::Buttons(i.saturating_sub(1).max(lo)),
-        KeyCode::Right | KeyCode::Char('l') => app.mode = Mode::Buttons((i + 1).min(hi)),
-        KeyCode::Enter | KeyCode::Tab => press_button(app, i),
-        _ => {}
+        KeyCode::Left | KeyCode::Char('h') => focus_button(app, i.saturating_sub(1).max(lo)),
+        KeyCode::Right | KeyCode::Char('l') => focus_button(app, (i + 1).min(hi)),
+        _ => return false,
     }
+    true
+}
+
+/// Come down from the toolbar by *acting*, as opposed to cancelling. The action
+/// was asked for from up in the row but it lands in the file view, so focus goes
+/// there rather than back to whichever pane the row was entered from. `Esc` and
+/// `Ctrl+j` are the ways back to where you came up from.
+pub fn leave_toolbar(app: &mut App) {
+    app.mode = Mode::Normal;
+    app.focus = Focus::View;
 }
 
 /// Leave the toolbar first: a button whose action opens a menu has to be able
@@ -1176,7 +1271,7 @@ fn press_button(app: &mut App, i: usize) {
     let Some(a) = config::TOOLBAR_BTNS.get(i) else {
         return;
     };
-    app.mode = Mode::Normal;
+    leave_toolbar(app);
     act(app, *a, 1);
 }
 
@@ -1205,8 +1300,8 @@ fn crumb_menu(app: &mut App, k: KeyEvent, seg: usize) {
         // on the button nearest the trail.
         KeyCode::Char('j') if ctrl => app.mode = Mode::Normal,
         KeyCode::Char('k') if ctrl => {}
-        KeyCode::Char('h') if ctrl => app.mode = Mode::Buttons(config::NAV_BTNS - 1),
-        KeyCode::Char('l') if ctrl => app.mode = Mode::Buttons(config::NAV_BTNS),
+        KeyCode::Char('h') if ctrl => focus_button(app, config::NAV_BTNS - 1),
+        KeyCode::Char('l') if ctrl => focus_button(app, config::NAV_BTNS),
         KeyCode::Char('n') if ctrl => app.menu_sel = (app.menu_sel + 1) % items.len(),
         KeyCode::Char('p') if ctrl => app.menu_sel = (app.menu_sel + items.len() - 1) % items.len(),
         KeyCode::Char('y') if ctrl => accept_crumb(app, &items),
@@ -1229,7 +1324,7 @@ fn accept_crumb(app: &mut App, items: &[PathBuf]) {
     let Some(d) = items.get(app.menu_sel).cloned() else {
         return;
     };
-    app.mode = Mode::Normal;
+    leave_toolbar(app);
     app.goto(Target::Dir(d), true);
 }
 
