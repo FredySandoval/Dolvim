@@ -30,6 +30,7 @@ pub fn key(app: &mut App, k: KeyEvent) {
         Mode::Properties | Mode::Help => app.mode = Mode::Normal,
         Mode::Menu(kind) => menu(app, k, kind),
         Mode::CrumbMenu(i) => crumb_menu(app, k, i),
+        Mode::Buttons(i) => buttons(app, k, i),
         _ => text(app, k),
     }
 }
@@ -134,10 +135,28 @@ fn delete_motion(app: &mut App, k: KeyEvent, pre: usize) {
     trash(app, v);
 }
 
+/// What an operation acts on: the selection when there is one, otherwise `n`
+/// rows from the cursor down. Every destructive action follows this rule.
+fn targets(app: &App, n: usize) -> Vec<PathBuf> {
+    if app.pane().selected.is_empty() {
+        let c = app.pane().cursor;
+        app.pane().paths_in(c, c + n - 1)
+    } else {
+        app.pane().selected_paths()
+    }
+}
+
 /// The one path to the Trash. Every delete key ends here so that the undo
 /// entry, the message and the refresh cannot drift apart.
 fn trash(app: &mut App, v: Vec<PathBuf>) {
     if v.is_empty() {
+        return;
+    }
+    // In the Trash there is no further "away" to move something to, so `x`
+    // means purge, as it does in Dolphin. It goes behind the Shift+Del
+    // confirmation: this is the one place the key is not undoable.
+    if app.pane().target == Target::Trash {
+        app.mode = Mode::Confirm(Confirm::PurgeFromTrash(v));
         return;
     }
     match ops::trash(&v) {
@@ -436,12 +455,7 @@ pub fn act(app: &mut App, a: Action, n: usize) {
             // `x` on the cursor, `5x` on five rows, the selection if there is
             // one. A selection is an explicit range, so it beats the count
             // rather than being sliced by it.
-            let v = if app.pane().selected.is_empty() {
-                let c = app.pane().cursor;
-                app.pane().paths_in(c, c + n - 1)
-            } else {
-                app.pane().selected_paths()
-            };
+            let v = targets(app, n);
             trash(app, v);
         }
         Action::DeleteOp => {
@@ -454,9 +468,13 @@ pub fn act(app: &mut App, a: Action, n: usize) {
             }
         }
         Action::DeletePerm => {
-            let v = app.pane().selected_paths();
+            let v = targets(app, n);
             if !v.is_empty() {
-                app.mode = Mode::Confirm(Confirm::DeletePermanently(v));
+                app.mode = Mode::Confirm(if app.pane().target == Target::Trash {
+                    Confirm::PurgeFromTrash(v)
+                } else {
+                    Confirm::DeletePermanently(v)
+                });
             }
         }
         Action::Rename => start_rename(app),
@@ -521,7 +539,7 @@ pub fn act(app: &mut App, a: Action, n: usize) {
         }
         Action::EmptyTrash => app.mode = Mode::Confirm(Confirm::EmptyTrash),
         Action::Restore => {
-            let v = app.pane().selected_paths();
+            let v = targets(app, n);
             match ops::restore_from_trash(&v) {
                 Ok(n) => {
                     app.info(format!("Restored {n} item(s)"));
@@ -547,19 +565,7 @@ pub fn act(app: &mut App, a: Action, n: usize) {
         Action::ToggleSplit => app.toggle_split(),
         Action::FocusLeft => app.focus_left(),
         Action::FocusRight => app.focus_right(),
-        Action::EnterCrumbs => {
-            // The rightmost segment is the one you are standing in, so its
-            // children are the listing in front of you — the useful default.
-            let seg = crate::ui::crumb_paths(&app.pane().cwd)
-                .len()
-                .saturating_sub(1);
-            if crumb_siblings(app, seg).is_empty() {
-                app.info("No subdirectories here");
-            } else {
-                app.menu_sel = 0;
-                app.mode = Mode::CrumbMenu(seg);
-            }
-        }
+        Action::EnterCrumbs => enter_crumbs(app, config::NAV_BTNS - 1),
         Action::SwapPane => {
             if app.split_on() {
                 app.other_pane();
@@ -997,6 +1003,14 @@ fn confirm(app: &mut App, k: KeyEvent, what: Confirm) {
             }
             Err(e) => app.error(e),
         },
+        Confirm::PurgeFromTrash(paths) => match ops::purge_from_trash(&paths) {
+            Ok(n) => {
+                app.pane_mut().selected.clear();
+                app.reload();
+                app.info(format!("Deleted {n} item(s) permanently"));
+            }
+            Err(e) => app.error(e),
+        },
         Confirm::EmptyTrash => match ops::empty_trash() {
             Ok(n) => {
                 app.reload();
@@ -1093,6 +1107,79 @@ pub fn crumb_siblings(app: &App, seg: usize) -> Vec<PathBuf> {
     v
 }
 
+/// The rightmost trail segment with subdirectories to list. Only the segment
+/// you are standing in can be childless — every one to its left holds at least
+/// the path you came through — so in a real directory this always finds one.
+/// A virtual place like `trash:/` has no trail at all, hence the `None`.
+fn openable_crumb(app: &App) -> Option<usize> {
+    let mut seg = crate::ui::crumb_paths(&app.pane().cwd)
+        .len()
+        .saturating_sub(1);
+    loop {
+        if !crumb_siblings(app, seg).is_empty() {
+            return Some(seg);
+        }
+        seg = seg.checked_sub(1)?;
+    }
+}
+
+/// Into the breadcrumb, or — when there is no trail to open — onto the button
+/// given as the fallback, so the toolbar stays reachable from every place.
+fn enter_crumbs(app: &mut App, fallback: usize) {
+    match openable_crumb(app) {
+        Some(seg) => {
+            app.menu_sel = 0;
+            app.mode = Mode::CrumbMenu(seg);
+        }
+        None => app.mode = Mode::Buttons(fallback),
+    }
+}
+
+/// The toolbar buttons, driven from the keyboard. The row is three panes side
+/// by side — nav group, breadcrumb, right group — so Ctrl+h and Ctrl+l cross
+/// between them while bare h and l walk the buttons within one.
+fn buttons(app: &mut App, k: KeyEvent, i: usize) {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let nav = i < config::NAV_BTNS;
+    let (lo, hi) = if nav {
+        (0, config::NAV_BTNS - 1)
+    } else {
+        (config::NAV_BTNS, config::TOOLBAR_BTNS.len() - 1)
+    };
+    match k.code {
+        KeyCode::Char('j') if ctrl => app.mode = Mode::Normal,
+        KeyCode::Char('k') if ctrl => {}
+        // Crossing lands on the trail, or steps straight over it to the other
+        // group when the place has no trail to open.
+        KeyCode::Char('h') if ctrl => {
+            if !nav {
+                enter_crumbs(app, config::NAV_BTNS - 1)
+            }
+        }
+        KeyCode::Char('l') if ctrl => {
+            if nav {
+                enter_crumbs(app, config::NAV_BTNS)
+            }
+        }
+        KeyCode::Char('y') if ctrl => press_button(app, i),
+        KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Normal,
+        KeyCode::Left | KeyCode::Char('h') => app.mode = Mode::Buttons(i.saturating_sub(1).max(lo)),
+        KeyCode::Right | KeyCode::Char('l') => app.mode = Mode::Buttons((i + 1).min(hi)),
+        KeyCode::Enter | KeyCode::Tab => press_button(app, i),
+        _ => {}
+    }
+}
+
+/// Leave the toolbar first: a button whose action opens a menu has to be able
+/// to set the mode after us, not have it overwritten.
+fn press_button(app: &mut App, i: usize) {
+    let Some(a) = config::TOOLBAR_BTNS.get(i) else {
+        return;
+    };
+    app.mode = Mode::Normal;
+    act(app, *a, 1);
+}
+
 /// The breadcrumb, driven from the keyboard. `Mode::CrumbMenu(seg)` is both
 /// "focus is up in the breadcrumb" and "segment `seg` has its menu open" —
 /// there is no third state where the crumb has focus with everything shut, so
@@ -1113,10 +1200,13 @@ fn crumb_menu(app: &mut App, k: KeyEvent, seg: usize) {
     };
     match k.code {
         // Ctrl+j is the way back down, the mirror of the Ctrl+k that came up.
-        // The other Ctrl motions are pane motions, and the breadcrumb is one
-        // pane occupying the whole row, so there is nowhere for them to go.
+        // Ctrl+h and Ctrl+l are pane motions and the toolbar row holds three
+        // panes, so they step out to the button group on either side, landing
+        // on the button nearest the trail.
         KeyCode::Char('j') if ctrl => app.mode = Mode::Normal,
-        KeyCode::Char('h' | 'k' | 'l') if ctrl => {}
+        KeyCode::Char('k') if ctrl => {}
+        KeyCode::Char('h') if ctrl => app.mode = Mode::Buttons(config::NAV_BTNS - 1),
+        KeyCode::Char('l') if ctrl => app.mode = Mode::Buttons(config::NAV_BTNS),
         KeyCode::Char('n') if ctrl => app.menu_sel = (app.menu_sel + 1) % items.len(),
         KeyCode::Char('p') if ctrl => app.menu_sel = (app.menu_sel + items.len() - 1) % items.len(),
         KeyCode::Char('y') if ctrl => accept_crumb(app, &items),

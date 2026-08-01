@@ -92,6 +92,12 @@ fn toolbar(f: &mut Frame, app: &mut App, area: Rect) {
     let can_back = p.hist_pos > 0;
     let can_fwd = p.hist_pos + 1 < p.history.len();
 
+    // The focused toolbar button wears the same fill a selected file does.
+    let sel = |n: usize, st: Style| match app.mode {
+        Mode::Buttons(i) if i == n => st.bg(color::SELECTION),
+        _ => st,
+    };
+
     let mut x = area.x;
     let put = |buf: &mut Buffer, s: &str, st: Style, x: &mut u16| -> Rect {
         let w = s.width() as u16;
@@ -102,9 +108,11 @@ fn toolbar(f: &mut Frame, app: &mut App, area: Rect) {
     };
 
     put(buf, " ", base, &mut x);
-    app.hits.back = put(buf, g::BACK, if can_back { base } else { dim }, &mut x);
+    let back_st = sel(0, if can_back { base } else { dim });
+    app.hits.back = put(buf, g::BACK, back_st, &mut x);
     put(buf, "  ", base, &mut x);
-    app.hits.forward = put(buf, g::FORWARD, if can_fwd { base } else { dim }, &mut x);
+    let fwd_st = sel(1, if can_fwd { base } else { dim });
+    app.hits.forward = put(buf, g::FORWARD, fwd_st, &mut x);
     put(buf, "   ", base, &mut x);
 
     // Dolphin's split button: the icon shows the current mode and cycles it,
@@ -114,9 +122,10 @@ fn toolbar(f: &mut Frame, app: &mut App, area: Rect) {
         ViewMode::Compact => g::VIEW_COMPACT,
         ViewMode::Details => g::VIEW_DETAILS,
     };
-    app.hits.view_cycle = put(buf, vg, base, &mut x);
-    put(buf, " ", base, &mut x);
-    app.hits.view_menu = put(buf, g::DROPDOWN, base, &mut x);
+    let view_st = sel(2, base);
+    app.hits.view_cycle = put(buf, vg, view_st, &mut x);
+    put(buf, " ", view_st, &mut x);
+    app.hits.view_menu = put(buf, g::DROPDOWN, view_st, &mut x);
 
     // The navigation group sits over the Places panel and the breadcrumb
     // starts where the file view does, which is how Dolphin lines them up.
@@ -214,15 +223,18 @@ fn toolbar(f: &mut Frame, app: &mut App, area: Rect) {
         Rect::new(*rx, area.y, w, 1)
     };
     put_r(buf, " ", base, &mut rx);
-    app.hits.menu = put_r(buf, g::MENU, base, &mut rx);
+    app.hits.menu = put_r(buf, g::MENU, sel(5, base), &mut rx);
     put_r(buf, "   ", base, &mut rx);
-    app.hits.search = put_r(buf, g::SEARCH, base, &mut rx);
+    app.hits.search = put_r(buf, g::SEARCH, sel(4, base), &mut rx);
     put_r(buf, "   ", base, &mut rx);
-    let split_style = if app.split_on() {
-        base.fg(color::ACCENT)
-    } else {
-        base
-    };
+    let split_style = sel(
+        3,
+        if app.split_on() {
+            base.fg(color::ACCENT)
+        } else {
+            base
+        },
+    );
     app.hits.split = put_r(buf, &format!("{} Split", g::SPLIT), split_style, &mut rx);
 
     if let Some(pos) = cursor {
@@ -1063,7 +1075,9 @@ fn overlays(f: &mut Frame, app: &mut App, area: Rect) {
                 _ => app.hits.menu,
             };
             let x = anchor.x.min(area.right().saturating_sub(w));
-            let r = Rect::new(x, area.y + 1, w, h.min(area.height));
+            // The popup hangs from the row under the toolbar, so the height it
+            // may take is one less than the screen — not the whole of it.
+            let r = Rect::new(x, area.y + 1, w, h.min(area.height.saturating_sub(1)));
             app.hits.menu_popup = inner_of(r);
             menu_popup(
                 f,
@@ -1081,7 +1095,7 @@ fn overlays(f: &mut Frame, app: &mut App, area: Rect) {
                 return;
             }
             let w = items.iter().map(|s| s.width()).max().unwrap_or(10) as u16 + 4;
-            let h = (items.len() as u16 + 2).min(area.height.saturating_sub(2));
+            let h = (items.len() as u16 + 2).min(area.height.saturating_sub(1));
             let x = app
                 .hits
                 .crumb_arrows
@@ -1099,6 +1113,13 @@ fn overlays(f: &mut Frame, app: &mut App, area: Rect) {
                     "Delete permanently",
                     format!(
                         "Delete {} item(s) permanently? This cannot be undone.",
+                        v.len()
+                    ),
+                ),
+                crate::app::Confirm::PurgeFromTrash(v) => (
+                    "Delete permanently",
+                    format!(
+                        "Delete {} item(s) from the Trash? This cannot be undone.",
                         v.len()
                     ),
                 ),
@@ -1222,11 +1243,12 @@ fn help_lines() -> Vec<Line<'static>> {
         row("H", "toggle hidden files"),
         row("F3  F9  F11  Ctrl+I", "split, places, info, filter"),
         row("Ctrl+h / Ctrl+l", "focus the panel left / right"),
-        sect("Breadcrumb"),
-        row("Ctrl+k / Ctrl+j", "up into the trail, back down"),
-        row("h  l", "previous / next segment"),
-        row("j  k / Ctrl+n  Ctrl+p", "down / up the menu"),
-        row("Ctrl+y  Enter  Tab", "go there        Esc  cancel"),
+        sect("Toolbar row"),
+        row("Ctrl+k / Ctrl+j", "up into the row, back down"),
+        row("Ctrl+h  Ctrl+l", "nav buttons / trail / right buttons"),
+        row("h  l", "previous / next item"),
+        row("j  k / Ctrl+n  Ctrl+p", "down / up an open menu"),
+        row("Ctrl+y  Enter  Tab", "accept          Esc  cancel"),
         row("F4", "shell here (suspends Dolvim)"),
         sect("Tabs and commands"),
         row("Ctrl+T Ctrl+W gt gT", "new, close, next, previous"),

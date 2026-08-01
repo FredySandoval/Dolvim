@@ -66,6 +66,8 @@ pub enum Mode {
     Help,
     /// A dropdown of sibling directories hanging off a breadcrumb segment.
     CrumbMenu(usize),
+    /// Focus is on a toolbar button: an index into `config::TOOLBAR_BTNS`.
+    Buttons(usize),
     Menu(MenuKind),
 }
 
@@ -79,6 +81,9 @@ pub enum MenuKind {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Confirm {
     DeletePermanently(Vec<PathBuf>),
+    /// The same question for items already in the Trash, which have to be
+    /// purged through the trash index rather than unlinked where they lie.
+    PurgeFromTrash(Vec<PathBuf>),
     EmptyTrash,
 }
 

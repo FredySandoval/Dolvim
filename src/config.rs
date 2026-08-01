@@ -212,6 +212,21 @@ pub const VIM_KEYS: &[Bind] = &[
     b(K::Char('?'), M::SHIFT  , Action::Help           ),
 ];
 
+/* The toolbar buttons, left to right, with the breadcrumb between the nav
+   group and the rest. Ctrl+h / Ctrl+l step across the three groups; h and l
+   walk the buttons inside one. */
+pub const NAV_BTNS: usize = 3;
+pub const TOOLBAR_BTNS: &[Action] = &[
+    /* nav group, left of the breadcrumb */
+    Action::Back,
+    Action::Forward,
+    Action::OpenViewMenu,
+    /* right group */
+    Action::ToggleSplit,
+    Action::EnterSearch,
+    Action::OpenMenu,
+];
+
 /* Two-key sequences: press the leader, then the follower. */
 pub const CHORDS: &[(char, char, Action)] = &[
    /* lead  then action               */

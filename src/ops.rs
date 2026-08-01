@@ -267,7 +267,7 @@ pub fn name(p: &Path) -> String {
 // ---------------------------------------------------------------------------
 
 pub fn trash(paths: &[PathBuf]) -> Result<UndoOp, String> {
-    trash::delete_all(paths).map_err(|e| e.to_string())?;
+    trash::delete_all(paths).map_err(trash_error)?;
     Ok(UndoOp::Trash {
         originals: paths.to_vec(),
     })
@@ -302,8 +302,29 @@ pub fn list_trash() -> Vec<Entry> {
         .collect()
 }
 
-pub fn restore_from_trash(originals: &[PathBuf]) -> Result<usize, String> {
-    let items = trash::os_limited::list().map_err(|e| e.to_string())?;
+/// The crate's `Display` prints its Debug-ish struct variant — a path and a
+/// field name where the status bar has room for a sentence. Say what happened.
+fn trash_error(e: trash::Error) -> String {
+    match e {
+        trash::Error::CanonicalizePath { original } => {
+            format!("{}: no longer there", name(&original))
+        }
+        // `path` here is a directory inside the trash can, not the file the
+        // user asked about, so naming it would only mislead. The io error is
+        // the part that says why.
+        trash::Error::FileSystem { source, .. } => {
+            format!("Cannot write to the Trash: {source}")
+        }
+        trash::Error::CouldNotAccess { target } => format!("{target}: cannot access"),
+        trash::Error::TargetedRoot => "Refusing to trash a filesystem root".into(),
+        e => format!("Trash failed: {e}"),
+    }
+}
+
+/// A Trash entry's `path` is where it came from, not where it now sits, so
+/// both operations on trashed items look them up by that original path.
+fn trash_items(originals: &[PathBuf]) -> Result<Vec<trash::TrashItem>, String> {
+    let items = trash::os_limited::list().map_err(trash_error)?;
     let wanted: Vec<_> = items
         .into_iter()
         .filter(|it| {
@@ -312,18 +333,30 @@ pub fn restore_from_trash(originals: &[PathBuf]) -> Result<usize, String> {
                 .any(|o| it.original_parent.join(&it.name) == *o)
         })
         .collect();
-    let n = wanted.len();
-    if n == 0 {
+    if wanted.is_empty() {
         return Err("No matching items in Trash".into());
     }
-    trash::os_limited::restore_all(wanted).map_err(|e| e.to_string())?;
+    Ok(wanted)
+}
+
+pub fn restore_from_trash(originals: &[PathBuf]) -> Result<usize, String> {
+    let wanted = trash_items(originals)?;
+    let n = wanted.len();
+    trash::os_limited::restore_all(wanted).map_err(trash_error)?;
+    Ok(n)
+}
+
+pub fn purge_from_trash(originals: &[PathBuf]) -> Result<usize, String> {
+    let wanted = trash_items(originals)?;
+    let n = wanted.len();
+    trash::os_limited::purge_all(wanted).map_err(trash_error)?;
     Ok(n)
 }
 
 pub fn empty_trash() -> Result<usize, String> {
-    let items = trash::os_limited::list().map_err(|e| e.to_string())?;
+    let items = trash::os_limited::list().map_err(trash_error)?;
     let n = items.len();
-    trash::os_limited::purge_all(items).map_err(|e| e.to_string())?;
+    trash::os_limited::purge_all(items).map_err(trash_error)?;
     Ok(n)
 }
 
