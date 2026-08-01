@@ -1,4 +1,4 @@
-# Dolvim + vim = Dolvim
+# Dolphin + vim = Dolvim
 
 KDE Dolphin, recreated in the terminal, with vim bindings.
 
