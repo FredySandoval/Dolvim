@@ -1,11 +1,11 @@
-# dolvin - KDE Dolphin, recreated in the terminal
+# dolvim - KDE Dolphin, recreated in the terminal
 # See LICENSE for copyright and license details.
 
 # config.rs is hand-aligned and rustfmt.toml ignores it, but `ignore` is a
 # nightly option. Formatting through stable silently reflows the tables.
 FMT_TOOLCHAIN = nightly
 
-BIN = target/release/dolvin
+BIN = target/release/dolvim
 
 all: build
 
@@ -37,7 +37,7 @@ install:
 	cargo install --path .
 
 uninstall:
-	cargo uninstall dolvin
+	cargo uninstall dolvim
 
 clean:
 	cargo clean
