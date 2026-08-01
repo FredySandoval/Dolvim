@@ -7,7 +7,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
@@ -124,7 +124,7 @@ fn toolbar(f: &mut Frame, app: &mut App, area: Rect) {
         x = x.max(area.x + config::PLACES_WIDTH);
     }
 
-    // Breadcrumb, or the editable path field when Ctrl+L is active.
+    // Breadcrumb, or the editable path field when path edit is active.
     let right_w: u16 = 22;
     let crumb_area = Rect::new(
         x,
@@ -158,13 +158,28 @@ fn toolbar(f: &mut Frame, app: &mut App, area: Rect) {
         while total_crumb_width(&segs) > crumb_area.width && segs.len() > 1 {
             segs.remove(0);
         }
+        // The segment whose dropdown is open, if any. Its arrow points down and
+        // it carries the selection background, so the row says where you are.
+        let open_seg = match app.mode {
+            Mode::CrumbMenu(i) => Some(i),
+            _ => None,
+        };
         let mut cx = crumb_area.x;
         let last = segs.len().saturating_sub(1);
         for (n, (i, label)) in segs.iter().enumerate() {
-            let sep = format!(" {} ", g::CRUMB_SEP);
+            // One marker at the head of the trail, then blanks. A separator per
+            // hop is three columns each of punctuation the path already implies.
+            let sep = if n == 0 {
+                format!(" {} ", g::CRUMB_SEP)
+            } else {
+                "  ".to_string()
+            };
             buf.set_string(cx, area.y, &sep, dim);
             cx += sep.width() as u16;
-            let st = if n == last {
+            let open = open_seg == Some(*i);
+            let st = if open {
+                base.bg(color::SELECTION)
+            } else if n == last {
                 base.add_modifier(Modifier::BOLD)
             } else {
                 base
@@ -179,7 +194,12 @@ fn toolbar(f: &mut Frame, app: &mut App, area: Rect) {
                 .push((Rect::new(cx, area.y, w, 1), paths[*i].clone()));
             cx += w;
             let arrow = Rect::new(cx, area.y, 1, 1);
-            buf.set_string(cx, area.y, g::DROPDOWN, dim);
+            let (glyph, ast) = if open {
+                (g::DROPDOWN, st)
+            } else {
+                (g::CRUMB_SHUT, dim)
+            };
+            buf.set_string(cx, area.y, glyph, ast);
             app.hits.crumb_arrows.push((arrow, *i));
             cx += 1;
         }
@@ -210,8 +230,13 @@ fn toolbar(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// Label plus arrow plus the blanks in front: three columns for the leading
+/// ` › `, two for every hop after it.
 fn total_crumb_width(segs: &[(usize, String)]) -> u16 {
-    segs.iter().map(|(_, s)| s.width() as u16 + 4).sum()
+    segs.iter()
+        .enumerate()
+        .map(|(n, (_, s))| s.width() as u16 + 1 + if n == 0 { 3 } else { 2 })
+        .sum()
 }
 
 fn tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
@@ -457,6 +482,8 @@ fn entry_style(p: &Pane, vis: usize, cut: bool) -> Style {
     let selected = p.selected.contains(&e.path);
     let fg = if cut {
         color::CUT
+    } else if e.is_locked() {
+        color::OFFLINE
     } else if e.is_dir() {
         color::FOLDER
     } else if e.kind == fs::Kind::Symlink {
@@ -595,6 +622,8 @@ fn icons_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool
             // selected, so it is the entry's kind that picks it.
             let fg = if is_cut {
                 color::CUT
+            } else if e.is_locked() {
+                color::OFFLINE
             } else if e.is_dir() {
                 color::FOLDER
             } else {
@@ -604,10 +633,8 @@ fn icons_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool
         }
 
         // Name, wrapped over its rows and centred, as Dolphin centres it.
-        for (li, part) in wrap_name(&e.name, body.width as usize, name_lines as usize)
-            .iter()
-            .enumerate()
-        {
+        let name = wrap_name(&e.name, body.width as usize, name_lines as usize);
+        for (li, part) in name.iter().enumerate() {
             let y = body.y + icon_h + li as u16;
             if y >= body.bottom() {
                 break;
@@ -617,9 +644,12 @@ fn icons_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool
         }
 
         if vis == app.pane_at(idx).cursor {
-            // One row taller than the cell: the frame's bottom edge borrows the
-            // blank row that the cell below opens with.
-            let h = (ch + 1).min(area.bottom().saturating_sub(y0));
+            // The frame hugs what is actually drawn: the blank margin row it is
+            // hung from, the icon, and only the name rows this name used. A
+            // one-line name gets a short box instead of two rows of empty space,
+            // and its bottom edge falls on a row the cell was not using anyway.
+            let used = (name.len() as u16).max(1);
+            let h = (icon_h + used + 2).min(area.bottom().saturating_sub(y0));
             outline(
                 f.buffer_mut(),
                 Rect::new(cell.x, cell.y, cell.width, h),
@@ -844,7 +874,9 @@ fn info_panel(f: &mut Frame, app: &mut App, area: Rect) {
             f.buffer_mut(),
             preview,
             e.glyph(),
-            Style::default().bg(color::PANEL_BG).fg(if e.is_dir() {
+            Style::default().bg(color::PANEL_BG).fg(if e.is_locked() {
+                color::OFFLINE
+            } else if e.is_dir() {
                 color::FOLDER
             } else {
                 color::FILE
@@ -1043,7 +1075,7 @@ fn overlays(f: &mut Frame, app: &mut App, area: Rect) {
         Mode::CrumbMenu(seg) => {
             let items: Vec<String> = vim::crumb_siblings(app, seg)
                 .iter()
-                .map(|p| crate::ops::name(p))
+                .map(|p| format!("{} {}", g::FOLDER, crate::ops::name(p)))
                 .collect();
             if items.is_empty() {
                 return;
@@ -1074,7 +1106,6 @@ fn overlays(f: &mut Frame, app: &mut App, area: Rect) {
                     "Empty Trash",
                     "Permanently delete everything in the Trash?".to_string(),
                 ),
-                crate::app::Confirm::Quit => ("Quit", "Close Dolvim?".to_string()),
             };
             let r = centre_rect(area, 60, 5);
             popup(
@@ -1179,15 +1210,23 @@ fn help_lines() -> Vec<Line<'static>> {
         row("Space  v  V", "toggle, visual, whole row"),
         row("Ctrl+A  Ctrl+Shift+A", "select all / invert"),
         sect("Files"),
-        row("y  d  p  x", "copy, cut, paste, trash"),
+        row("x  5x", "trash the item / n items"),
+        row("dd  3dd  dj  dk  dG", "trash: this, n, or to a motion"),
+        row("y  Ctrl+X  p", "copy, cut, paste"),
         row("r / cw / F2", "rename (batch when multi-selected)"),
         row("o  O / F10", "new file / new folder"),
-        row("u / Ctrl+Z", "undo        Shift+Del  delete forever"),
+        row("u", "undo        Shift+Del  delete forever"),
         row("D  P", "drag out / drop in (needs ripdrag)"),
         sect("View"),
         row("Ctrl+1/2/3", "icons / compact / details"),
-        row("zh / Ctrl+H", "hidden files"),
+        row("H", "toggle hidden files"),
         row("F3  F9  F11  Ctrl+I", "split, places, info, filter"),
+        row("Ctrl+h / Ctrl+l", "focus the panel left / right"),
+        sect("Breadcrumb"),
+        row("Ctrl+k / Ctrl+j", "up into the trail, back down"),
+        row("h  l", "previous / next segment"),
+        row("j  k / Ctrl+n  Ctrl+p", "down / up the menu"),
+        row("Ctrl+y  Enter  Tab", "go there        Esc  cancel"),
         row("F4", "shell here (suspends Dolvim)"),
         sect("Tabs and commands"),
         row("Ctrl+T Ctrl+W gt gT", "new, close, next, previous"),
@@ -1209,6 +1248,7 @@ fn popup(f: &mut Frame, r: Rect, title: &str, body: Vec<Line<'static>>) {
     f.render_widget(Clear, r);
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .title(format!(" {title} "))
         .style(Style::default().bg(color::PANEL_BG).fg(color::TEXT))
         .border_style(Style::default().fg(color::ACCENT));
@@ -1231,6 +1271,7 @@ fn menu_popup(f: &mut Frame, r: Rect, sel: usize, items: &[String]) {
     f.render_widget(Clear, r);
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .style(Style::default().bg(color::PANEL_BG).fg(color::TEXT))
         .border_style(Style::default().fg(color::SEPARATOR));
     let inner = block.inner(r);

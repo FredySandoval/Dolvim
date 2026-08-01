@@ -293,6 +293,7 @@ pub fn list_trash() -> Vec<Entry> {
                 size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
                 mtime: it.time_deleted,
                 mode: 0o644,
+                readable: true,
                 hidden: false,
                 depth: 0,
                 expanded: false,

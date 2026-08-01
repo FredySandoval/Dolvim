@@ -42,6 +42,7 @@ fn normal(app: &mut App, k: KeyEvent) {
     if k.code == KeyCode::Esc {
         app.count.clear();
         app.pending = None;
+        app.pending_delete = None;
         if app.mode == Mode::Visual {
             app.mode = Mode::Normal;
         } else {
@@ -73,6 +74,12 @@ fn normal(app: &mut App, k: KeyEvent) {
         }
     }
 
+    // A `d` owns the next motion. After the count block, so `d5j` can collect
+    // its 5 the same way `5j` does.
+    if let Some(pre) = app.pending_delete {
+        return delete_motion(app, k, pre);
+    }
+
     if app.focus == Focus::Places && places_key(app, k) {
         return;
     }
@@ -100,6 +107,54 @@ fn normal(app: &mut App, k: KeyEvent) {
     }
 }
 
+/// Resolve `d{motion}` into a linewise range and trash it.
+///
+/// `pre` is the count typed before the `d`; vim multiplies it by the one typed
+/// after, so `2d3j` is six lines. Anything that is not a motion cancels, which
+/// is what vim does with a key the operator cannot use.
+fn delete_motion(app: &mut App, k: KeyEvent, pre: usize) {
+    app.pending_delete = None;
+    // Ctrl+d is half-page down, not `dd`. Only a bare motion counts.
+    if !k.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+        return;
+    }
+    let n = pre * take_count(app);
+    let c = app.pane().cursor;
+    let last = app.pane().len().saturating_sub(1);
+    let (a, b) = match k.code {
+        // `dd` is this line and the n-1 below it; `dj` is this line *and* the
+        // n below, one more, exactly as in vim.
+        KeyCode::Char('d') => (c, c + n - 1),
+        KeyCode::Char('j') | KeyCode::Down => (c, c + n),
+        KeyCode::Char('k') | KeyCode::Up => (c.saturating_sub(n), c),
+        KeyCode::Char('G') => (c, last),
+        _ => return,
+    };
+    let v = app.pane().paths_in(a, b);
+    trash(app, v);
+}
+
+/// The one path to the Trash. Every delete key ends here so that the undo
+/// entry, the message and the refresh cannot drift apart.
+fn trash(app: &mut App, v: Vec<PathBuf>) {
+    if v.is_empty() {
+        return;
+    }
+    match ops::trash(&v) {
+        Ok(op) => {
+            app.undo.push(op);
+            app.info(format!("Moved {} item(s) to Trash", v.len()));
+            app.pane_mut().selected.clear();
+            app.refresh_in_place();
+        }
+        Err(e) => app.error(e),
+    }
+    // Deleting the visual range ends the visual, as `d` does in vim.
+    if app.mode == Mode::Visual {
+        app.mode = Mode::Normal;
+    }
+}
+
 fn lookup(k: KeyEvent) -> Option<Action> {
     let m = k.modifiers.difference(KeyModifiers::NONE);
     config::VIM_KEYS
@@ -117,6 +172,13 @@ fn take_count(app: &mut App) -> usize {
 
 /// Keys the Places panel consumes while it has focus. Returns true when handled.
 fn places_key(app: &mut App, k: KeyEvent) -> bool {
+    // A control chord is never Places navigation: `Ctrl+h` must move focus, not
+    // be read as the bare `h` that leaves the panel.
+    if k.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return false;
+    }
     let step = |app: &mut App, d: isize| {
         let n = app.places.len() as isize;
         let mut i = app.places_sel as isize;
@@ -186,6 +248,8 @@ pub enum Action {
     /* file operations */
     Copy,
     Cut,
+    /// `d`: trash a range, once a motion says which.
+    DeleteOp,
     Paste,
     Trash,
     DeletePerm,
@@ -206,6 +270,10 @@ pub enum Action {
     ToggleHidden,
     ToggleSplit,
     SwapPane,
+    FocusLeft,
+    FocusRight,
+    /// `Ctrl+k`: up into the breadcrumb, with its menu open.
+    EnterCrumbs,
     TogglePlaces,
     ToggleInfo,
     ToggleFilterBar,
@@ -365,20 +433,25 @@ pub fn act(app: &mut App, a: Action, n: usize) {
         }
         Action::Paste => paste(app),
         Action::Trash => {
-            let v = app.pane().selected_paths();
-            if v.is_empty() {
-                return;
+            // `x` on the cursor, `5x` on five rows, the selection if there is
+            // one. A selection is an explicit range, so it beats the count
+            // rather than being sliced by it.
+            let v = if app.pane().selected.is_empty() {
+                let c = app.pane().cursor;
+                app.pane().paths_in(c, c + n - 1)
+            } else {
+                app.pane().selected_paths()
+            };
+            trash(app, v);
+        }
+        Action::DeleteOp => {
+            // A selection already is the range, so there is nothing to wait for.
+            if app.pane().selected.is_empty() {
+                app.pending_delete = Some(n);
+            } else {
+                let v = app.pane().selected_paths();
+                trash(app, v);
             }
-            match ops::trash(&v) {
-                Ok(op) => {
-                    app.undo.push(op);
-                    app.info(format!("Moved {} item(s) to Trash", v.len()));
-                    app.pane_mut().selected.clear();
-                    app.refresh_in_place();
-                }
-                Err(e) => app.error(e),
-            }
-            app.mode = Mode::Normal;
         }
         Action::DeletePerm => {
             let v = app.pane().selected_paths();
@@ -472,6 +545,21 @@ pub fn act(app: &mut App, a: Action, n: usize) {
         }
         Action::ToggleHidden => app.toggle_hidden(),
         Action::ToggleSplit => app.toggle_split(),
+        Action::FocusLeft => app.focus_left(),
+        Action::FocusRight => app.focus_right(),
+        Action::EnterCrumbs => {
+            // The rightmost segment is the one you are standing in, so its
+            // children are the listing in front of you — the useful default.
+            let seg = crate::ui::crumb_paths(&app.pane().cwd)
+                .len()
+                .saturating_sub(1);
+            if crumb_siblings(app, seg).is_empty() {
+                app.info("No subdirectories here");
+            } else {
+                app.menu_sel = 0;
+                app.mode = Mode::CrumbMenu(seg);
+            }
+        }
         Action::SwapPane => {
             if app.split_on() {
                 app.other_pane();
@@ -916,7 +1004,6 @@ fn confirm(app: &mut App, k: KeyEvent, what: Confirm) {
             }
             Err(e) => app.error(e),
         },
-        Confirm::Quit => app.quit = true,
     }
 }
 
@@ -927,8 +1014,9 @@ pub fn menu_items(kind: &MenuKind) -> Vec<(&'static str, Action)> {
             ("New Folder…            F10", Action::NewFolder),
             ("New File…                o", Action::NewFile),
             ("Rename…                 F2", Action::Rename),
-            ("Move to Trash          Del", Action::Trash),
+            ("Move to Trash        x/Del", Action::Trash),
             ("Delete            Shift+Del", Action::DeletePerm),
+            ("Cut                   Ctrl+X", Action::Cut),
             ("Copy                  Ctrl+C", Action::Copy),
             ("Paste                 Ctrl+V", Action::Paste),
             ("Compress                  ", Action::Compress),
@@ -936,7 +1024,7 @@ pub fn menu_items(kind: &MenuKind) -> Vec<(&'static str, Action)> {
             ("Empty Trash               ", Action::EmptyTrash),
             ("Extract here              ", Action::Extract),
             ("Select All            Ctrl+A", Action::SelectAll),
-            ("Show Hidden Files     Ctrl+H", Action::ToggleHidden),
+            ("Show Hidden Files          H", Action::ToggleHidden),
             ("Filter                Ctrl+I", Action::ToggleFilterBar),
             ("Sort by…                   ", Action::OpenSortMenu),
             ("View mode…                 ", Action::OpenViewMenu),
@@ -1005,25 +1093,54 @@ pub fn crumb_siblings(app: &App, seg: usize) -> Vec<PathBuf> {
     v
 }
 
+/// The breadcrumb, driven from the keyboard. `Mode::CrumbMenu(seg)` is both
+/// "focus is up in the breadcrumb" and "segment `seg` has its menu open" —
+/// there is no third state where the crumb has focus with everything shut, so
+/// there is no flag for one.
 fn crumb_menu(app: &mut App, k: KeyEvent, seg: usize) {
     let items = crumb_siblings(app, seg);
     if items.is_empty() {
         app.mode = Mode::Normal;
         return;
     }
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let last_seg = crate::ui::crumb_paths(&app.pane().cwd)
+        .len()
+        .saturating_sub(1);
+    let walk = |app: &mut App, to: usize| {
+        app.menu_sel = 0;
+        app.mode = Mode::CrumbMenu(to);
+    };
     match k.code {
+        // Ctrl+j is the way back down, the mirror of the Ctrl+k that came up.
+        // The other Ctrl motions are pane motions, and the breadcrumb is one
+        // pane occupying the whole row, so there is nowhere for them to go.
+        KeyCode::Char('j') if ctrl => app.mode = Mode::Normal,
+        KeyCode::Char('h' | 'k' | 'l') if ctrl => {}
+        KeyCode::Char('n') if ctrl => app.menu_sel = (app.menu_sel + 1) % items.len(),
+        KeyCode::Char('p') if ctrl => app.menu_sel = (app.menu_sel + items.len() - 1) % items.len(),
+        KeyCode::Char('y') if ctrl => accept_crumb(app, &items),
         KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Normal,
+        // Inside the pane, bare motions move: h/l along the trail, j/k down the
+        // menu. `l` does not enter a directory — that is what accept is for,
+        // and a motion key that sometimes navigates is the ambiguity to avoid.
+        KeyCode::Left | KeyCode::Char('h') => walk(app, seg.saturating_sub(1)),
+        KeyCode::Right | KeyCode::Char('l') => walk(app, (seg + 1).min(last_seg)),
         KeyCode::Down | KeyCode::Char('j') => app.menu_sel = (app.menu_sel + 1) % items.len(),
         KeyCode::Up | KeyCode::Char('k') => {
             app.menu_sel = (app.menu_sel + items.len() - 1) % items.len()
         }
-        KeyCode::Enter | KeyCode::Char('l') => {
-            let d = items[app.menu_sel].clone();
-            app.mode = Mode::Normal;
-            app.goto(Target::Dir(d), true);
-        }
+        KeyCode::Enter | KeyCode::Tab => accept_crumb(app, &items),
         _ => {}
     }
+}
+
+fn accept_crumb(app: &mut App, items: &[PathBuf]) {
+    let Some(d) = items.get(app.menu_sel).cloned() else {
+        return;
+    };
+    app.mode = Mode::Normal;
+    app.goto(Target::Dir(d), true);
 }
 
 #[cfg(test)]

@@ -49,7 +49,7 @@ pub enum Mode {
     Search,
     /// `Ctrl+I` live filter.
     Filter,
-    /// `Ctrl+L` editable location bar.
+    /// `F6` editable location bar.
     PathEdit,
     /// F2 inline rename; the payload is the path being renamed.
     Rename(PathBuf),
@@ -80,7 +80,6 @@ pub enum MenuKind {
 pub enum Confirm {
     DeletePermanently(Vec<PathBuf>),
     EmptyTrash,
-    Quit,
 }
 
 /// One file view. Two of these exist when the split view is on.
@@ -272,6 +271,18 @@ impl Pane {
         }
     }
 
+    /// Visible items `a..=b`, clamped to the listing. The linewise range a vim
+    /// operator works on: one row is one line.
+    pub fn paths_in(&self, a: usize, b: usize) -> Vec<PathBuf> {
+        if self.visible.is_empty() {
+            return Vec::new();
+        }
+        let last = self.visible.len() - 1;
+        (a.min(last)..=b.min(last))
+            .map(|i| self.entries[self.visible[i]].path.clone())
+            .collect()
+    }
+
     pub fn counts(&self) -> (usize, usize, u64) {
         let (mut d, mut f, mut bytes) = (0, 0, 0);
         for &i in &self.visible {
@@ -366,9 +377,12 @@ pub struct App {
     pub status_is_error: bool,
     pub typeahead: String,
     pub typeahead_at: Option<Instant>,
-    /// Pending vim state: count prefix and operator (`g`, `z`, `d`, `y`).
+    /// Pending vim state: count prefix and chord leader (`g`, `z`, `c`).
     pub count: String,
     pub pending: Option<char>,
+    /// A `d` waiting for its motion, holding the count typed before it (`3dd`).
+    /// One operator exists, so this is that count and not an enum of operators.
+    pub pending_delete: Option<usize>,
     pub search_last: String,
     pub drag: Option<Drag>,
     pub hits: Hitboxes,
@@ -414,6 +428,7 @@ impl App {
             typeahead_at: None,
             count: String::new(),
             pending: None,
+            pending_delete: None,
             search_last: String::new(),
             drag: None,
             hits: Hitboxes::default(),
@@ -838,6 +853,28 @@ impl App {
         self.reload();
     }
 
+    /// The focusable columns, left to right: Places, pane 0, pane 1. `Ctrl+h`
+    /// and `Ctrl+l` step between them and stop at the ends, like `<C-w>h` and
+    /// `<C-w>l` in vim.
+    pub fn focus_left(&mut self) {
+        if self.focus == Focus::View && self.tab().active > 0 {
+            self.tab_mut().active = 0;
+        } else if self.focus == Focus::View && self.places_visible {
+            self.focus = Focus::Places;
+        }
+    }
+
+    pub fn focus_right(&mut self) {
+        if self.focus == Focus::Places {
+            // Coming back from Places lands on the left pane, which is the one
+            // immediately to its right — not wherever focus was before.
+            self.focus = Focus::View;
+            self.tab_mut().active = 0;
+        } else if self.split_on() && self.tab().active == 0 {
+            self.tab_mut().active = 1;
+        }
+    }
+
     pub fn other_pane(&mut self) {
         let t = self.tab_mut();
         if t.panes.len() > 1 {
@@ -853,9 +890,10 @@ impl App {
         self.reload();
     }
 
+    /// Closing the last tab quits, the way `:q` on vim's last window does.
     pub fn close_tab(&mut self) {
         if self.tabs.len() == 1 {
-            self.mode = Mode::Confirm(Confirm::Quit);
+            self.quit = true;
             return;
         }
         self.tabs.remove(self.tab);
@@ -980,6 +1018,7 @@ mod tests {
                 size: 0,
                 mtime: 0,
                 mode: 0,
+                readable: true,
                 hidden: n.starts_with('.'),
                 depth: 0,
                 expanded: false,
@@ -1033,5 +1072,23 @@ mod tests {
     fn counts_split_dirs_and_files() {
         let p = pane_with(&["a", "b"]);
         assert_eq!(p.counts(), (0, 2, 0));
+    }
+
+    /// `5dd` on the second-to-last file must take what is there and stop, not
+    /// panic on the range and not wrap to the top.
+    #[test]
+    fn a_delete_range_clamps_to_the_listing() {
+        let p = pane_with(&["a", "b", "c"]);
+        let names = |v: Vec<PathBuf>| -> Vec<String> {
+            v.iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(names(p.paths_in(1, 1)), ["b"]);
+        assert_eq!(names(p.paths_in(1, 99)), ["b", "c"]);
+        assert_eq!(names(p.paths_in(0, 2)), ["a", "b", "c"]);
+        // Past the end entirely: clamped to the last item, never empty.
+        assert_eq!(names(p.paths_in(9, 9)), ["c"]);
+        assert!(pane_with(&[]).paths_in(0, 3).is_empty());
     }
 }

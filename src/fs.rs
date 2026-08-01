@@ -27,6 +27,9 @@ pub struct Entry {
     pub size: u64,
     pub mtime: i64,
     pub mode: u32,
+    /// False for a directory we cannot open — root-owned `0700` and the like.
+    /// Free to compute: the child count already has to open it.
+    pub readable: bool,
     pub hidden: bool,
     /// Depth in an expanded Details tree; 0 for a plain listing.
     pub depth: u16,
@@ -36,6 +39,11 @@ pub struct Entry {
 impl Entry {
     pub fn is_dir(&self) -> bool {
         self.kind == Kind::Dir
+    }
+
+    /// A directory the current user cannot look inside.
+    pub fn is_locked(&self) -> bool {
+        self.kind == Kind::Dir && !self.readable
     }
 
     pub fn is_executable(&self) -> bool {
@@ -99,7 +107,9 @@ impl Entry {
         match self.kind {
             Kind::Symlink => g::SYMLINK,
             Kind::Dir => {
-                if self.expanded {
+                if self.is_locked() {
+                    g::FOLDER_LOCKED
+                } else if self.expanded {
                     g::FOLDER_OPEN
                 } else if let Some(gl) = self.home_folder_glyph() {
                     gl
@@ -263,19 +273,21 @@ pub fn read_dir(path: &Path, depth: u16) -> std::io::Result<Vec<Entry>> {
         } else {
             Kind::File
         };
-        let size = if kind == Kind::Dir {
-            dir_child_count(&p)
-        } else {
-            meta.len()
-        };
+        // One `read_dir` answers both "how many children" and "can we get in",
+        // so the lock state costs no extra syscall.
+        let children = (kind == Kind::Dir).then(|| dir_child_count(&p));
         out.push(Entry {
             hidden: name.starts_with('.'),
             name,
             path: p,
             kind,
-            size,
+            size: match children {
+                Some(c) => c.unwrap_or(0),
+                None => meta.len(),
+            },
             mtime: meta.mtime(),
             mode: meta.permissions().mode(),
+            readable: children.map(|c| c.is_some()).unwrap_or(true),
             depth,
             expanded: false,
         });
@@ -283,8 +295,9 @@ pub fn read_dir(path: &Path, depth: u16) -> std::io::Result<Vec<Entry>> {
     Ok(out)
 }
 
-fn dir_child_count(p: &Path) -> u64 {
-    fs::read_dir(p).map(|d| d.count() as u64).unwrap_or(0)
+/// `None` when the directory cannot be opened at all.
+fn dir_child_count(p: &Path) -> Option<u64> {
+    fs::read_dir(p).map(|d| d.count() as u64).ok()
 }
 
 pub fn format_size(bytes: u64) -> String {
@@ -544,6 +557,7 @@ mod tests {
             size: 0,
             mtime: 0,
             mode: 0,
+            readable: true,
             hidden: false,
             depth: 0,
             expanded: false,
