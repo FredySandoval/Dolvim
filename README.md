@@ -1,6 +1,6 @@
 # Dolphin + vim = Dolvim
 
-KDE Dolphin, recreated in the terminal, with vim bindings.
+KDE Dolphin, recreated in the terminal, with vim bindings, written in rust btw.
 
 ![dolvim](assets/Dolvim-2026-08-01_00-43.png)
 
