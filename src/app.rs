@@ -15,46 +15,7 @@ use crate::places::{self, Row, Target};
 use crate::thumbs::Thumbs;
 use crate::watch::Watcher;
 
-/// A run of Ctrl+scroll events treated as one gesture.
-///
-/// Re-anchoring on every notch makes the cursor hop between items mid-gesture:
-/// the grid reflows under a pointer that is not moving, so what is beneath it
-/// changes for reasons the user did not cause. The whole run keeps the anchor
-/// it started with, and where the pointer ended up is settled once the wheel
-/// stops. See docs/DECISIONS.md.
-pub struct ZoomBurst {
-    /// Visible index the gesture is zooming about.
-    pub anchor: usize,
-    /// Which way the last notch went. Zooming in is aiming at something, so
-    /// the selection follows the pointer when the gesture ends; zooming out is
-    /// only widening the view, and moving the selection then is a jump the
-    /// user did not ask for.
-    pub zoom_in: bool,
-    /// Where the pointer was, for the settle.
-    pub x: u16,
-    pub y: u16,
-    pub at: Instant,
-}
-
-/// Scroll offset that puts `anchor` back at the fraction of the viewport it
-/// occupied before a zoom — top row zooms about the top, bottom row about the
-/// bottom. Integer halves so it lands on the middle of a row, not its edge.
-pub fn anchored_offset(
-    anchor: usize,
-    screen_row: usize,
-    old_rows: usize,
-    cols: usize,
-    rows: usize,
-    len: usize,
-) -> usize {
-    let (cols, rows, old_rows) = (cols.max(1), rows.max(1), old_rows.max(1));
-    let keep = ((2 * screen_row + 1) * rows / (2 * old_rows)).min(rows - 1);
-    // Never leave the viewport hanging past the end of the listing.
-    let last = len.div_ceil(cols).saturating_sub(rows);
-    (anchor / cols).saturating_sub(keep).min(last)
-}
-
-/// Work that needs the terminal to itself. Dolvin leaves the alternate
+/// Work that needs the terminal to itself. Dolvim leaves the alternate
 /// screen, runs it to completion, and comes back.
 pub enum Suspend {
     /// F4: a shell in this directory.
@@ -135,7 +96,6 @@ pub struct Pane {
     pub offset: usize,
     pub selected: HashSet<PathBuf>,
     pub view: ViewMode,
-    pub zoom: usize,
     pub sort: Sort,
     pub show_hidden: bool,
     pub filter: String,
@@ -172,7 +132,6 @@ impl Pane {
             offset: 0,
             selected: HashSet::new(),
             view: ViewMode::Icons,
-            zoom: config::DEFAULT_ZOOM,
             sort: Sort::default(),
             show_hidden: false,
             filter: String::new(),
@@ -260,19 +219,6 @@ impl Pane {
             return;
         }
         self.cursor = self.cursor.min(self.visible.len() - 1);
-    }
-
-    /// The icon nearest a point, clamped into the grid.
-    ///
-    /// Unlike a click, a pointer that merely came to rest is allowed to be in
-    /// the gutter between two cells or past the last row — there is always a
-    /// nearest item, so this answers rather than declining.
-    pub fn nearest_icon(&self, x: u16, y: u16) -> usize {
-        let cols = self.grid_cols.max(1);
-        let c = (x.saturating_sub(self.grid_x) / self.cell_w.max(1)).min(cols - 1);
-        let r = (y.saturating_sub(self.area.y) / self.cell_h.max(1)).min(self.grid_rows.max(1) - 1);
-        let vis = (self.offset + r as usize) * cols as usize + c as usize;
-        vis.min(self.len().saturating_sub(1))
     }
 
     /// Furthest the viewport may scroll: the last screenful, not the last item.
@@ -388,7 +334,6 @@ pub struct Hitboxes {
     pub path_bar: Rect,
     pub places: Rect,
     pub tabs: Vec<Rect>,
-    pub zoom_slider: Rect,
     pub headers: Vec<(Rect, SortKey)>,
     /// The popup currently on screen, for click-to-pick.
     pub menu_popup: Rect,
@@ -432,8 +377,6 @@ pub struct App {
     disk: Option<(PathBuf, (u64, u64), Instant)>,
     /// Last left-click (when, which item) — the double-click detector.
     pub last_click: Option<(Instant, usize)>,
-    /// The Ctrl+scroll gesture in progress, if any.
-    pub zoom_burst: Option<ZoomBurst>,
     pub thumbs: Thumbs,
     pub progress: Option<Progress>,
     pub quit: bool,
@@ -477,7 +420,6 @@ impl App {
             menu_sel: 0,
             disk: None,
             last_click: None,
-            zoom_burst: None,
             thumbs: Thumbs::new(),
             progress: None,
             quit: false,
@@ -863,56 +805,6 @@ impl App {
         self.disk.as_ref().map(|(_, s, _)| *s)
     }
 
-    pub fn zoom(&mut self, delta: isize) {
-        let n = config::ZOOM_LEVELS.len() as isize - 1;
-        let level = (self.pane().zoom as isize + delta).clamp(0, n) as usize;
-        self.zoom_to(level);
-    }
-
-    /// Zoom about the cursor: it keeps its place in the pane while the cells
-    /// grow around it. Ctrl+scroll overrides the offset afterwards to anchor on
-    /// the pointer instead; everything else — the slider, `zi`/`zo` — has no
-    /// pointer to speak of, and the current item is the only thing the user
-    /// could mean.
-    pub fn zoom_to(&mut self, level: usize) {
-        let p = self.pane();
-        let (cols, rows) = (p.grid_cols.max(1) as usize, p.grid_rows.max(1) as usize);
-        let screen_row = (p.cursor / cols).saturating_sub(p.offset);
-        let (area, icons) = (p.area, p.view == ViewMode::Icons);
-        let p = self.pane_mut();
-        p.zoom = level.min(config::ZOOM_LEVELS.len() - 1);
-        if icons {
-            let (new_cols, new_rows, _) = crate::ui::icon_grid(area, p.zoom);
-            p.offset = anchored_offset(
-                p.cursor,
-                screen_row,
-                rows,
-                new_cols as usize,
-                new_rows as usize,
-                p.len(),
-            );
-        }
-    }
-
-    /// End a Ctrl+scroll gesture once the wheel has been quiet long enough,
-    /// putting the cursor on whatever the pointer is now nearest.
-    ///
-    /// Mid-gesture the grid is moving under a stationary pointer, so what is
-    /// beneath it then says nothing about intent; where it comes to rest does.
-    /// The user re-aims by a centimetre, not by hunting for the item again.
-    pub fn settle_zoom(&mut self) {
-        let Some(b) = &self.zoom_burst else { return };
-        if b.at.elapsed() < std::time::Duration::from_millis(config::ZOOM_SETTLE_MS) {
-            return;
-        }
-        let (x, y, zoom_in) = (b.x, b.y, b.zoom_in);
-        self.zoom_burst = None;
-        let p = self.pane_mut();
-        if zoom_in && p.view == ViewMode::Icons && !p.visible.is_empty() {
-            p.cursor = p.nearest_icon(x, y);
-        }
-    }
-
     pub fn toggle_hidden(&mut self) {
         let p = self.pane_mut();
         p.show_hidden = !p.show_hidden;
@@ -938,7 +830,6 @@ impl App {
         } else {
             let mut clone = Pane::new(t.panes[0].cwd.clone());
             clone.view = t.panes[0].view;
-            clone.zoom = t.panes[0].zoom;
             clone.sort = t.panes[0].sort;
             clone.show_hidden = t.panes[0].show_hidden;
             t.panes.push(clone);
@@ -1094,26 +985,6 @@ mod tests {
                 expanded: false,
             })
             .collect()
-    }
-
-    /// 45 items, a 5x5 grid becoming 4x4. The anchor has to stay on screen
-    /// wherever it was pointed at, which is the whole point of zooming at it.
-    #[test]
-    fn zoom_keeps_the_anchor_in_view() {
-        for screen_row in 0..5 {
-            let anchor = screen_row * 5 + 2; // offset 0, so row == screen row
-            let off = anchored_offset(anchor, screen_row, 5, 4, 4, 45);
-            let row = anchor / 4;
-            assert!(
-                (off..off + 4).contains(&row),
-                "anchor {anchor} scrolled off"
-            );
-        }
-        // Pointing at the top row keeps the top; at the bottom row, the bottom.
-        assert_eq!(anchored_offset(2, 0, 5, 4, 4, 45), 0);
-        assert_eq!(anchored_offset(22, 4, 5, 4, 4, 45), 5 - 3);
-        // Never scrolls past the end: 45 items in 4 columns is 12 rows.
-        assert_eq!(anchored_offset(44, 4, 5, 4, 4, 45), 8);
     }
 
     /// A refresh delivers the listing in readdir order, which is nothing like

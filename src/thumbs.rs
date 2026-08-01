@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn a_decoded_thumb_has_one_cell_per_two_pixel_rows() {
-        let d = std::env::temp_dir().join(format!("dolvin-thumb-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("dolvim-thumb-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         let p = d.join("t.png");
         let img = image::RgbImage::from_pixel(8, 8, image::Rgb([1, 2, 3]));
@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn undecodable_files_fail_without_panicking() {
-        let d = std::env::temp_dir().join(format!("dolvin-thumb2-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("dolvim-thumb2-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         let p = d.join("not-an-image.png");
         std::fs::write(&p, b"nope").unwrap();

@@ -78,7 +78,6 @@ pub mod glyph {
 /* Panel geometry and tunables. */
 pub const PLACES_WIDTH        : u16   = 22  ; /* Places panel columns, the screenshot's 150 px */
 pub const INFO_WIDTH          : u16   = 30  ; /* Information panel columns (F11)               */
-pub const DEFAULT_ZOOM        : usize = 3   ; /* index into ZOOM_LEVELS at startup             */
 pub const TYPEAHEAD_TIMEOUT_MS: u128  = 1000; /* type-ahead buffer life without a keystroke    */
 pub const WATCH_DEBOUNCE_MS   : u64   = 120 ; /* coalescing window for inotify storms          */
 pub const TICK_MS             : u64   = 40  ; /* event loop tick; listing/thumbnail poll rate  */
@@ -86,27 +85,14 @@ pub const DRAG_THRESHOLD      : u16   = 1   ; /* cells of movement before a drag
 pub const THUMB_CACHE_CAP     : usize = 512 ; /* decoded thumbnails held in memory             */
 pub const CELL_GAP            : u16   = 2   ; /* blank columns between icon-view tiles         */
 pub const NAME_LINES          : u16   = 3   ; /* rows a name may wrap over in the icon view    */
-pub const ZOOM_SETTLE_MS      : u64   = 200 ; /* quiet wheel before a zoom gesture re-anchors   */
 pub const DISK_POLL_MS        : u64   = 2000; /* how often the status bar re-measures free space*/
 
-/* Dolphin's zoom slider has ten stops. Compact and Details derive from these.
- * These are *pitch*: each cell keeps a blank row on top and CELL_GAP blank
+/* Icon cell *pitch*: each cell keeps a blank row on top and CELL_GAP blank
  * columns, which is where the cursor frame is drawn. Content is therefore
- * (w - CELL_GAP) by (h - 1), and the first stop is the 13x4 the layout was
- * designed around — one icon row and three of name. */
-pub const ZOOM_LEVELS: [(u16, u16); 10] = [
-    /* w   h  */
-      (15, 5 ),
-      (17, 6 ),
-      (19, 7 ),
-      (21, 8 ),
-      (24, 9 ),
-      (28, 11),
-      (32, 13),
-      (38, 16),
-      (44, 19),
-      (52, 23),
-];
+ * (CELL_W - CELL_GAP) by (CELL_H - 1) — one icon row and three of name, the
+ * 13x4 the layout was designed around. Compact derives its width from this. */
+pub const CELL_W              : u16   = 15  ; /* icon-view cell pitch, columns                 */
+pub const CELL_H              : u16   = 5   ; /* icon-view cell pitch, rows                    */
 
 /* Dolphin badges the XDG user directories in the view, not just in Places.
  * Matched by name and only directly under $HOME, so a Downloads you made
@@ -167,9 +153,6 @@ pub const DOLPHIN_KEYS: &[Bind] = &[
     b(K::Char('2'), M::CONTROL                , Action::ViewCompact    ),
     b(K::Char('3'), M::CONTROL                , Action::ViewDetails    ),
     b(K::Char('h'), M::CONTROL                , Action::ToggleHidden   ),
-    b(K::Char('+'), M::CONTROL                , Action::ZoomIn         ),
-    b(K::Char('='), M::CONTROL                , Action::ZoomIn         ),
-    b(K::Char('-'), M::CONTROL                , Action::ZoomOut        ),
     b(K::F(3)     , M::NONE                   , Action::ToggleSplit    ),
     b(K::Tab      , M::NONE                   , Action::SwapPane       ),
     b(K::F(9)     , M::NONE                   , Action::TogglePlaces   ),
@@ -233,8 +216,6 @@ pub const CHORDS: &[(char, char, Action)] = &[
       ('g', 'T' , Action::PrevTab     ),
       ('g', 'u' , Action::GoUp        ),
       ('z', 'h' , Action::ToggleHidden),
-      ('z', 'i' , Action::ZoomIn      ),
-      ('z', 'o' , Action::ZoomOut     ),
       ('z', 'a' , Action::ToggleExpand),
       ('z', 'v' , Action::CycleView   ),
       ('c', 'w' , Action::Rename      ),

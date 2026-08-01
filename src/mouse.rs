@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
-use crate::app::{App, Drag, Focus, MenuKind, Mode, ViewMode, ZoomBurst};
+use crate::app::{App, Drag, Focus, MenuKind, Mode, ViewMode};
 use crate::config;
 use crate::drag;
 use crate::places::Target;
@@ -36,8 +36,8 @@ pub fn handle(app: &mut App, m: MouseEvent) {
     let shift = m.modifiers.contains(KeyModifiers::SHIFT);
 
     match m.kind {
-        MouseEventKind::ScrollDown => scroll(app, x, y, 1, ctrl),
-        MouseEventKind::ScrollUp => scroll(app, x, y, -1, ctrl),
+        MouseEventKind::ScrollDown => scroll(app, x, y, 1),
+        MouseEventKind::ScrollUp => scroll(app, x, y, -1),
         MouseEventKind::Down(MouseButton::Left) => press(app, x, y, ctrl, shift),
         MouseEventKind::Down(MouseButton::Middle) => middle(app, x, y),
         MouseEventKind::Down(MouseButton::Right) => {
@@ -51,12 +51,7 @@ pub fn handle(app: &mut App, m: MouseEvent) {
     }
 }
 
-fn scroll(app: &mut App, x: u16, y: u16, dir: isize, ctrl: bool) {
-    // Ctrl+Scroll is Dolphin's zoom, everywhere in the view.
-    if ctrl {
-        zoom_at(app, x, y, -dir);
-        return;
-    }
+fn scroll(app: &mut App, x: u16, y: u16, dir: isize) {
     if app.places_visible && hit(app.hits.places, x, y) {
         let n = app.places.len();
         let next = (app.places_sel as isize + dir).clamp(0, n as isize - 1) as usize;
@@ -78,68 +73,6 @@ fn scroll(app: &mut App, x: u16, y: u16, dir: isize, ctrl: bool) {
         // off into blank space.
         let max = p.max_offset() as isize;
         p.offset = (p.offset as isize + dir * step).clamp(0, max) as usize;
-    }
-}
-
-/// Zoom about the item under the pointer, the way an image viewer does: the
-/// item you are pointing at stays on screen, at the same height in the pane.
-///
-/// Dolphin anchors at the top left, which makes "look closer at *this* file"
-/// two motions — zoom, then hunt for it again in a grid that just reflowed.
-/// See docs/DECISIONS.md.
-fn zoom_at(app: &mut App, x: u16, y: u16, delta: isize) {
-    if app.pane().view != ViewMode::Icons {
-        return app.zoom(delta);
-    }
-    // A gesture already under way keeps its anchor. Re-reading the pointer on
-    // every notch would anchor on whatever the reflow happened to slide under
-    // it, which is what made the cursor hop.
-    let live = app
-        .zoom_burst
-        .as_ref()
-        .is_some_and(|b| b.at.elapsed() < Duration::from_millis(config::ZOOM_SETTLE_MS));
-    let anchor = match &app.zoom_burst {
-        Some(b) if live => b.anchor,
-        // Zoom applies to the active pane, so only the active pane can be
-        // anchored. Empty space gives us nothing to anchor on either.
-        _ => match hit_item(app, x, y) {
-            Some((i, vis)) if i == app.tab().active => vis,
-            _ => return app.zoom(delta),
-        },
-    };
-    let p = app.pane();
-    let (old_cols, old_rows) = (p.grid_cols.max(1) as usize, p.grid_rows.max(1) as usize);
-    // Read the anchor's row off the layout it is in now, not the one the
-    // gesture started in: each notch put it where it belongs, so this keeps it
-    // at the same fraction of the pane all the way through.
-    let screen_row = (anchor / old_cols).saturating_sub(p.offset);
-    let area = p.area;
-
-    app.zoom(delta);
-    app.zoom_burst = Some(ZoomBurst {
-        anchor,
-        zoom_in: delta > 0,
-        x,
-        y,
-        at: Instant::now(),
-    });
-
-    let p = app.pane_mut();
-    let (cols, rows, _) = crate::ui::icon_grid(area, p.zoom);
-    p.offset = crate::app::anchored_offset(
-        anchor,
-        screen_row,
-        old_rows,
-        cols as usize,
-        rows as usize,
-        p.len(),
-    );
-    // Zooming in is aiming: the cursor rides the anchor so the item growing
-    // under the pointer is also the one selected. Zooming out is only widening
-    // the view, and taking the selection along would be a jump nobody asked
-    // for — whatever was selected stays selected, on screen or not.
-    if delta > 0 {
-        p.cursor = anchor;
     }
 }
 
@@ -221,11 +154,6 @@ fn press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
             app.tab = i;
             return;
         }
-    }
-    if hit(h.zoom_slider, x, y) {
-        let rel = (x - h.zoom_slider.x) as usize;
-        app.zoom_to(rel);
-        return;
     }
     // Details column headers sort, and re-sort in reverse on a second click.
     for (r, key) in &h.headers {

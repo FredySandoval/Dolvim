@@ -1,4 +1,4 @@
-//! Dolvin — KDE Dolphin, recreated in the terminal.
+//! Dolvim — KDE Dolphin, recreated in the terminal.
 //!
 //! `main` owns the terminal and the event loop, and nothing else.
 
@@ -35,7 +35,7 @@ fn main() {
     let start = match std::env::args().nth(1) {
         Some(a) if a == "-h" || a == "--help" => {
             println!(
-                "usage: dolvin [DIR]\n\nKDE Dolphin, in the terminal. Press F1 inside for keys."
+                "usage: dolvim [DIR]\n\nKDE Dolphin, in the terminal. Press F1 inside for keys."
             );
             return;
         }
@@ -43,14 +43,14 @@ fn main() {
         None => std::env::current_dir().unwrap_or_else(|_| places::home()),
     };
     if !start.is_dir() {
-        eprintln!("dolvin: {}: not a directory", start.display());
+        eprintln!("dolvim: {}: not a directory", start.display());
         std::process::exit(1);
     }
     let start = start.canonicalize().unwrap_or(start);
 
     if let Err(e) = run(start) {
         restore();
-        eprintln!("dolvin: {e}");
+        eprintln!("dolvim: {e}");
         std::process::exit(1);
     }
 }
@@ -97,7 +97,6 @@ fn run(start: PathBuf) -> io::Result<()> {
             }
         }
 
-        app.settle_zoom();
         app.pump();
         app.thumbs.pump();
         finish_progress(&mut app);
@@ -106,7 +105,7 @@ fn run(start: PathBuf) -> io::Result<()> {
             hand_over(&mut term, || match what {
                 Suspend::Shell(dir) => {
                     let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
-                    println!("dolvin: shell in {} — exit to return", dir.display());
+                    println!("dolvim: shell in {} — exit to return", dir.display());
                     let _ = Command::new(shell).current_dir(&dir).status();
                 }
                 Suspend::Open(path) => {

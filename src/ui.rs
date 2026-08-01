@@ -478,10 +478,7 @@ fn entry_style(p: &Pane, vis: usize, cut: bool) -> Style {
 ///
 /// Dolphin's wheel scrolls the view and leaves the selection alone, even off
 /// screen, so the renderer must not drag the viewport back on the next frame.
-/// Zoom is not in the key: `App::zoom_to` places the offset itself, anchored on
-/// the cursor or, for Ctrl+scroll, on the pointer — revealing here as well
-/// would overrule that and drag a zoom-out back to a selection the user left
-/// behind. A view change is, since it reorients the axis the cursor sits on.
+/// A view change is in the key, since it reorients the axis the cursor sits on.
 fn reveal(p: &mut Pane, line: usize, visible: usize) {
     let state = (p.cursor, p.view);
     if p.last_reveal == state {
@@ -500,17 +497,14 @@ fn scroll_to(offset: &mut usize, cursor_line: usize, visible_lines: usize) {
     }
 }
 
-/// Columns, rows and left margin of the icon grid at a given zoom.
+/// Columns, rows and left margin of the icon grid.
 ///
 /// A cell carries its own margin: a blank row above it and CELL_GAP blank
 /// columns. The cursor frame is drawn in that margin, so it costs no row of
 /// content and no two names can touch. Its bottom edge lands on the blank row
 /// the cell below starts with, which is why the grid keeps one row spare.
-///
-/// Ctrl+scroll has to know the grid it is about to produce, so this cannot live
-/// inside the renderer.
-pub fn icon_grid(area: Rect, zoom: usize) -> (u16, u16, u16) {
-    let (cw, ch) = config::ZOOM_LEVELS[zoom];
+pub fn icon_grid(area: Rect) -> (u16, u16, u16) {
+    let (cw, ch) = (config::CELL_W, config::CELL_H);
     let cols = (area.width.saturating_sub(2) / cw).max(1);
     let rows = (area.height.saturating_sub(1) / ch).max(1);
     // Columns never divide the pane evenly. The remainder becomes margin, split
@@ -519,8 +513,8 @@ pub fn icon_grid(area: Rect, zoom: usize) -> (u16, u16, u16) {
 }
 
 fn icons_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool) {
-    let (cw, ch) = config::ZOOM_LEVELS[app.pane_at(idx).zoom];
-    let (cols, rows, mx) = icon_grid(area, app.pane_at(idx).zoom);
+    let (cw, ch) = (config::CELL_W, config::CELL_H);
+    let (cols, rows, mx) = icon_grid(area);
     let cut = app.clipboard.cut;
     let cut_set = app.clipboard.paths.clone();
     {
@@ -540,8 +534,7 @@ fn icons_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool
     let gap = config::CELL_GAP.min(cw.saturating_sub(3));
     let tile_w = cw - gap;
     let body_h = ch - 1;
-    // The name always gets its rows; the icon takes what is left. Growing the
-    // zoom therefore grows the icon, which is the thing zoom is about.
+    // The name always gets its rows; the icon takes what is left.
     let name_lines = config::NAME_LINES.clamp(1, body_h.saturating_sub(1).max(1));
     let icon_h = body_h.saturating_sub(name_lines);
 
@@ -637,8 +630,7 @@ fn icons_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool
 }
 
 fn compact_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool) {
-    let (cw, _) = config::ZOOM_LEVELS[app.pane_at(idx).zoom];
-    let cw = (cw + 4).min(area.width.max(1));
+    let cw = (config::CELL_W + 4).min(area.width.max(1));
     let rows = area.height.max(1);
     let cols = (area.width / cw).max(1);
     let cut = app.clipboard.cut;
@@ -696,13 +688,7 @@ fn detail_columns(width: u16) -> [u16; 4] {
 }
 
 fn details_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool) {
-    let zoom = app.pane_at(idx).zoom;
-    // "zoom changes row height only between fixed steps" — three steps.
-    let row_h: u16 = match zoom {
-        0..=4 => 1,
-        5..=7 => 2,
-        _ => 3,
-    };
+    let row_h: u16 = 1;
     let head = area.y;
     let list = Rect::new(
         area.x,
@@ -990,12 +976,7 @@ fn status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     f.buffer_mut()
         .set_string(area.x + 1, area.y, clip(&left, area.width as usize), style);
 
-    // Right side: zoom slider then free space, as stock Dolphin lays it out.
-    let zoom = app.pane().zoom;
-    let bars: String = (0..config::ZOOM_LEVELS.len())
-        .map(|i| if i <= zoom { '\u{2588}' } else { '\u{2591}' })
-        .collect();
-    let slider = format!("\u{2212} {bars} +");
+    // Right side: free space, where stock Dolphin puts it.
     let free = match app.disk_space() {
         Some((avail, total)) => format!(
             "  {} free of {}",
@@ -1004,13 +985,12 @@ fn status_bar(f: &mut Frame, app: &mut App, area: Rect) {
         ),
         None => String::new(),
     };
-    let right_text = format!("{slider}{free} ");
+    let right_text = format!("{free} ");
     let rw = right_text.width() as u16;
     if rw < area.width {
         let x = area.right() - rw;
         f.buffer_mut()
             .set_string(x, area.y, &right_text, st.fg(color::DIM));
-        app.hits.zoom_slider = Rect::new(x + 2, area.y, bars.width() as u16, 1);
     }
 }
 
@@ -1094,7 +1074,7 @@ fn overlays(f: &mut Frame, app: &mut App, area: Rect) {
                     "Empty Trash",
                     "Permanently delete everything in the Trash?".to_string(),
                 ),
-                crate::app::Confirm::Quit => ("Quit", "Close Dolvin?".to_string()),
+                crate::app::Confirm::Quit => ("Quit", "Close Dolvim?".to_string()),
             };
             let r = centre_rect(area, 60, 5);
             popup(
@@ -1144,7 +1124,7 @@ fn overlays(f: &mut Frame, app: &mut App, area: Rect) {
         }
         Mode::Help => {
             let r = centre_rect(area, 76, area.height.saturating_sub(4).min(30));
-            popup(f, r, "Dolvin — keys", help_lines());
+            popup(f, r, "Dolvim — keys", help_lines());
         }
         _ => {}
     }
@@ -1206,9 +1186,9 @@ fn help_lines() -> Vec<Line<'static>> {
         row("D  P", "drag out / drop in (needs ripdrag)"),
         sect("View"),
         row("Ctrl+1/2/3", "icons / compact / details"),
-        row("zi zo / Ctrl+±", "zoom        zh / Ctrl+H  hidden"),
+        row("zh / Ctrl+H", "hidden files"),
         row("F3  F9  F11  Ctrl+I", "split, places, info, filter"),
-        row("F4", "shell here (suspends Dolvin)"),
+        row("F4", "shell here (suspends Dolvim)"),
         sect("Tabs and commands"),
         row("Ctrl+T Ctrl+W gt gT", "new, close, next, previous"),
         row(":e :cd :sort :view", ":split :q :qa"),

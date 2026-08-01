@@ -204,8 +204,6 @@ pub enum Action {
     ViewDetails,
     CycleView,
     ToggleHidden,
-    ZoomIn,
-    ZoomOut,
     ToggleSplit,
     SwapPane,
     TogglePlaces,
@@ -473,8 +471,6 @@ pub fn act(app: &mut App, a: Action, n: usize) {
             app.set_view(v);
         }
         Action::ToggleHidden => app.toggle_hidden(),
-        Action::ZoomIn => app.zoom(n as isize),
-        Action::ZoomOut => app.zoom(-(n as isize)),
         Action::ToggleSplit => app.toggle_split(),
         Action::SwapPane => {
             if app.split_on() {
@@ -956,8 +952,6 @@ pub fn menu_items(kind: &MenuKind) -> Vec<(&'static str, Action)> {
             ("Icons                 Ctrl+1", Action::ViewIcons),
             ("Compact               Ctrl+2", Action::ViewCompact),
             ("Details               Ctrl+3", Action::ViewDetails),
-            ("Zoom In               Ctrl++", Action::ZoomIn),
-            ("Zoom Out              Ctrl+-", Action::ZoomOut),
         ],
         MenuKind::Sort => vec![
             ("Name", Action::SortName),
