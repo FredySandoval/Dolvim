@@ -40,7 +40,7 @@ root, where rustup has no default toolchain.
 
 	dolvim [DIR]
 
-With no argument it opens the current directory. Press `F1` inside for the key
+With no argument it opens the current directory. Press `:help` inside for the key
 list.
 
 ## Configure
