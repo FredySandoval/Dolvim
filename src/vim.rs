@@ -1145,16 +1145,22 @@ fn openable_crumb(app: &App) -> Option<usize> {
     }
 }
 
-/// Open segment `seg`, remembering it as where the breadcrumb was left. The
-/// cursor starts on the child you are standing in, when the menu holds it: that
-/// is the one row already in force, as in `open_menu`.
+/// Open segment `seg`, remembering it as where the breadcrumb was left.
+///
+/// The row is the one left highlighted last time this same segment was open.
+/// Failing that — a first visit, or a pick that is no longer there — it is the
+/// child you are standing in, the one row already in force, as in `open_menu`.
 pub fn open_crumb(app: &mut App, seg: usize) {
     let trail = crate::ui::crumb_paths(&app.pane().cwd);
-    let here = trail.get(seg + 1);
-    app.menu_sel = here
-        .and_then(|p| crumb_siblings(app, seg).iter().position(|s| s == p))
+    let sibs = crumb_siblings(app, seg);
+    let returning = app.pane().crumb_focus == trail.get(seg).cloned();
+    let pick = app.pane().crumb_pick.clone().filter(|_| returning);
+    app.menu_sel = pick
+        .or_else(|| trail.get(seg + 1).cloned())
+        .and_then(|p| sibs.iter().position(|s| *s == p))
         .unwrap_or(0);
     app.pane_mut().crumb_focus = trail.get(seg).cloned();
+    app.pane_mut().crumb_pick = sibs.get(app.menu_sel).cloned();
     app.mode = Mode::CrumbMenu(seg);
 }
 
@@ -1323,6 +1329,13 @@ fn crumb_menu(app: &mut App, k: KeyEvent, seg: usize) {
         }
         KeyCode::Enter | KeyCode::Tab => accept_crumb(app, &items),
         _ => {}
+    }
+    // Record where the row ended up, so leaving and coming back lands on it.
+    // Only while this same segment is still the open one: `walk` has already
+    // set the pair for the segment it moved to, and leaving the trail entirely
+    // must not overwrite the pick with a row from a menu that is now shut.
+    if app.mode == Mode::CrumbMenu(seg) {
+        app.pane_mut().crumb_pick = items.get(app.menu_sel).cloned();
     }
 }
 
