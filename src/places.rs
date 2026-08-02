@@ -87,16 +87,8 @@ pub fn build() -> Vec<Row> {
 
     // The directory name doubles as the label, so there is no second spelling
     // to keep in sync — `Download` vs `Downloads` is exactly how this row went
-    // missing before. These are the xdg-user-dirs defaults.
-    let standard = [
-        ("XDG_DESKTOP_DIR", "Desktop", g::FOLDER),
-        ("XDG_DOCUMENTS_DIR", "Documents", g::DOCUMENT),
-        ("XDG_DOWNLOAD_DIR", "Downloads", g::DOWNLOAD),
-        ("XDG_MUSIC_DIR", "Music", g::MUSIC),
-        ("XDG_PICTURES_DIR", "Pictures", g::PICTURE),
-        ("XDG_VIDEOS_DIR", "Videos", g::VIDEO),
-    ];
-    for (key, name, gl) in standard {
+    // missing before.
+    for &(key, name, gl) in crate::config::XDG_DIRS {
         if let Some(p) = xdg_dir(key, name) {
             rows.push(item(name, gl, Target::Dir(p)));
         }

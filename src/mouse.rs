@@ -365,7 +365,7 @@ fn hit_pane(app: &mut App, x: u16, y: u16) {
 fn hit_item(app: &App, x: u16, y: u16) -> Option<(usize, usize)> {
     let idx = pane_at(app, x, y)?;
     let p = app.pane_at(idx);
-    let (dx, dy) = (x - p.area.x, y - p.area.y);
+    let dy = y - p.area.y;
     let vis = match p.view {
         ViewMode::Icons => {
             // The grid is centred, so its left edge is not the pane's.
@@ -380,11 +380,15 @@ fn hit_item(app: &App, x: u16, y: u16) -> Option<(usize, usize)> {
         }
         ViewMode::Compact => {
             // Columns are individually sized, so the hit is found by walking
-            // them. Running off the right end means the leftover margin, which
-            // belongs to no cell — without that the index would run past the
-            // last column and the length check below would wave it through.
-            // Rows need no such guard: a compact row is one line and the grid
-            // is the full pane height.
+            // them. Running off either end means margin, which belongs to no
+            // cell — without that the index would run past the last column and
+            // the length check below would wave it through. Rows need no such
+            // guard: a compact row is one line and the grid is the full pane
+            // height.
+            if x < p.grid_x {
+                return None;
+            }
+            let dx = x - p.grid_x;
             let mut edge = 0;
             let c = p.col_w.iter().position(|w| {
                 edge += w;
@@ -494,7 +498,8 @@ mod tests {
         p.area = Rect::new(0, 0, 25, 4);
         p.cell_w = 10;
         p.cell_h = 1;
-        p.col_w = vec![10, 10]; // 20..24 is leftover margin, no cell
+        p.grid_x = 1; // VIEW_MARGIN: columns start one in from the pane edge
+        p.col_w = vec![10, 10]; // 21..24 is leftover margin, no cell
         p.grid_cols = 2;
         p.grid_rows = 4;
         // More items than the two columns hold, so an out-of-range column
@@ -503,6 +508,7 @@ mod tests {
         p.visible = (0..12).collect();
 
         assert_eq!(hit_item(&app, 19, 0), Some((0, 4)));
+        assert_eq!(hit_item(&app, 0, 0), None); // the left margin
         assert_eq!(hit_item(&app, 22, 0), None);
     }
 
@@ -516,14 +522,15 @@ mod tests {
         p.view = ViewMode::Compact;
         p.area = Rect::new(0, 0, 25, 4);
         p.cell_h = 1;
+        p.grid_x = 1; // VIEW_MARGIN
         p.col_w = vec![12, 8];
         p.grid_cols = 2;
         p.grid_rows = 4;
         p.visible = (0..12).collect();
 
-        assert_eq!(hit_item(&app, 11, 0), Some((0, 0))); // last cell of col 0
-        assert_eq!(hit_item(&app, 12, 0), Some((0, 4))); // first of col 1
-        assert_eq!(hit_item(&app, 19, 2), Some((0, 6)));
-        assert_eq!(hit_item(&app, 20, 0), None); // past both columns
+        assert_eq!(hit_item(&app, 12, 0), Some((0, 0))); // last cell of col 0
+        assert_eq!(hit_item(&app, 13, 0), Some((0, 4))); // first of col 1
+        assert_eq!(hit_item(&app, 20, 2), Some((0, 6)));
+        assert_eq!(hit_item(&app, 21, 0), None); // past both columns
     }
 }

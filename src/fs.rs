@@ -93,12 +93,9 @@ impl Entry {
     }
 
     /// `home()` is only touched once a name matches, so the common case is a
-    /// string compare against a five-row table.
+    /// string compare against a six-row table.
     fn home_folder_glyph(&self) -> Option<&'static str> {
-        let gl = config::HOME_FOLDER_ICONS
-            .iter()
-            .find(|(n, _)| *n == self.name)?
-            .1;
+        let gl = config::XDG_DIRS.iter().find(|(_, n, _)| *n == self.name)?.2;
         (self.path.parent()? == crate::places::home()).then_some(gl)
     }
 

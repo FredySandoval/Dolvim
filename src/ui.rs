@@ -416,10 +416,15 @@ fn places_panel(f: &mut Frame, app: &mut App, area: Rect) {
                         Style::default().fg(color::DIM),
                     );
                 }
+                // The row already carries the selection fill; only the block is
+                // new, and only while the panel has focus.
                 if selected && focused {
-                    if let Some(c) = buf.cell_mut((area.x, y)) {
-                        c.set_char('\u{2590}').set_fg(color::ACCENT);
-                    }
+                    cursor_block(
+                        buf,
+                        icon_cell(area.x + 1, y, glyph),
+                        Rect::new(area.x, y, w, 1),
+                        true,
+                    );
                 }
             }
         }
@@ -645,7 +650,10 @@ fn compact_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
     let rows = area.height.max(1);
     let cut = app.clipboard.cut;
     let cut_set = app.clipboard.paths.clone();
-    let widths = compact_widths(app.pane_at(idx), rows, area.width);
+    // The margin is the pane's, not each column's: columns are already held
+    // apart by the blank `compact_widths` leaves on the right.
+    let avail = area.width.saturating_sub(config::VIEW_MARGIN);
+    let widths = compact_widths(app.pane_at(idx), rows, avail);
     {
         let p = app.pane_at_mut(idx);
         p.grid_rows = rows;
@@ -654,7 +662,7 @@ fn compact_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
         let cur_col = p.cursor / rows as usize;
         if p.last_reveal != (p.cursor, p.view) {
             p.last_reveal = (p.cursor, p.view);
-            scroll_columns(&mut p.offset, cur_col, &widths, area.width);
+            scroll_columns(&mut p.offset, cur_col, &widths, avail);
         }
     }
     let p_len = app.pane_at(idx).visible.len();
@@ -665,7 +673,7 @@ fn compact_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
     let mut shown: Vec<u16> = Vec::new();
     let mut used = 0;
     for w in widths.iter().skip(offset) {
-        if used + w > area.width && !shown.is_empty() {
+        if used + w > avail && !shown.is_empty() {
             break;
         }
         shown.push(*w);
@@ -676,9 +684,10 @@ fn compact_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
         p.grid_cols = shown.len().max(1) as u16;
         p.cell_w = shown.first().copied().unwrap_or(1);
         p.col_w = shown.clone();
+        p.grid_x = area.x + config::VIEW_MARGIN;
     }
 
-    let mut x = area.x;
+    let mut x = area.x + config::VIEW_MARGIN;
     for (c, cw) in shown.iter().enumerate() {
         for r in 0..rows {
             let vis = (offset + c) * rows as usize + r as usize;
@@ -704,7 +713,8 @@ fn compact_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
             f.buffer_mut()
                 .set_string(x, y, clip(&text, w.saturating_sub(1) as usize), st);
             if vis == app.pane_at(idx).cursor {
-                cursor_row(f.buffer_mut(), cell, active);
+                let icon = icon_cell(x, y, e.glyph());
+                cursor_block(f.buffer_mut(), icon, cell, active);
             }
         }
         x += cw;
@@ -854,8 +864,12 @@ fn details_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
             e.name
         );
         let mut x = area.x;
-        f.buffer_mut()
-            .set_string(x + 1, y, clip(&name, cols[0] as usize), st);
+        f.buffer_mut().set_string(
+            x + config::VIEW_MARGIN,
+            y,
+            clip(&name, cols[0] as usize),
+            st,
+        );
         x += cols[0] + 1;
         f.buffer_mut().set_string(
             x,
@@ -871,7 +885,9 @@ fn details_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
             .set_string(x, y, clip(&e.type_name(), cols[3] as usize), st);
 
         if vis == app.pane_at(idx).cursor {
-            cursor_row(f.buffer_mut(), row, active);
+            // The tree column pushes the icon right: indent, arrow, one blank.
+            let ix = area.x + config::VIEW_MARGIN + indent + arrow.width().max(1) as u16 + 1;
+            cursor_block(f.buffer_mut(), icon_cell(ix, y, e.glyph()), row, active);
         }
     }
 }
@@ -1374,7 +1390,7 @@ fn centred(buf: &mut Buffer, r: Rect, s: &str, st: Style) {
 /// Dolphin's focus rectangle: an outline, not a fill.
 fn outline(buf: &mut Buffer, r: Rect, active: bool) {
     if r.width < 2 || r.height < 2 {
-        cursor_row(buf, r, active);
+        cursor_block(buf, Rect::new(r.x, r.y, 1, 1), r, active);
         return;
     }
     let c = if active {
@@ -1415,25 +1431,36 @@ fn outline(buf: &mut Buffer, r: Rect, active: bool) {
     }
 }
 
-/// One-row cursor: a left accent bar, so it reads as focus without hiding text.
-fn cursor_row(buf: &mut Buffer, r: Rect, active: bool) {
-    let c = if active {
-        color::ACCENT
-    } else {
-        color::SEPARATOR
-    };
-    for y in r.y..r.bottom() {
-        if let Some(cell) = buf.cell_mut((r.x, y)) {
-            cell.set_char('\u{2590}').set_fg(c);
-        }
-        if active {
-            for x in r.x + 1..r.right() {
+/// The cursor is the terminal's own: a block sitting *on* the entry's icon with
+/// its colours inverted. A bar in the margin had to borrow a column and read as
+/// a fifth kind of line; the icon is already there and already means "this one".
+/// The row keeps the selection fill behind it, so where you are and what is
+/// selected stay two separate readings.
+fn cursor_block(buf: &mut Buffer, icon: Rect, row: Rect, active: bool) {
+    if active {
+        for y in row.y..row.bottom() {
+            for x in row.x..row.right() {
                 if let Some(cell) = buf.cell_mut((x, y)) {
                     cell.set_bg(color::SELECTION);
                 }
             }
         }
     }
+    // SEPARATOR is a hairline colour: legible as a 1 px rule, invisible as a
+    // block behind inverted text. The unfocused pane gets DIM instead.
+    let bg = if active { color::ACCENT } else { color::DIM };
+    for y in icon.y..icon.bottom() {
+        for x in icon.x..icon.right() {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_bg(bg).set_fg(color::VIEW_BG);
+            }
+        }
+    }
+}
+
+/// Where the icon sits within a row, given the columns drawn before it.
+fn icon_cell(x: u16, y: u16, glyph: &str) -> Rect {
+    Rect::new(x, y, glyph.width().max(1) as u16, 1)
 }
 
 /// The icon's colour says what the entry *is*, not whether it is selected.

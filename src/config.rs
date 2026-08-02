@@ -55,6 +55,7 @@ pub mod glyph {
     pub const DEVICE_USB   :&str = "\u{f11f0}"; /* 󱇰 removable media            */
     pub const EJECT        :&str = "\u{f01ea}"; /* 󰇪 unmount a removable        */
     pub const CLOCK        :&str = "\u{f0e17}"; /* 󰸗 Places: Recent             */
+    pub const DESKTOP      :&str = "\u{f108}" ; /*   Desktop                    */
     pub const DOWNLOAD     :&str = "\u{f409}" ; /*   Downloads                  */
     pub const DOCUMENT     :&str = "\u{eaf0}" ; /*   Documents                  */
     pub const MUSIC        :&str = "\u{266a}" ; /* ♪ Places: Music              */
@@ -87,6 +88,7 @@ pub const TICK_MS             :  u64 =   40; /* event loop tick; listing/thumbna
 pub const DRAG_THRESHOLD      :  u16 =    1; /* cells of movement before a drag begins          */
 pub const THUMB_CACHE_CAP     :usize =  512; /* decoded thumbnails held in memory               */
 pub const CELL_GAP            :  u16 =    2; /* blank columns between icon-view tiles           */
+pub const VIEW_MARGIN         :  u16 =    1; /* blank columns left of Compact and Details rows  */
 pub const NAME_LINES          :  u16 =    3; /* rows a name may wrap over in the icon view      */
 pub const DISK_POLL_MS        :  u64 = 2000; /* how often the status bar re-measures free space */
 
@@ -97,16 +99,19 @@ pub const DISK_POLL_MS        :  u64 = 2000; /* how often the status bar re-meas
 pub const CELL_W              :  u16 =   15; /* icon-view cell pitch, columns                    */
 pub const CELL_H              :  u16 =    5; /* icon-view cell pitch, rows                       */
 
-/* Dolphin badges the XDG user directories in the view, not just in Places.
- * Matched by name and only directly under $HOME, so a Downloads you made
- * somewhere else stays a plain folder. */
-pub const HOME_FOLDER_ICONS: &[(&str, &str)] = &[
-    /* name         glyph          */
-      ("Documents", glyph::DOCUMENT),
-      ("Downloads", glyph::DOWNLOAD),
-      ("Music"    , glyph::MUSIC   ),
-      ("Pictures" , glyph::PICTURE ),
-      ("Videos"   , glyph::VIDEO   ),
+/* The XDG user directories, as xdg-user-dirs defaults them. Places lists these
+ * rows and the view badges the same folders, so both read this one table — a
+ * second spelling of "Downloads" is how the Places row went missing once.
+ * The glyph is also the view's badge, painted only on a folder directly under
+ * $HOME, so a Downloads you made elsewhere stays a plain folder. */
+pub const XDG_DIRS: &[(&str, &str, &str)] = &[
+    /* user-dirs.dirs key    name         glyph          */
+      ("XDG_DESKTOP_DIR"  , "Desktop"  , glyph::DESKTOP ),
+      ("XDG_DOCUMENTS_DIR", "Documents", glyph::DOCUMENT),
+      ("XDG_DOWNLOAD_DIR" , "Downloads", glyph::DOWNLOAD),
+      ("XDG_MUSIC_DIR"    , "Music"    , glyph::MUSIC   ),
+      ("XDG_PICTURES_DIR" , "Pictures" , glyph::PICTURE ),
+      ("XDG_VIDEOS_DIR"   , "Videos"   , glyph::VIDEO   ),
 ];
 
 /* File classification by extension. */
