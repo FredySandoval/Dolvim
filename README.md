@@ -49,26 +49,6 @@ Configuration is source code. Colors, glyphs, and keys are `const` tables in
 `src/config.rs` — edit, recompile, done. There is no dotfile and no config
 parser.
 
-## Develop
-
-	make run        # cargo run --
-	make test       # unit tests, inline #[cfg(test)]
-	make lint       # clippy, warnings are errors
-	make fmt        # rustfmt, via nightly
-	make check      # fmt --check + lint + test; what must pass before a commit
-
-`make fmt` needs a nightly toolchain (`rustup toolchain install nightly`).
-`rustfmt.toml` ignores `src/config.rs` to keep its hand-aligned tables, and
-`ignore` is nightly-only — stable `cargo fmt` warns and reflows them anyway.
-
-`docs/DECISIONS.md` is the log: every non-obvious choice, why it was made, and
-what it cost. Read it before changing behaviour, and add to it when you do.
-`docs/UI_SPEC.md` holds the Breeze measurements the colors came from.
-
-`CLAUDE.md` is the manifesto the code is written to. It is not decoration —
-features are refused on purpose, and the absence of a test suite is an argument
-made there, not an oversight.
-
 ## License
 
 MIT.
