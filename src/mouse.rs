@@ -42,8 +42,7 @@ pub fn handle(app: &mut App, m: MouseEvent) {
         MouseEventKind::Down(MouseButton::Middle) => middle(app, x, y),
         MouseEventKind::Down(MouseButton::Right) => {
             hit_pane(app, x, y);
-            app.mode = Mode::Menu(MenuKind::Hamburger);
-            app.menu_sel = 0;
+            vim::open_menu(app, MenuKind::Hamburger);
         }
         MouseEventKind::Drag(MouseButton::Left) => dragging(app, x, y),
         MouseEventKind::Up(MouseButton::Left) => release(app, x, y, shift, ctrl),
@@ -82,8 +81,7 @@ fn hover(app: &mut App, x: u16, y: u16) {
         return;
     };
     if app.mode != Mode::Menu(want.clone()) {
-        app.mode = Mode::Menu(want);
-        app.menu_sel = 0;
+        vim::open_menu(app, want);
     }
 }
 
@@ -155,9 +153,7 @@ fn press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
         return vim::act(app, Action::CycleView, 1);
     }
     if hit(h.view_menu, x, y) {
-        app.mode = Mode::Menu(MenuKind::ViewMode);
-        app.menu_sel = 0;
-        return;
+        return vim::open_menu(app, MenuKind::ViewMode);
     }
     if hit(h.split, x, y) {
         return app.toggle_split();
@@ -166,15 +162,11 @@ fn press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
         return vim::act(app, Action::EnterSearch, 1);
     }
     if hit(h.menu, x, y) {
-        app.mode = Mode::Menu(MenuKind::Hamburger);
-        app.menu_sel = 0;
-        return;
+        return vim::open_menu(app, MenuKind::Hamburger);
     }
     for (r, seg) in &h.crumb_arrows {
         if hit(*r, x, y) {
-            app.mode = Mode::CrumbMenu(*seg);
-            app.menu_sel = 0;
-            return;
+            return vim::open_crumb(app, *seg);
         }
     }
     for (r, p) in &h.crumbs {
@@ -387,15 +379,18 @@ fn hit_item(app: &App, x: u16, y: u16) -> Option<(usize, usize)> {
             p.offset * p.grid_cols as usize + r as usize * p.grid_cols as usize + c as usize
         }
         ViewMode::Compact => {
-            // `cols` truncates, so the leftover columns on the right belong to
-            // no cell. Without this the index runs one column past the end and
-            // the length check below waves it through. Rows need no such guard:
-            // a compact row is one line and the grid is the full pane height.
-            let c = dx / p.cell_w.max(1);
-            if c >= p.grid_cols {
-                return None;
-            }
-            (p.offset + c as usize) * p.grid_rows as usize + dy as usize
+            // Columns are individually sized, so the hit is found by walking
+            // them. Running off the right end means the leftover margin, which
+            // belongs to no cell — without that the index would run past the
+            // last column and the length check below would wave it through.
+            // Rows need no such guard: a compact row is one line and the grid
+            // is the full pane height.
+            let mut edge = 0;
+            let c = p.col_w.iter().position(|w| {
+                edge += w;
+                dx < edge
+            })?;
+            (p.offset + c) * p.grid_rows as usize + dy as usize
         }
         ViewMode::Details => {
             if dy == 0 {
@@ -499,7 +494,8 @@ mod tests {
         p.area = Rect::new(0, 0, 25, 4);
         p.cell_w = 10;
         p.cell_h = 1;
-        p.grid_cols = 2; // 25 / 10 — columns 20..24 belong to no cell
+        p.col_w = vec![10, 10]; // 20..24 is leftover margin, no cell
+        p.grid_cols = 2;
         p.grid_rows = 4;
         // More items than the two columns hold, so an out-of-range column
         // still lands inside the listing and the length check waves it
@@ -508,5 +504,26 @@ mod tests {
 
         assert_eq!(hit_item(&app, 19, 0), Some((0, 4)));
         assert_eq!(hit_item(&app, 22, 0), None);
+    }
+
+    /// Compact columns are sized to their own contents, so the column under a
+    /// pointer is found by walking the widths. Dividing by any single one of
+    /// them lands in the wrong column the moment they differ.
+    #[test]
+    fn compact_columns_may_differ_in_width() {
+        let mut app = App::new(std::env::temp_dir());
+        let p = app.pane_mut();
+        p.view = ViewMode::Compact;
+        p.area = Rect::new(0, 0, 25, 4);
+        p.cell_h = 1;
+        p.col_w = vec![12, 8];
+        p.grid_cols = 2;
+        p.grid_rows = 4;
+        p.visible = (0..12).collect();
+
+        assert_eq!(hit_item(&app, 11, 0), Some((0, 0))); // last cell of col 0
+        assert_eq!(hit_item(&app, 12, 0), Some((0, 4))); // first of col 1
+        assert_eq!(hit_item(&app, 19, 2), Some((0, 6)));
+        assert_eq!(hit_item(&app, 20, 0), None); // past both columns
     }
 }

@@ -642,53 +642,114 @@ fn icons_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool
 }
 
 fn compact_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool) {
-    let cw = (config::CELL_W + 4).min(area.width.max(1));
     let rows = area.height.max(1);
-    let cols = (area.width / cw).max(1);
     let cut = app.clipboard.cut;
     let cut_set = app.clipboard.paths.clone();
+    let widths = compact_widths(app.pane_at(idx), rows, area.width);
     {
         let p = app.pane_at_mut(idx);
-        p.grid_cols = cols;
         p.grid_rows = rows;
-        p.cell_w = cw;
         p.cell_h = 1;
         // Compact flows down columns, so the scroll axis is columns.
         let cur_col = p.cursor / rows as usize;
-        reveal(p, cur_col, cols as usize);
+        if p.last_reveal != (p.cursor, p.view) {
+            p.last_reveal = (p.cursor, p.view);
+            scroll_columns(&mut p.offset, cur_col, &widths, area.width);
+        }
     }
     let p_len = app.pane_at(idx).visible.len();
     let offset = app.pane_at(idx).offset;
-    let first = offset * rows as usize;
 
-    for slot in 0..(cols as usize * rows as usize) {
-        let vis = first + slot;
-        if vis >= p_len {
+    // Only whole columns are drawn, except the first: at any width something
+    // must be on screen, even if it is a name too long for the pane.
+    let mut shown: Vec<u16> = Vec::new();
+    let mut used = 0;
+    for w in widths.iter().skip(offset) {
+        if used + w > area.width && !shown.is_empty() {
             break;
         }
-        let (c, r) = (slot / rows as usize, slot % rows as usize);
-        let x = area.x + c as u16 * cw;
-        let y = area.y + r as u16;
-        if y >= area.bottom() || x >= area.right() {
-            continue;
+        shown.push(*w);
+        used += w;
+    }
+    {
+        let p = app.pane_at_mut(idx);
+        p.grid_cols = shown.len().max(1) as u16;
+        p.cell_w = shown.first().copied().unwrap_or(1);
+        p.col_w = shown.clone();
+    }
+
+    let mut x = area.x;
+    for (c, cw) in shown.iter().enumerate() {
+        for r in 0..rows {
+            let vis = (offset + c) * rows as usize + r as usize;
+            if vis >= p_len {
+                break;
+            }
+            let y = area.y + r;
+            if y >= area.bottom() {
+                break;
+            }
+            let e = {
+                let p = app.pane_at(idx);
+                p.entries[p.visible[vis]].clone()
+            };
+            let is_cut = cut && cut_set.contains(&e.path);
+            let st = entry_style(app.pane_at(idx), vis, is_cut);
+            let w = (*cw).min(area.right() - x);
+            let cell = Rect::new(x, y, w, 1);
+            if st.bg == Some(color::SELECTION) {
+                fill(f.buffer_mut(), cell, color::SELECTION);
+            }
+            let text = format!("{} {}", e.glyph(), e.name);
+            f.buffer_mut()
+                .set_string(x, y, clip(&text, w.saturating_sub(1) as usize), st);
+            if vis == app.pane_at(idx).cursor {
+                cursor_row(f.buffer_mut(), cell, active);
+            }
         }
-        let e = {
-            let p = app.pane_at(idx);
-            p.entries[p.visible[vis]].clone()
-        };
-        let is_cut = cut && cut_set.contains(&e.path);
-        let st = entry_style(app.pane_at(idx), vis, is_cut);
-        let w = cw.min(area.right() - x);
-        let cell = Rect::new(x, y, w, 1);
-        if st.bg == Some(color::SELECTION) {
-            fill(f.buffer_mut(), cell, color::SELECTION);
-        }
-        let text = format!("{} {}", e.glyph(), e.name);
-        f.buffer_mut()
-            .set_string(x, y, clip(&text, w.saturating_sub(1) as usize), st);
-        if vis == app.pane_at(idx).cursor {
-            cursor_row(f.buffer_mut(), cell, active);
-        }
+        x += cw;
+    }
+}
+
+/// Dolphin's Compact sizes every column to its own longest name rather than
+/// truncating to a fixed cell, so a column of short names stays narrow and a
+/// long one is read in full. Widths for *all* columns, scrolled or not: which
+/// column an item lands in depends only on the row count, so this does not
+/// shift as the view scrolls.
+fn compact_widths(p: &crate::app::Pane, rows: u16, avail: u16) -> Vec<u16> {
+    let mut out = Vec::new();
+    for col in p.visible.chunks(rows as usize) {
+        let text = col
+            .iter()
+            .map(|&i| {
+                let e = &p.entries[i];
+                e.glyph().width().max(1) + 1 + e.name.width()
+            })
+            .max()
+            .unwrap_or(1);
+        // One trailing blank keeps neighbouring columns from touching.
+        out.push(((text + 1) as u16).min(avail.max(1)));
+    }
+    out
+}
+
+/// Scroll the least that brings column `col` on screen. Ragged widths mean the
+/// number that fits depends on where you start, so this walks left from `col`
+/// rather than subtracting a column count.
+fn scroll_columns(offset: &mut usize, col: usize, widths: &[u16], avail: u16) {
+    if col < *offset {
+        *offset = col;
+        return;
+    }
+    let Some(&cw) = widths.get(col) else { return };
+    let mut used = cw;
+    let mut start = col;
+    while start > *offset && used + widths[start - 1] <= avail {
+        used += widths[start - 1];
+        start -= 1;
+    }
+    if start > *offset {
+        *offset = start;
     }
 }
 

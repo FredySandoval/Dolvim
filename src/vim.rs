@@ -577,17 +577,7 @@ pub fn act(app: &mut App, a: Action, n: usize) {
                 enter_crumbs(app, config::NAV_BTNS - 1);
             }
         }
-        Action::SwapPane => {
-            if app.split_on() {
-                app.other_pane();
-            } else if app.places_visible {
-                app.focus = if app.focus == Focus::View {
-                    Focus::Places
-                } else {
-                    Focus::View
-                };
-            }
-        }
+        Action::SwapPane => app.other_pane(),
         Action::TogglePlaces => {
             app.places_visible = !app.places_visible;
             if !app.places_visible {
@@ -648,18 +638,9 @@ pub fn act(app: &mut App, a: Action, n: usize) {
         }
         Action::DragOut => crate::drag::drag_out(app),
         Action::DropIn => crate::drag::drop_in(app),
-        Action::OpenMenu => {
-            app.mode = Mode::Menu(MenuKind::Hamburger);
-            app.menu_sel = 0;
-        }
-        Action::OpenViewMenu => {
-            app.mode = Mode::Menu(MenuKind::ViewMode);
-            app.menu_sel = 0;
-        }
-        Action::OpenSortMenu => {
-            app.mode = Mode::Menu(MenuKind::Sort);
-            app.menu_sel = 0;
-        }
+        Action::OpenMenu => open_menu(app, MenuKind::Hamburger),
+        Action::OpenViewMenu => open_menu(app, MenuKind::ViewMode),
+        Action::OpenSortMenu => open_menu(app, MenuKind::Sort),
         Action::Help => app.mode = Mode::Help,
         Action::QuitAll => app.quit = true,
     }
@@ -1029,6 +1010,28 @@ fn confirm(app: &mut App, k: KeyEvent, what: Confirm) {
     }
 }
 
+/// Open a menu with the cursor on the row already in force. A menu that always
+/// opened on its first item read as "Icons" being the mode whatever the pane
+/// was actually showing, since the highlight is the only mark a row carries.
+pub fn open_menu(app: &mut App, kind: MenuKind) {
+    app.menu_sel = match kind {
+        MenuKind::ViewMode => match app.pane().view {
+            ViewMode::Icons => 0,
+            ViewMode::Compact => 1,
+            ViewMode::Details => 2,
+        },
+        MenuKind::Sort => match app.pane().sort.key {
+            SortKey::Name => 0,
+            SortKey::Size => 1,
+            SortKey::Date => 2,
+            SortKey::Type => 3,
+        },
+        // The hamburger is a list of verbs; none of them is in force.
+        MenuKind::Hamburger => 0,
+    };
+    app.mode = Mode::Menu(kind);
+}
+
 /// Menu contents. Kept next to the handler so adding an item cannot forget one.
 pub fn menu_items(kind: &MenuKind) -> Vec<(&'static str, Action)> {
     match kind {
@@ -1142,14 +1145,39 @@ fn openable_crumb(app: &App) -> Option<usize> {
     }
 }
 
+/// Open segment `seg`, remembering it as where the breadcrumb was left. The
+/// cursor starts on the child you are standing in, when the menu holds it: that
+/// is the one row already in force, as in `open_menu`.
+pub fn open_crumb(app: &mut App, seg: usize) {
+    let trail = crate::ui::crumb_paths(&app.pane().cwd);
+    let here = trail.get(seg + 1);
+    app.menu_sel = here
+        .and_then(|p| crumb_siblings(app, seg).iter().position(|s| s == p))
+        .unwrap_or(0);
+    app.pane_mut().crumb_focus = trail.get(seg).cloned();
+    app.mode = Mode::CrumbMenu(seg);
+}
+
 /// Into the breadcrumb, or — when there is no trail to open — onto the button
 /// given as the fallback, so the toolbar stays reachable from every place.
+///
+/// Focus returns to the segment it was left on, not to the end of the trail.
+/// Walking down a tree and back up is the common errand, and always landing on
+/// the deepest segment means re-walking left across the trail every time. The
+/// segment is remembered by path: after descending into it, it is still there,
+/// one place further from the end. A path no longer on the trail — a jump to
+/// some other tree — falls back to the rightmost openable segment.
 fn enter_crumbs(app: &mut App, fallback: usize) {
-    match openable_crumb(app) {
-        Some(seg) => {
-            app.menu_sel = 0;
-            app.mode = Mode::CrumbMenu(seg);
-        }
+    let remembered = app.pane().crumb_focus.clone().and_then(|p| {
+        crate::ui::crumb_paths(&app.pane().cwd)
+            .iter()
+            .position(|c| *c == p)
+    });
+    let seg = remembered
+        .filter(|&s| !crumb_siblings(app, s).is_empty())
+        .or_else(|| openable_crumb(app));
+    match seg {
+        Some(seg) => open_crumb(app, seg),
         None => focus_button(app, fallback),
     }
 }
@@ -1194,11 +1222,13 @@ pub fn menu_owner(kind: &MenuKind) -> Option<usize> {
 /// *is* opening its dropdown. `Mode::Menu` is then both "the menu is open" and
 /// "focus is on its button", which is why there is no flag for either.
 fn focus_button(app: &mut App, i: usize) {
-    app.menu_sel = 0;
-    app.mode = match button_menu(i) {
-        Some(kind) => Mode::Menu(kind),
-        None => Mode::Buttons(i),
-    };
+    match button_menu(i) {
+        Some(kind) => open_menu(app, kind),
+        None => {
+            app.menu_sel = 0;
+            app.mode = Mode::Buttons(i);
+        }
+    }
 }
 
 /// The keys that move focus around the toolbar row, for a focus resting on
@@ -1268,10 +1298,7 @@ fn crumb_menu(app: &mut App, k: KeyEvent, seg: usize) {
     let last_seg = crate::ui::crumb_paths(&app.pane().cwd)
         .len()
         .saturating_sub(1);
-    let walk = |app: &mut App, to: usize| {
-        app.menu_sel = 0;
-        app.mode = Mode::CrumbMenu(to);
-    };
+    let walk = open_crumb;
     match k.code {
         // Ctrl+j is the way back down, the mirror of the Ctrl+k that came up.
         // Ctrl+h and Ctrl+l are pane motions and the toolbar row holds three

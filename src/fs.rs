@@ -300,15 +300,20 @@ fn dir_child_count(p: &Path) -> Option<u64> {
     fs::read_dir(p).map(|d| d.count() as u64).ok()
 }
 
+/// Base 1000, KDE's "Metric" file size setting. The binary units it also offers
+/// disagree with `eza`, which is what the terminal beside this one is showing.
+/// The unit is two wide either way, so a bare `B` carries a leading space. The
+/// Details column right-aligns the whole string; without the pad, a `B` row
+/// pushes its digits one place right of the `KB` rows it sits under.
 pub fn format_size(bytes: u64) -> String {
-    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
-    if bytes < 1024 {
-        return format!("{bytes} B");
+    if bytes < 1000 {
+        return format!("{bytes}  B");
     }
-    let mut v = bytes as f64;
+    const UNITS: [&str; 5] = ["KB", "MB", "GB", "TB", "PB"];
+    let mut v = bytes as f64 / 1000.0;
     let mut i = 0;
-    while v >= 1024.0 && i + 1 < UNITS.len() {
-        v /= 1024.0;
+    while v >= 1000.0 && i + 1 < UNITS.len() {
+        v /= 1000.0;
         i += 1;
     }
     format!("{:.1} {}", v, UNITS[i])
@@ -536,10 +541,10 @@ mod tests {
 
     #[test]
     fn sizes_match_dolphin_formatting() {
-        assert_eq!(format_size(0), "0 B");
-        assert_eq!(format_size(701), "701 B");
-        assert_eq!(format_size(1024), "1.0 KiB");
-        assert_eq!(format_size(499_289_948_160), "465.0 GiB");
+        assert_eq!(format_size(0), "0  B");
+        assert_eq!(format_size(701), "701  B");
+        assert_eq!(format_size(1000), "1.0 KB");
+        assert_eq!(format_size(499_289_948_160), "499.3 GB");
     }
 
     #[test]

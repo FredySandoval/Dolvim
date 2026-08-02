@@ -43,9 +43,9 @@ pub mod glyph {
     /*        name          escape                 glyph  where it appears      */
     pub const FOLDER       :&str = "\u{ea83}" ; /*   directory entry            */
     pub const FOLDER_EMPTY :&str = "\u{eaf7}" ; /*   directory with no children */
-    pub const FOLDER_OPEN  :&str = "\u{1f5c1}"; /* 🗁 expanded in Details        */
+    pub const FOLDER_OPEN  :&str = "\u{f0770}"; /* 󰝰 expanded in Details        */
     pub const FOLDER_LOCKED:&str = "\u{f1aa8}"; /* 󱪨 no permission to enter     */
-    pub const FILE         :&str = "\u{1f5cb}"; /* 🗋 regular file               */
+    pub const FILE         :&str = "\u{f016}" ; /*  regular file                */
     pub const SYMLINK      :&str = "\u{2937}" ; /* ⤷ link                       */
     pub const HOME         :&str = "\u{f02dc}"; /* 󰋜 Places: Home               */
     pub const TRASH        :&str = "\u{f014}" ; /*   Places: Trash              */
@@ -58,16 +58,16 @@ pub mod glyph {
     pub const DOWNLOAD     :&str = "\u{f409}" ; /*   Downloads                  */
     pub const DOCUMENT     :&str = "\u{eaf0}" ; /*   Documents                  */
     pub const MUSIC        :&str = "\u{266a}" ; /* ♪ Places: Music              */
-    pub const PICTURE      :&str = "\u{1f5bb}"; /* 🖻  Places: Pictures          */
-    pub const VIDEO        :&str = "\u{1f5b7}"; /* 🖷  Places: Videos            */
-    pub const ARCHIVE      :&str = "\u{1f5c3}"; /* 🗃 archive file              */
+    pub const PICTURE      :&str = "\u{f0976}"; /* 󰥶 Places: Pictures           */
+    pub const VIDEO        :&str = "\u{f0567}"; /* 󰕧 Places: Videos             */
+    pub const ARCHIVE      :&str = "\u{f05c4}"; /* 󰗄 archive file               */
     pub const BACK         :&str = "\u{efc3}" ; /*   toolbar back               */
     pub const FORWARD      :&str = "\u{edfb}" ; /*   toolbar forward            */
     pub const VIEW_ICONS   :&str = "\u{f0570}"; /* 󰕰 toolbar view button        */
     pub const VIEW_COMPACT :&str = "\u{f02be}"; /* 󰊾 toolbar view button        */
     pub const VIEW_DETAILS :&str = "\u{ef81}" ; /*   toolbar view button        */
     pub const SPLIT        :&str = "\u{f4b4}" ; /*   toolbar Split              */
-    pub const SEARCH       :&str = "\u{1f50d}"; /* 🔍 toolbar Search            */
+    pub const SEARCH       :&str = "\u{ea6d}" ; /*  toolbar Search              */
     pub const MENU         :&str = "\u{2630}" ; /* ☰ toolbar hamburger         */
     pub const DROPDOWN     :&str = "\u{25be}" ; /* ▾  split-button, open crumb  */
     pub const CRUMB_SHUT   :&str = "\u{2bc8}" ; /* ⯈  crumb whose menu is shut  */
@@ -93,7 +93,7 @@ pub const DISK_POLL_MS        :  u64 = 2000; /* how often the status bar re-meas
 /* Icon cell *pitch*: each cell keeps a blank row on top and CELL_GAP blank
  * columns, which is where the cursor frame is drawn. Content is therefore
  * (CELL_W - CELL_GAP) by (CELL_H - 1) — one icon row and three of name, the
- * 13x4 the layout was designed around. Compact derives its width from this. */
+ * 13x4 the layout was designed around. Compact sizes its own columns. */
 pub const CELL_W              :  u16 =   15; /* icon-view cell pitch, columns                    */
 pub const CELL_H              :  u16 =    5; /* icon-view cell pitch, rows                       */
 

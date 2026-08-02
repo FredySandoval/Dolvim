@@ -148,12 +148,21 @@ pub struct Pane {
     pub grid_rows: u16,
     pub cell_w: u16,
     pub cell_h: u16,
+    /// Compact sizes each column to its own longest name, so the one cell width
+    /// above cannot describe it. Widths of the rendered columns, left to right.
+    pub col_w: Vec<u16>,
     /// Left edge of the icon grid, which floats inside the pane as the leftover
     /// columns are split into margin.
     pub grid_x: u16,
     /// Cursor and view the viewport was last scrolled to follow. The renderer
     /// reveals the cursor when this goes stale, and only then.
     pub last_reveal: (usize, ViewMode),
+    /// Trail segment the breadcrumb focus last sat on, and the row left
+    /// highlighted in its menu. Both are paths, not indices, so that navigating
+    /// or a directory changing underneath cannot leave them pointing at
+    /// something else — a stale one is simply not found, and the default wins.
+    pub crumb_focus: Option<PathBuf>,
+    pub crumb_pick: Option<PathBuf>,
 }
 
 impl Pane {
@@ -182,8 +191,11 @@ impl Pane {
             grid_rows: 1,
             cell_w: 1,
             cell_h: 1,
+            col_w: Vec::new(),
             grid_x: 0,
             last_reveal: (0, ViewMode::Icons),
+            crumb_focus: None,
+            crumb_pick: None,
         }
     }
 
