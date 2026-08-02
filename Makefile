@@ -5,6 +5,8 @@
 # nightly option. Formatting through stable silently reflows the tables.
 FMT_TOOLCHAIN = nightly
 
+PREFIX = /usr/local
+
 BIN = target/release/dolvim
 
 all: build
@@ -33,11 +35,13 @@ check:
 	cargo clippy --all-targets -- -D warnings
 	cargo test
 
+# Not dependent on `build`: cargo runs as root under sudo, where rustup has no
+# default toolchain. Run `make` first.
 install:
-	cargo install --path .
+	install -Dm755 $(BIN) $(DESTDIR)$(PREFIX)/bin/dolvim
 
 uninstall:
-	cargo uninstall dolvim
+	rm -f $(DESTDIR)$(PREFIX)/bin/dolvim
 
 clean:
 	cargo clean
