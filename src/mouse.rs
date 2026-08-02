@@ -230,6 +230,16 @@ fn press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
     let path = app.pane().at(vis).map(|e| e.path.clone());
     let Some(path) = path else { return };
 
+    // The tree arrow opens a folder as a drawer in place, on one click. The
+    // rest of the row is untouched, so double-clicking the name still enters
+    // the folder — same split Dolphin makes.
+    if !ctrl && !shift && on_expand_arrow(app, x, vis) {
+        app.pane_mut().cursor = vis;
+        app.last_click = None;
+        app.toggle_expand();
+        return;
+    }
+
     if ctrl {
         let p = app.pane_mut();
         if !p.selected.remove(&path) {
@@ -397,6 +407,21 @@ fn hit_item(app: &App, x: u16, y: u16) -> Option<(usize, usize)> {
     (vis < p.len()).then_some((idx, vis))
 }
 
+/// Whether `x` lands on the ▸/▾ glyph of a Details row that draws one. The
+/// blank cell to its left counts too: one column is a mean target with a mouse,
+/// and nothing else claims that cell.
+fn on_expand_arrow(app: &App, x: u16, vis: usize) -> bool {
+    let p = app.pane();
+    if p.view != ViewMode::Details {
+        return false;
+    }
+    let Some(e) = p.at(vis) else { return false };
+    // Mirrors the name column `ui::details_view` writes: one cell of padding,
+    // then two per depth level, then the arrow.
+    let arrow = p.area.x + 1 + e.depth * 2;
+    e.is_dir() && (x == arrow || x + 1 == arrow)
+}
+
 /// Row index inside whichever popup is open, or None when the click missed.
 fn menu_index(app: &App, x: u16, y: u16, len: usize) -> Option<usize> {
     let r = app.hits.menu_popup;
@@ -426,6 +451,42 @@ mod tests {
         app.pane_mut().area = Rect::new(0, 0, 80, 20);
         app.pane_mut().cell_h = 1;
         assert_eq!(hit_item(&app, 5, 0), None);
+    }
+
+    /// The arrow's column is computed twice — here and in the renderer — so it
+    /// is worth pinning the indent arithmetic down.
+    #[test]
+    fn expand_arrow_follows_the_tree_indent() {
+        use crate::fs::{Entry, Kind};
+
+        let mk = |depth: u16, kind: Kind| Entry {
+            name: "d".into(),
+            path: "/d".into(),
+            kind,
+            size: 0,
+            mtime: 0,
+            mode: 0,
+            readable: true,
+            hidden: false,
+            depth,
+            expanded: false,
+        };
+        let mut app = App::new(std::env::temp_dir());
+        let p = app.pane_mut();
+        p.view = ViewMode::Details;
+        p.area = Rect::new(4, 0, 60, 20);
+        p.entries = vec![mk(0, Kind::Dir), mk(2, Kind::Dir), mk(0, Kind::File)];
+        p.visible = vec![0, 1, 2];
+
+        // depth 0: pane edge + one cell of padding.
+        assert!(on_expand_arrow(&app, 5, 0));
+        assert!(on_expand_arrow(&app, 4, 0)); // the forgiving cell to its left
+        assert!(!on_expand_arrow(&app, 6, 0));
+        // depth 2: two more cells per level.
+        assert!(on_expand_arrow(&app, 9, 1));
+        assert!(!on_expand_arrow(&app, 5, 1));
+        // Files have no arrow to hit.
+        assert!(!on_expand_arrow(&app, 5, 2));
     }
 
     /// `cols` truncates, so a compact grid leaves dead columns on the right.

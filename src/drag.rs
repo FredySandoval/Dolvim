@@ -64,13 +64,11 @@ pub fn drag_out(app: &mut App) {
         return;
     };
     let mut cmd = Command::new(bin);
+    cmd.arg("--and-exit");
     if name == "ripdrag" {
-        cmd.arg("--and-exit");
         if let Some((x, y)) = cell_origin(app.pane().area.x, app.pane().area.y) {
             cmd.args(["-x", &x.to_string(), "-y", &y.to_string()]);
         }
-    } else {
-        cmd.arg("--and-exit");
     }
     cmd.args(&paths).stdout(Stdio::null()).stderr(Stdio::null());
     match cmd.spawn() {

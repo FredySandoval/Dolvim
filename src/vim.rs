@@ -193,11 +193,10 @@ fn enter_visual(app: &mut App, want: Mode) {
 }
 
 fn lookup(k: KeyEvent) -> Option<Action> {
-    let m = k.modifiers.difference(KeyModifiers::NONE);
     config::VIM_KEYS
         .iter()
         .chain(config::DOLPHIN_KEYS.iter())
-        .find(|b| b.code == k.code && b.mods == m)
+        .find(|b| b.code == k.code && b.mods == k.modifiers)
         .map(|b| b.action)
 }
 
@@ -417,15 +416,9 @@ pub fn act(app: &mut App, a: Action, n: usize) {
                 ViewMode::Icons => app.step_along(d, extend),
             }
         }
-        Action::Top => {
-            // `5gg` goes to item 5, like vim's line numbers.
-            let target = if app.count.is_empty() {
-                n.saturating_sub(1)
-            } else {
-                n - 1
-            };
-            app.goto_index(target, extend);
-        }
+        // `5gg` goes to item 5, like vim's line numbers. `n` is 1 when no count
+        // was typed, so a bare `gg` lands on the first item.
+        Action::Top => app.goto_index(n - 1, extend),
         Action::Bottom => {
             let last = app.pane().len().saturating_sub(1);
             app.goto_index(last, extend);
@@ -456,18 +449,15 @@ pub fn act(app: &mut App, a: Action, n: usize) {
         Action::EnterVisualLine => enter_visual(app, Mode::VisualLine),
 
         // file operations
-        Action::Copy => {
+        Action::Copy | Action::Cut => {
+            let cut = a == Action::Cut;
             let v = app.pane().selected_paths();
             let n = v.len();
-            app.clipboard.set(v, false);
-            app.info(format!("Copied {n} item(s)"));
-            app.mode = Mode::Normal;
-        }
-        Action::Cut => {
-            let v = app.pane().selected_paths();
-            let n = v.len();
-            app.clipboard.set(v, true);
-            app.info(format!("Cut {n} item(s)"));
+            app.clipboard.set(v, cut);
+            app.info(format!(
+                "{} {n} item(s)",
+                if cut { "Cut" } else { "Copied" }
+            ));
             app.mode = Mode::Normal;
         }
         Action::Paste => paste(app),
@@ -498,16 +488,8 @@ pub fn act(app: &mut App, a: Action, n: usize) {
             }
         }
         Action::Rename => start_rename(app),
-        Action::NewFolder => {
-            app.mode = Mode::NewFolder;
-            app.input.clear();
-            app.input_cursor = 0;
-        }
-        Action::NewFile => {
-            app.mode = Mode::NewFile;
-            app.input.clear();
-            app.input_cursor = 0;
-        }
+        Action::NewFolder => enter_text(app, Mode::NewFolder, String::new()),
+        Action::NewFile => enter_text(app, Mode::NewFile, String::new()),
         Action::Undo => match app.undo.pop() {
             None => app.info("Nothing to undo"),
             Some(op) => match ops::undo(&op) {
@@ -1014,10 +996,7 @@ fn command(app: &mut App, line: &str) {
 // ---------------------------------------------------------------------------
 
 fn confirm(app: &mut App, k: KeyEvent, what: Confirm) {
-    let yes = matches!(
-        k.code,
-        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter
-    );
+    let yes = matches!(k.code, KeyCode::Char('y' | 'Y') | KeyCode::Enter);
     app.mode = Mode::Normal;
     if !yes {
         app.info("Cancelled");

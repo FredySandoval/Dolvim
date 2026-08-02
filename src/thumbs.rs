@@ -72,8 +72,7 @@ impl Thumbs {
     }
 
     /// Collect finished work. Called once per tick.
-    pub fn pump(&mut self) -> bool {
-        let mut any = false;
+    pub fn pump(&mut self) {
         while let Ok((path, w, h, t)) = self.rx.try_recv() {
             let k = Key { path, w, h };
             self.cache.insert(
@@ -84,13 +83,11 @@ impl Thumbs {
                 },
             );
             self.order.push(k);
-            any = true;
         }
         while self.order.len() > config::THUMB_CACHE_CAP {
             let k = self.order.remove(0);
             self.cache.remove(&k);
         }
-        any
     }
 
     /// Thumbnail for `path` at `w x h` cells, requesting one if absent.
@@ -108,11 +105,14 @@ impl Thumbs {
         if !self.cache.contains_key(&k) {
             // Bound the queue: a directory of 5000 images must not enqueue
             // 5000 decodes ahead of the ones actually on screen.
-            let busy = self.inflight.lock().map(|g| *g).unwrap_or(0);
-            if busy < 32 {
-                if let Ok(mut g) = self.inflight.lock() {
+            let mut claimed = false;
+            if let Ok(mut g) = self.inflight.lock() {
+                claimed = *g < 32;
+                if claimed {
                     *g += 1;
                 }
+            }
+            if claimed {
                 let _ = self.tx.send((k.path.clone(), w, h));
                 self.cache.insert(k.clone(), State::Pending);
                 self.order.push(k);

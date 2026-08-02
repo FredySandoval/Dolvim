@@ -262,9 +262,9 @@ pub fn read_dir(path: &Path, depth: u16) -> std::io::Result<Vec<Entry>> {
         let is_link = lmeta.file_type().is_symlink();
         // Dolphin follows links for the type shown, but keeps the link marker.
         let meta = if is_link {
-            fs::metadata(&p).unwrap_or_else(|_| lmeta.clone())
+            fs::metadata(&p).unwrap_or(lmeta)
         } else {
-            lmeta.clone()
+            lmeta
         };
         let kind = if meta.is_dir() {
             Kind::Dir

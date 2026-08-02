@@ -19,12 +19,7 @@ use crate::vim;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    // Paint the whole window in the view background first, so the gaps
-    // between widgets are Breeze white, not terminal default.
-    f.render_widget(
-        Block::default().style(Style::default().bg(color::VIEW_BG)),
-        area,
-    );
+    paint(f, area, color::VIEW_BG);
 
     let tabbar = if app.tabs.len() > 1 { 1 } else { 0 };
     let filter = if app.filter_bar { 1 } else { 0 };
@@ -73,16 +68,11 @@ fn crumb_label(p: &Path) -> String {
     if p == Path::new("/") {
         return "/".into();
     }
-    p.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| p.to_string_lossy().into_owned())
+    crate::ops::name(p)
 }
 
 fn toolbar(f: &mut Frame, app: &mut App, area: Rect) {
-    f.render_widget(
-        Block::default().style(Style::default().bg(color::TOOLBAR_BG)),
-        area,
-    );
+    paint(f, area, color::TOOLBAR_BG);
     // Where the text cursor should end up, applied once the buffer borrow ends.
     let mut cursor: Option<(u16, u16)> = None;
     let buf = f.buffer_mut();
@@ -258,10 +248,7 @@ fn total_crumb_width(segs: &[(usize, String)]) -> u16 {
 }
 
 fn tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
-    f.render_widget(
-        Block::default().style(Style::default().bg(color::PANEL_BG)),
-        area,
-    );
+    paint(f, area, color::PANEL_BG);
     let buf = f.buffer_mut();
     app.hits.tabs.clear();
     let mut x = area.x;
@@ -340,10 +327,7 @@ fn body(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn places_panel(f: &mut Frame, app: &mut App, area: Rect) {
-    f.render_widget(
-        Block::default().style(Style::default().bg(color::PANEL_BG)),
-        area,
-    );
+    paint(f, area, color::PANEL_BG);
     let focused = app.focus == Focus::Places;
     let buf = f.buffer_mut();
     // No splitter rule: PANEL_BG against the view's white already reads as an
@@ -448,10 +432,7 @@ fn places_panel(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn view(f: &mut Frame, app: &mut App, area: Rect, idx: usize) {
     let is_active = idx == app.tab().active && app.focus == Focus::View;
-    f.render_widget(
-        Block::default().style(Style::default().bg(color::VIEW_BG)),
-        area,
-    );
+    paint(f, area, color::VIEW_BG);
     {
         let p = app.pane_at_mut(idx);
         p.area = area;
@@ -620,34 +601,17 @@ fn icons_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool
             cell.height.saturating_sub(1),
         );
         let thumb_area = Rect::new(body.x, body.y, body.width, icon_h.min(body.height));
-        let drew = if e.is_image() && thumb_area.width > 1 && thumb_area.height > 0 {
-            let t = app
-                .thumbs
-                .get(&e.path, thumb_area.width, thumb_area.height)
-                .cloned();
-            match t {
-                Some(t) => {
-                    blit(f.buffer_mut(), thumb_area, &t);
-                    true
-                }
-                None => false,
-            }
-        } else {
-            false
-        };
+        let drew = e.is_image()
+            && thumb_area.width > 1
+            && thumb_area.height > 0
+            && thumb(f, &mut app.thumbs, thumb_area, &e.path);
         if !drew {
-            // The icon's colour says what the entry is, not whether it is
-            // selected, so it is the entry's kind that picks it.
-            let fg = if is_cut {
-                color::CUT
-            } else if e.is_locked() {
-                color::OFFLINE
-            } else if e.is_dir() {
-                color::FOLDER
-            } else {
-                color::FILE
-            };
-            centred(f.buffer_mut(), thumb_area, e.glyph(), st.fg(fg));
+            centred(
+                f.buffer_mut(),
+                thumb_area,
+                e.glyph(),
+                st.fg(icon_color(&e, is_cut)),
+            );
         }
 
         // Name, wrapped over its rows and centred, as Dolphin centres it.
@@ -736,7 +700,7 @@ fn detail_columns(width: u16) -> [u16; 4] {
 }
 
 fn details_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool) {
-    let row_h: u16 = 1;
+    // One item per row, always: Details is Dolphin's list, not a grid.
     let head = area.y;
     let list = Rect::new(
         area.x,
@@ -744,7 +708,7 @@ fn details_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
         area.width,
         area.height.saturating_sub(1),
     );
-    let rows = (list.height / row_h).max(1);
+    let rows = list.height.max(1);
     let cols = detail_columns(area.width);
     let sort = app.pane_at(idx).sort;
     let cut = app.clipboard.cut;
@@ -755,7 +719,7 @@ fn details_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
         p.grid_cols = 1;
         p.grid_rows = rows;
         p.cell_w = area.width;
-        p.cell_h = row_h;
+        p.cell_h = 1;
         reveal(p, p.cursor, rows as usize);
     }
 
@@ -795,7 +759,7 @@ fn details_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
         if vis >= p_len {
             break;
         }
-        let y = list.y + r as u16 * row_h;
+        let y = list.y + r as u16;
         if y >= list.bottom() {
             break;
         }
@@ -805,7 +769,7 @@ fn details_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
         };
         let is_cut = cut && cut_set.contains(&e.path);
         let st = entry_style(app.pane_at(idx), vis, is_cut);
-        let row = Rect::new(area.x, y, area.width, row_h.min(list.bottom() - y));
+        let row = Rect::new(area.x, y, area.width, 1);
         if st.bg == Some(color::SELECTION) {
             fill(f.buffer_mut(), row, color::SELECTION);
         }
@@ -845,14 +809,6 @@ fn details_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
         f.buffer_mut()
             .set_string(x, y, clip(&e.type_name(), cols[3] as usize), st);
 
-        // With taller rows there is space for a real thumbnail beside the name.
-        if row_h > 1 && e.is_image() {
-            let ta = Rect::new(area.x + 1, y, (row_h * 2).min(cols[0]), row_h);
-            if let Some(t) = app.thumbs.get(&e.path, ta.width, ta.height).cloned() {
-                blit(f.buffer_mut(), ta, &t);
-            }
-        }
-
         if vis == app.pane_at(idx).cursor {
             cursor_row(f.buffer_mut(), row, active);
         }
@@ -864,41 +820,19 @@ fn details_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
 // ---------------------------------------------------------------------------
 
 fn info_panel(f: &mut Frame, app: &mut App, area: Rect) {
-    f.render_widget(
-        Block::default().style(Style::default().bg(color::PANEL_BG)),
-        area,
-    );
+    paint(f, area, color::PANEL_BG);
     let Some(e) = app.pane().current().cloned() else {
         return;
     };
     let preview = Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), 10);
-    let drew = if e.is_image() {
-        match app
-            .thumbs
-            .get(&e.path, preview.width, preview.height)
-            .cloned()
-        {
-            Some(t) => {
-                blit(f.buffer_mut(), preview, &t);
-                true
-            }
-            None => false,
-        }
-    } else {
-        false
-    };
-    if !drew {
+    if !(e.is_image() && thumb(f, &mut app.thumbs, preview, &e.path)) {
         centred(
             f.buffer_mut(),
             preview,
             e.glyph(),
-            Style::default().bg(color::PANEL_BG).fg(if e.is_locked() {
-                color::OFFLINE
-            } else if e.is_dir() {
-                color::FOLDER
-            } else {
-                color::FILE
-            }),
+            Style::default()
+                .bg(color::PANEL_BG)
+                .fg(icon_color(&e, false)),
         );
     }
     let st = Style::default().bg(color::PANEL_BG).fg(color::TEXT);
@@ -1350,6 +1284,12 @@ fn menu_popup(f: &mut Frame, r: Rect, sel: usize, items: &[String]) {
 // Buffer helpers
 // ---------------------------------------------------------------------------
 
+/// Lay a background colour under a whole region, so the gaps between widgets
+/// are Breeze, not terminal default.
+fn paint(f: &mut Frame, r: Rect, bg: ratatui::style::Color) {
+    f.render_widget(Block::default().style(Style::default().bg(bg)), r);
+}
+
 fn fill(buf: &mut Buffer, r: Rect, bg: ratatui::style::Color) {
     for y in r.y..r.bottom() {
         for x in r.x..r.right() {
@@ -1432,6 +1372,32 @@ fn cursor_row(buf: &mut Buffer, r: Rect, active: bool) {
                 }
             }
         }
+    }
+}
+
+/// The icon's colour says what the entry *is*, not whether it is selected.
+fn icon_color(e: &fs::Entry, cut: bool) -> ratatui::style::Color {
+    if cut {
+        color::CUT
+    } else if e.is_locked() {
+        color::OFFLINE
+    } else if e.is_dir() {
+        color::FOLDER
+    } else {
+        color::FILE
+    }
+}
+
+/// Draw `path`'s thumbnail into `r`, requesting a decode if there is none yet.
+/// False means "nothing to draw" and the caller falls back to the glyph; the
+/// thumbnail pops in on a later frame, like Dolphin.
+fn thumb(f: &mut Frame, thumbs: &mut crate::thumbs::Thumbs, r: Rect, path: &Path) -> bool {
+    match thumbs.get(path, r.width, r.height).cloned() {
+        Some(t) => {
+            blit(f.buffer_mut(), r, &t);
+            true
+        }
+        None => false,
     }
 }
 

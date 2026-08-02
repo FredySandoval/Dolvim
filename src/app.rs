@@ -358,10 +358,7 @@ impl Tab {
     }
 
     pub fn title(&self) -> String {
-        let p = &self.pane().cwd;
-        p.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| p.to_string_lossy().into_owned())
+        ops::name(&self.pane().cwd)
     }
 }
 
@@ -740,7 +737,7 @@ impl App {
             .stderr(Stdio::null())
             .spawn()
         {
-            Ok(_) => self.info(format!("Opening {}", name_of(path))),
+            Ok(_) => self.info(format!("Opening {}", ops::name(path))),
             Err(e) => self.error(format!("xdg-open failed: {e}")),
         }
     }
@@ -1032,12 +1029,6 @@ impl App {
         }
         p.clamp();
     }
-}
-
-pub fn name_of(p: &Path) -> String {
-    p.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| p.to_string_lossy().into_owned())
 }
 
 /// Files under `root` modified within `days`, shallow-recursive like Dolphin's
