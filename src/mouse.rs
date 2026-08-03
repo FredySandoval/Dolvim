@@ -219,7 +219,7 @@ fn press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
     app.tabs[app.active_tab].active = pane_idx;
     app.focus = Focus::View;
 
-    let path = app.pane().at(vis).map(|e| e.path.clone());
+    let path = app.pane().entry_at(vis).map(|e| e.path.clone());
     let Some(path) = path else { return };
 
     // The tree arrow opens a folder as a drawer in place, on one click. The
@@ -243,7 +243,7 @@ fn press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
         let anchor = app.pane().anchor;
         let (a, b) = (anchor.min(vis), anchor.max(vis));
         let range: Vec<PathBuf> = (a..=b)
-            .filter_map(|i| app.pane().at(i).map(|e| e.path.clone()))
+            .filter_map(|i| app.pane().entry_at(i).map(|e| e.path.clone()))
             .collect();
         let p = app.pane_mut();
         p.selected.clear();
@@ -274,7 +274,7 @@ fn press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
         };
         app.drag = Some(Drag {
             paths,
-            at: (x, y),
+            position: (x, y),
             origin: (x, y),
             started: false,
         });
@@ -286,7 +286,7 @@ fn middle(app: &mut App, x: u16, y: u16) {
     // Middle-click a folder to open it in a new tab, as Dolphin does.
     if let Some((pane_idx, vis)) = hit_item(app, x, y) {
         app.tabs[app.active_tab].active = pane_idx;
-        if let Some(e) = app.pane().at(vis).cloned() {
+        if let Some(e) = app.pane().entry_at(vis).cloned() {
             if e.is_dir() {
                 app.new_tab(e.path);
             }
@@ -303,7 +303,7 @@ fn middle(app: &mut App, x: u16, y: u16) {
 
 fn dragging(app: &mut App, x: u16, y: u16) {
     let Some(d) = app.drag.as_mut() else { return };
-    d.at = (x, y);
+    d.position = (x, y);
     let moved = x.abs_diff(d.origin.0) + y.abs_diff(d.origin.1);
     if moved > config::DRAG_THRESHOLD {
         d.started = true;
@@ -332,7 +332,7 @@ fn release(app: &mut App, x: u16, y: u16, shift: bool, ctrl: bool) {
     if let Some((pane_idx, vis)) = hit_item(app, x, y) {
         let target = app
             .pane_at(pane_idx)
-            .at(vis)
+            .entry_at(vis)
             .filter(|e| e.is_dir())
             .map(|e| e.path.clone())
             .unwrap_or_else(|| app.pane_at(pane_idx).cwd.clone());
@@ -414,7 +414,9 @@ fn on_expand_arrow(app: &App, x: u16, vis: usize) -> bool {
     if p.view != ViewMode::Details {
         return false;
     }
-    let Some(e) = p.at(vis) else { return false };
+    let Some(e) = p.entry_at(vis) else {
+        return false;
+    };
     // Mirrors the name column `ui::details_view` writes: one cell of padding,
     // then two per depth level, then the arrow.
     let arrow = p.area.x + 1 + e.depth * 2;

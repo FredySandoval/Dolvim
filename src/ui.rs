@@ -1224,8 +1224,8 @@ fn overlays(f: &mut Frame, app: &mut App, area: Rect) {
         if d.started {
             let label = format!(" {} item{} ", d.paths.len(), plural(d.paths.len()));
             let w = label.width() as u16;
-            let x = (d.at.0 + 1).min(area.right().saturating_sub(w));
-            let y = (d.at.1 + 1).min(area.bottom().saturating_sub(1));
+            let x = (d.position.0 + 1).min(area.right().saturating_sub(w));
+            let y = (d.position.1 + 1).min(area.bottom().saturating_sub(1));
             f.buffer_mut().set_string(
                 x,
                 y,

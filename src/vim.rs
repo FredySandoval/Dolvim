@@ -697,7 +697,7 @@ fn search_step(app: &mut App, dir: isize) {
         let i = (start + dir * k).rem_euclid(n as isize) as usize;
         if app
             .pane()
-            .at(i)
+            .entry_at(i)
             .is_some_and(|e| e.name.to_lowercase().contains(&needle))
         {
             app.pane_mut().cursor = i;
@@ -793,7 +793,7 @@ fn live_update(app: &mut App) {
             for i in 0..n {
                 if app
                     .pane()
-                    .at(i)
+                    .entry_at(i)
                     .is_some_and(|e| e.name.to_lowercase().contains(&needle))
                 {
                     app.pane_mut().cursor = i;

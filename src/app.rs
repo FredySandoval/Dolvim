@@ -207,12 +207,12 @@ impl Pane {
         self.visible.is_empty()
     }
 
-    pub fn at(&self, vis: usize) -> Option<&Entry> {
+    pub fn entry_at(&self, vis: usize) -> Option<&Entry> {
         self.visible.get(vis).and_then(|&i| self.entries.get(i))
     }
 
     pub fn current(&self) -> Option<&Entry> {
-        self.at(self.cursor)
+        self.entry_at(self.cursor)
     }
 
     /// Install a fresh listing, keeping the cursor on the same file.
@@ -400,7 +400,7 @@ pub struct Hitboxes {
 /// A drag in flight. Terminals have no native DnD, so we draw our own.
 pub struct Drag {
     pub paths: Vec<PathBuf>,
-    pub at: (u16, u16),
+    pub position: (u16, u16),
     pub origin: (u16, u16),
     pub started: bool,
 }
@@ -774,7 +774,7 @@ impl App {
                 b = (b - b % s + s - 1).min(last as usize);
             }
             let range: Vec<PathBuf> = (a..=b)
-                .filter_map(|v| p.at(v).map(|e| e.path.clone()))
+                .filter_map(|v| p.entry_at(v).map(|e| e.path.clone()))
                 .collect();
             p.selected.clear();
             p.selected.extend(range);
@@ -867,7 +867,7 @@ impl App {
             let i = (from + k) % n;
             let hit = self
                 .pane()
-                .at(i)
+                .entry_at(i)
                 .is_some_and(|e| e.name.to_lowercase().starts_with(&needle));
             if hit {
                 self.pane_mut().cursor = i;
