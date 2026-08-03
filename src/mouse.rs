@@ -181,7 +181,7 @@ fn press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
     }
     for (i, r) in h.tabs.iter().enumerate() {
         if hit(*r, x, y) {
-            app.tab = i;
+            app.active_tab = i;
             return;
         }
     }
@@ -208,7 +208,7 @@ fn press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
     // The file view.
     let Some((pane_idx, vis)) = hit_item(app, x, y) else {
         if let Some(i) = pane_at(app, x, y) {
-            app.tabs[app.tab].active = i;
+            app.tabs[app.active_tab].active = i;
             app.focus = Focus::View;
             if !ctrl && !shift {
                 app.pane_at_mut(i).selected.clear();
@@ -216,7 +216,7 @@ fn press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
         }
         return;
     };
-    app.tabs[app.tab].active = pane_idx;
+    app.tabs[app.active_tab].active = pane_idx;
     app.focus = Focus::View;
 
     let path = app.pane().at(vis).map(|e| e.path.clone());
@@ -285,7 +285,7 @@ fn press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
 fn middle(app: &mut App, x: u16, y: u16) {
     // Middle-click a folder to open it in a new tab, as Dolphin does.
     if let Some((pane_idx, vis)) = hit_item(app, x, y) {
-        app.tabs[app.tab].active = pane_idx;
+        app.tabs[app.active_tab].active = pane_idx;
         if let Some(e) = app.pane().at(vis).cloned() {
             if e.is_dir() {
                 app.new_tab(e.path);
@@ -355,7 +355,7 @@ fn pane_at(app: &App, x: u16, y: u16) -> Option<usize> {
 
 fn hit_pane(app: &mut App, x: u16, y: u16) {
     if let Some(i) = pane_at(app, x, y) {
-        app.tabs[app.tab].active = i;
+        app.tabs[app.active_tab].active = i;
         app.focus = Focus::View;
     }
 }

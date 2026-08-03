@@ -258,7 +258,7 @@ fn tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
         if x + w > area.right() {
             break;
         }
-        let st = if i == app.tab {
+        let st = if i == app.active_tab {
             Style::default()
                 .bg(color::VIEW_BG)
                 .fg(color::TEXT)

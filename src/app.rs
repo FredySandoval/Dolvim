@@ -407,7 +407,7 @@ pub struct Drag {
 
 pub struct App {
     pub tabs: Vec<Tab>,
-    pub tab: usize,
+    pub active_tab: usize,
     pub places: Vec<Row>,
     pub places_sel: usize,
     pub places_visible: bool,
@@ -457,7 +457,7 @@ impl App {
         let watcher = Watcher::new();
         let mut app = App {
             tabs: vec![Tab::new(start.clone())],
-            tab: 0,
+            active_tab: 0,
             places: places::build(),
             places_sel: 1,
             places_visible: true,
@@ -498,11 +498,11 @@ impl App {
     // -- accessors ---------------------------------------------------------
 
     pub fn tab(&self) -> &Tab {
-        &self.tabs[self.tab]
+        &self.tabs[self.active_tab]
     }
 
     pub fn tab_mut(&mut self) -> &mut Tab {
-        &mut self.tabs[self.tab]
+        &mut self.tabs[self.active_tab]
     }
 
     pub fn pane(&self) -> &Pane {
@@ -516,11 +516,11 @@ impl App {
     /// A pane of the current tab by index, for the renderer and the hit-tests,
     /// which work on both panes of a split rather than only the active one.
     pub fn pane_at(&self, i: usize) -> &Pane {
-        &self.tabs[self.tab].panes[i]
+        &self.tabs[self.active_tab].panes[i]
     }
 
     pub fn pane_at_mut(&mut self, i: usize) -> &mut Pane {
-        &mut self.tabs[self.tab].panes[i]
+        &mut self.tabs[self.active_tab].panes[i]
     }
 
     pub fn split_on(&self) -> bool {
@@ -967,7 +967,7 @@ impl App {
 
     pub fn new_tab(&mut self, dir: PathBuf) {
         self.tabs.push(Tab::new(dir));
-        self.tab = self.tabs.len() - 1;
+        self.active_tab = self.tabs.len() - 1;
         self.reload();
     }
 
@@ -977,13 +977,13 @@ impl App {
             self.quit = true;
             return;
         }
-        self.tabs.remove(self.tab);
-        self.tab = self.tab.min(self.tabs.len() - 1);
+        self.tabs.remove(self.active_tab);
+        self.active_tab = self.active_tab.min(self.tabs.len() - 1);
     }
 
     pub fn cycle_tab(&mut self, delta: isize) {
         let n = self.tabs.len() as isize;
-        self.tab = ((self.tab as isize + delta).rem_euclid(n)) as usize;
+        self.active_tab = ((self.active_tab as isize + delta).rem_euclid(n)) as usize;
     }
 
     // -- details tree ------------------------------------------------------
