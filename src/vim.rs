@@ -364,7 +364,7 @@ pub struct Bind {
 }
 
 /// Terse constructor so a table row reads as one line.
-pub const fn b(code: KeyCode, mods: KeyModifiers, action: Action) -> Bind {
+pub const fn bind(code: KeyCode, mods: KeyModifiers, action: Action) -> Bind {
     Bind { code, mods, action }
 }
 
