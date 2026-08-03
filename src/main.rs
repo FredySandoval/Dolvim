@@ -90,7 +90,7 @@ fn run(start: PathBuf) -> io::Result<()> {
                 Event::Key(k) if k.kind != KeyEventKind::Release => {
                     app.status.clear();
                     app.status_is_error = false;
-                    vim::key(&mut app, k);
+                    vim::handle_key_event(&mut app, k);
                 }
                 Event::Mouse(m) => mouse::handle(&mut app, m),
                 _ => {}

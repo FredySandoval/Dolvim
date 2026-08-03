@@ -12,26 +12,28 @@ use crate::fs::SortKey;
 use crate::ops;
 use crate::places::{self, Target};
 
-pub fn key(app: &mut App, k: KeyEvent) {
+pub fn handle_key_event(app: &mut App, key_event: KeyEvent) {
     // The transfer popup is modal, as Dolphin's is. Letting keys through means
     // you can navigate away from a live copy, or start a second one on top of
     // `app.progress` and orphan the first thread with no way to see or stop it.
-    if let Some(p) = &app.progress {
-        if k.code == KeyCode::Esc {
-            p.cancel_requested.store(true, Ordering::Relaxed);
+    if let Some(active_transfer) = &app.progress {
+        if key_event.code == KeyCode::Esc {
+            active_transfer
+                .cancel_requested
+                .store(true, Ordering::Relaxed);
         }
         return;
     }
 
     match app.mode.clone() {
-        Mode::Normal | Mode::Visual | Mode::VisualLine => normal(app, k),
-        Mode::Confirm(c) => confirm(app, k, c),
+        Mode::Normal | Mode::Visual | Mode::VisualLine => normal(app, key_event),
+        Mode::Confirm(c) => confirm(app, key_event, c),
         // Any key dismisses an information overlay.
         Mode::Properties | Mode::Help => app.mode = Mode::Normal,
-        Mode::Menu(kind) => menu(app, k, kind),
-        Mode::CrumbMenu(i) => crumb_menu(app, k, i),
-        Mode::Buttons(i) => buttons(app, k, i),
-        _ => text(app, k),
+        Mode::Menu(kind) => menu(app, key_event, kind),
+        Mode::CrumbMenu(i) => crumb_menu(app, key_event, i),
+        Mode::Buttons(i) => buttons(app, key_event, i),
+        _ => text(app, key_event),
     }
 }
 
@@ -1357,7 +1359,7 @@ mod tests {
     }
 
     fn press(a: &mut App, c: char) {
-        key(a, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        handle_key_event(a, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
     }
 
     #[test]
@@ -1390,7 +1392,7 @@ mod tests {
         let mut a = app();
         press(&mut a, ':');
         assert_eq!(a.mode, Mode::Command);
-        key(&mut a, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        handle_key_event(&mut a, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(a.mode, Mode::Normal);
     }
 

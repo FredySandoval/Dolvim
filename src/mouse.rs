@@ -25,9 +25,9 @@ fn hit(r: Rect, x: u16, y: u16) -> bool {
 const DOUBLE_MS: u64 = 400;
 
 pub fn handle(app: &mut App, m: MouseEvent) {
-    // Modal, for the reason given in `vim::key` — a click can reach Paste
-    // through the menu just as a key can, so blocking only the keyboard would
-    // leave the orphaned-transfer hole open.
+    // Modal, for the reason given in `vim::handle_key_event` — a click can
+    // reach Paste through the menu just as a key can, so blocking only the
+    // keyboard would leave the orphaned-transfer hole open.
     if app.progress.is_some() {
         return;
     }
