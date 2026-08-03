@@ -11,6 +11,8 @@
 
 use ratatui::style::Color;
 
+use crate::fs::TimeStyle;
+
 /* Breeze palette. Truecolor: terminals that cannot do 24-bit will degrade,
  * which is their business, not ours. */
 pub mod color {
@@ -83,35 +85,71 @@ pub mod glyph {
 pub const PLACES_WIDTH        :  u16 =   22; /* Places panel columns, the screenshot's 150 px   */
 pub const INFO_WIDTH          :  u16 =   30; /* Information panel columns (F11)                 */
 pub const TYPEAHEAD_TIMEOUT_MS: u128 = 1000; /* type-ahead buffer life without a keystroke      */
+/* Double-click window. Dolphin selects on the first click and opens on the
+ * second — verified on a stock install with no `SingleClick` key set in
+ * kdeglobals. We do the same. */
+pub const DOUBLE_CLICK_MS     :  u64 =  400; /* second click inside this counts as a double     */
 pub const WATCH_DEBOUNCE_MS   :  u64 =  120; /* coalescing window for inotify storms            */
 pub const TICK_MS             :  u64 =   40; /* event loop tick; listing/thumbnail poll rate    */
 pub const DRAG_THRESHOLD      :  u16 =    1; /* cells of movement before a drag begins          */
 pub const THUMB_CACHE_CAP     :usize =  512; /* decoded thumbnails held in memory               */
+pub const THUMB_MAX_INFLIGHT  :usize =   32; /* decodes queued at once; the rest wait           */
 pub const CELL_GAP            :  u16 =    2; /* blank columns between icon-view tiles           */
 pub const VIEW_MARGIN         :  u16 =    1; /* blank columns left of Compact and Details rows  */
 pub const NAME_LINES          :  u16 =    3; /* rows a name may wrap over in the icon view      */
 pub const DISK_POLL_MS        :  u64 = 2000; /* how often the status bar re-measures free space */
+pub const COPY_CHUNK_BYTES    :usize = 256 * 1024; /* streaming copy buffer; cancel granularity  */
+pub const RECENT_MAX_DEPTH    :  u32 =    3; /* how deep a Recent search walks                  */
+pub const RECENT_MAX_ITEMS    :usize = 2000; /* results a Recent search stops at                */
+
+/* How the Details `Modified` column spells a timestamp. `Short` is Dolphin's
+ * `Aug 2, 8:22pm`, dropping the year while it is the current one; `Iso` is
+ * `2026-08-02 20:22`, which sorts as it reads. Month names are English: the
+ * locale's are the C library's to know, and this crate forbids `unsafe`.
+ * Widen TIME_WIDTH to match if you change the style. */
+pub const TIME_STYLE          :TimeStyle = TimeStyle::Short;
+pub const TIME_WIDTH          :  u16 =   20; /* `Modified` width at its widest, with a year     */
+pub const SIZE_WIDTH          :  u16 =   12; /* Details `Size` column                           */
+pub const TYPE_WIDTH          :  u16 =   14; /* Details `Type` column                           */
+pub const PROGRESS_POPUP_W    :  u16 =   60; /* transfer popup, columns                         */
+pub const PROGRESS_POPUP_H    :  u16 =    6; /* transfer popup, rows                            */
+pub const PROGRESS_BAR_WIDTH  :usize =   56; /* the meter inside it: popup width less borders   */
+/* Columns the toolbar keeps clear on the right for its own controls: the
+ * hamburger, Search and the Split button, with the blanks between them.
+ * Widen it if you add a button, or the breadcrumb will run underneath. */
+pub const TOOLBAR_RIGHT_WIDTH :  u16 =   22; /* right-hand toolbar controls, columns            */
 
 /* Icon cell *pitch*: each cell keeps a blank row on top and CELL_GAP blank
  * columns, which is where the cursor frame is drawn. Content is therefore
- * (CELL_W - CELL_GAP) by (CELL_H - 1) — one icon row and three of name, the
+ * (CELL_WIDTH - CELL_GAP) by (CELL_HEIGHT - 1) — one icon row and three of name, the
  * 13x4 the layout was designed around. Compact sizes its own columns. */
-pub const CELL_W              :  u16 =   15; /* icon-view cell pitch, columns                    */
-pub const CELL_H              :  u16 =    5; /* icon-view cell pitch, rows                       */
+pub const CELL_WIDTH          :  u16 =   15; /* icon-view cell pitch, columns                   */
+pub const CELL_HEIGHT         :  u16 =    5; /* icon-view cell pitch, rows                      */
 
 /* The XDG user directories, as xdg-user-dirs defaults them. Places lists these
  * rows and the view badges the same folders, so both read this one table — a
  * second spelling of "Downloads" is how the Places row went missing once.
  * The glyph is also the view's badge, painted only on a folder directly under
  * $HOME, so a Downloads you made elsewhere stays a plain folder. */
-pub const XDG_DIRS: &[(&str, &str, &str)] = &[
-    /* user-dirs.dirs key    name         glyph          */
-      ("XDG_DESKTOP_DIR"  , "Desktop"  , glyph::DESKTOP ),
-      ("XDG_DOCUMENTS_DIR", "Documents", glyph::DOCUMENT),
-      ("XDG_DOWNLOAD_DIR" , "Downloads", glyph::DOWNLOAD),
-      ("XDG_MUSIC_DIR"    , "Music"    , glyph::MUSIC   ),
-      ("XDG_PICTURES_DIR" , "Pictures" , glyph::PICTURE ),
-      ("XDG_VIDEOS_DIR"   , "Videos"   , glyph::VIDEO   ),
+pub struct XdgDir {
+    pub env_key: &'static str,
+    pub name   : &'static str,
+    pub glyph  : &'static str,
+}
+
+/* One row per directory; `xdg_dir` reads the key, Places shows the name. */
+const fn xdg(env_key: &'static str, name: &'static str, glyph: &'static str) -> XdgDir {
+    XdgDir { env_key, name, glyph }
+}
+
+pub const XDG_DIRS: &[XdgDir] = &[
+    /* user-dirs.dirs key        name         glyph          */
+    xdg("XDG_DESKTOP_DIR"  , "Desktop"  , glyph::DESKTOP ),
+    xdg("XDG_DOCUMENTS_DIR", "Documents", glyph::DOCUMENT),
+    xdg("XDG_DOWNLOAD_DIR" , "Downloads", glyph::DOWNLOAD),
+    xdg("XDG_MUSIC_DIR"    , "Music"    , glyph::MUSIC   ),
+    xdg("XDG_PICTURES_DIR" , "Pictures" , glyph::PICTURE ),
+    xdg("XDG_VIDEOS_DIR"   , "Videos"   , glyph::VIDEO   ),
 ];
 
 /* File classification by extension. */
@@ -122,106 +160,106 @@ pub const ARCHIVE_EXTS : &[&str] = &["tar", "gz" , "tgz" , "bz2", "xz" , "zst" ,
 // Keymap
 // ---------------------------------------------------------------------------
 
-use crossterm::event::{KeyCode as K, KeyModifiers as M};
+use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::vim::{bind, Action, Bind};
 
 /* Dolphin's native shortcuts. Active in every non-text mode, alongside vim. */
 pub const DOLPHIN_KEYS: &[Bind] = &[
-    /*    key          modifiers                   action                 */
-    bind(K::Left     , M::ALT                    , Action::Back           ),
-    bind(K::Right    , M::ALT                    , Action::Forward        ),
-    bind(K::Up       , M::ALT                    , Action::GoUp           ),
-    bind(K::Backspace, M::NONE                   , Action::GoUp           ),
-    bind(K::Home     , M::ALT                    , Action::GoHome         ),
-    bind(K::F(5)     , M::NONE                   , Action::Refresh        ),
-    bind(K::Enter    , M::NONE                   , Action::Open           ),
-    bind(K::Down     , M::NONE                   , Action::MoveDown       ),
-    bind(K::Up       , M::NONE                   , Action::MoveUp         ),
-    bind(K::Left     , M::NONE                   , Action::MoveLeft       ),
-    bind(K::Right    , M::NONE                   , Action::MoveRight      ),
-    bind(K::Home     , M::NONE                   , Action::Top            ),
-    bind(K::End      , M::NONE                   , Action::Bottom         ),
-    bind(K::PageDown , M::NONE                   , Action::PageDown       ),
-    bind(K::PageUp   , M::NONE                   , Action::PageUp         ),
-    bind(K::Char(' '), M::NONE                   , Action::ToggleSelect   ),
-    bind(K::Char('a'), M::CONTROL                , Action::SelectAll      ),
-    bind(K::Char('A'), M::CONTROL.union(M::SHIFT), Action::InvertSelect   ),
-    bind(K::Char('c'), M::CONTROL                , Action::Copy           ),
-    bind(K::Char('x'), M::CONTROL                , Action::Cut            ),
-    bind(K::Char('v'), M::CONTROL                , Action::Paste          ),
-    bind(K::Delete   , M::NONE                   , Action::Trash          ),
-    bind(K::Delete   , M::SHIFT                  , Action::DeletePerm     ),
-    bind(K::F(2)     , M::NONE                   , Action::Rename         ),
-    bind(K::F(10)    , M::NONE                   , Action::NewFolder      ),
-    bind(K::Char('n'), M::CONTROL.union(M::SHIFT), Action::NewFolder      ),
-    bind(K::Enter    , M::ALT                    , Action::Properties     ),
-    bind(K::Char('1'), M::CONTROL                , Action::ViewIcons      ),
-    bind(K::Char('2'), M::CONTROL                , Action::ViewCompact    ),
-    bind(K::Char('3'), M::CONTROL                , Action::ViewDetails    ),
-    bind(K::F(3)     , M::NONE                   , Action::ToggleSplit    ),
-    bind(K::Tab      , M::NONE                   , Action::SwapPane       ),
-    bind(K::F(9)     , M::NONE                   , Action::TogglePlaces   ),
-    bind(K::F(11)    , M::NONE                   , Action::ToggleInfo     ),
-    bind(K::Char('i'), M::CONTROL                , Action::ToggleFilterBar),
-    bind(K::Char('t'), M::CONTROL                , Action::NewTab         ),
-    bind(K::Char('w'), M::CONTROL                , Action::CloseTab       ),
-    bind(K::Tab      , M::CONTROL                , Action::NextTab        ),
-    bind(K::BackTab  , M::CONTROL.union(M::SHIFT), Action::PrevTab        ),
-    bind(K::Char('f'), M::CONTROL                , Action::EnterSearch    ),
-    bind(K::F(6)     , M::NONE                   , Action::EnterPathEdit  ),
-    bind(K::F(4)     , M::NONE                   , Action::TerminalPanel  ),
-    bind(K::F(4)     , M::SHIFT                  , Action::TerminalHere   ),
-    bind(K::F(1)     , M::NONE                   , Action::Help           ),
-    bind(K::Char('q'), M::CONTROL                , Action::QuitAll        ),
+    /*    key                 modifiers                                         action                  */
+    bind(KeyCode::Left     , KeyModifiers::ALT                               , Action::Back           ),
+    bind(KeyCode::Right    , KeyModifiers::ALT                               , Action::Forward        ),
+    bind(KeyCode::Up       , KeyModifiers::ALT                               , Action::GoUp           ),
+    bind(KeyCode::Backspace, KeyModifiers::NONE                              , Action::GoUp           ),
+    bind(KeyCode::Home     , KeyModifiers::ALT                               , Action::GoHome         ),
+    bind(KeyCode::F(5)     , KeyModifiers::NONE                              , Action::Refresh        ),
+    bind(KeyCode::Enter    , KeyModifiers::NONE                              , Action::Open           ),
+    bind(KeyCode::Down     , KeyModifiers::NONE                              , Action::MoveDown       ),
+    bind(KeyCode::Up       , KeyModifiers::NONE                              , Action::MoveUp         ),
+    bind(KeyCode::Left     , KeyModifiers::NONE                              , Action::MoveLeft       ),
+    bind(KeyCode::Right    , KeyModifiers::NONE                              , Action::MoveRight      ),
+    bind(KeyCode::Home     , KeyModifiers::NONE                              , Action::Top            ),
+    bind(KeyCode::End      , KeyModifiers::NONE                              , Action::Bottom         ),
+    bind(KeyCode::PageDown , KeyModifiers::NONE                              , Action::PageDown       ),
+    bind(KeyCode::PageUp   , KeyModifiers::NONE                              , Action::PageUp         ),
+    bind(KeyCode::Char(' '), KeyModifiers::NONE                              , Action::ToggleSelect   ),
+    bind(KeyCode::Char('a'), KeyModifiers::CONTROL                           , Action::SelectAll      ),
+    bind(KeyCode::Char('A'), KeyModifiers::CONTROL.union(KeyModifiers::SHIFT), Action::InvertSelect   ),
+    bind(KeyCode::Char('c'), KeyModifiers::CONTROL                           , Action::Copy           ),
+    bind(KeyCode::Char('x'), KeyModifiers::CONTROL                           , Action::Cut            ),
+    bind(KeyCode::Char('v'), KeyModifiers::CONTROL                           , Action::Paste          ),
+    bind(KeyCode::Delete   , KeyModifiers::NONE                              , Action::Trash          ),
+    bind(KeyCode::Delete   , KeyModifiers::SHIFT                             , Action::DeletePerm     ),
+    bind(KeyCode::F(2)     , KeyModifiers::NONE                              , Action::Rename         ),
+    bind(KeyCode::F(10)    , KeyModifiers::NONE                              , Action::NewFolder      ),
+    bind(KeyCode::Char('n'), KeyModifiers::CONTROL.union(KeyModifiers::SHIFT), Action::NewFolder      ),
+    bind(KeyCode::Enter    , KeyModifiers::ALT                               , Action::Properties     ),
+    bind(KeyCode::Char('1'), KeyModifiers::CONTROL                           , Action::ViewIcons      ),
+    bind(KeyCode::Char('2'), KeyModifiers::CONTROL                           , Action::ViewCompact    ),
+    bind(KeyCode::Char('3'), KeyModifiers::CONTROL                           , Action::ViewDetails    ),
+    bind(KeyCode::F(3)     , KeyModifiers::NONE                              , Action::ToggleSplit    ),
+    bind(KeyCode::Tab      , KeyModifiers::NONE                              , Action::SwapPane       ),
+    bind(KeyCode::F(9)     , KeyModifiers::NONE                              , Action::TogglePlaces   ),
+    bind(KeyCode::F(11)    , KeyModifiers::NONE                              , Action::ToggleInfo     ),
+    bind(KeyCode::Char('i'), KeyModifiers::CONTROL                           , Action::ToggleFilterBar),
+    bind(KeyCode::Char('t'), KeyModifiers::CONTROL                           , Action::NewTab         ),
+    bind(KeyCode::Char('w'), KeyModifiers::CONTROL                           , Action::CloseTab       ),
+    bind(KeyCode::Tab      , KeyModifiers::CONTROL                           , Action::NextTab        ),
+    bind(KeyCode::BackTab  , KeyModifiers::CONTROL.union(KeyModifiers::SHIFT), Action::PrevTab        ),
+    bind(KeyCode::Char('f'), KeyModifiers::CONTROL                           , Action::EnterSearch    ),
+    bind(KeyCode::F(6)     , KeyModifiers::NONE                              , Action::EnterPathEdit  ),
+    bind(KeyCode::F(4)     , KeyModifiers::NONE                              , Action::TerminalPanel  ),
+    bind(KeyCode::F(4)     , KeyModifiers::SHIFT                             , Action::TerminalHere   ),
+    bind(KeyCode::F(1)     , KeyModifiers::NONE                              , Action::Help           ),
+    bind(KeyCode::Char('q'), KeyModifiers::CONTROL                           , Action::QuitAll        ),
 ];
 
 /* The vim layer. Consulted first, so `h`/`j`/`k`/`l` are motions; any
  * printable key that lands in neither table falls through to Dolphin's
  * type-ahead jump-to-name. */
 pub const VIM_KEYS: &[Bind] = &[
-    /*    key          modifiers   action                 */
-    bind(K::Char('h'), M::NONE   , Action::MoveLeft       ),
-    bind(K::Char('j'), M::NONE   , Action::MoveDown       ),
-    bind(K::Char('k'), M::NONE   , Action::MoveUp         ),
-    bind(K::Char('l'), M::NONE   , Action::MoveRight      ),
-    bind(K::Char('G'), M::SHIFT  , Action::Bottom         ),
-    bind(K::Char('H'), M::SHIFT  , Action::ToggleHidden   ),
-    bind(K::Char('d'), M::CONTROL, Action::HalfPageDown   ),
-    bind(K::Char('u'), M::CONTROL, Action::HalfPageUp     ),
-    bind(K::Char('f'), M::CONTROL, Action::PageDown       ),
-    bind(K::Char('b'), M::CONTROL, Action::PageUp         ),
-    bind(K::Char('0'), M::NONE   , Action::RowStart       ),
-    bind(K::Char('$'), M::NONE   , Action::RowEnd         ),
-    bind(K::Char('v'), M::NONE   , Action::EnterVisual    ),
-    bind(K::Char('V'), M::SHIFT  , Action::EnterVisualLine),
-    bind(K::Char('y'), M::NONE   , Action::Copy           ),
-    bind(K::Char('d'), M::NONE   , Action::DeleteOp       ),
-    bind(K::Char('p'), M::NONE   , Action::Paste          ),
-    bind(K::Char('P'), M::SHIFT  , Action::DropIn         ),
-    bind(K::Char('x'), M::NONE   , Action::Trash          ),
-    bind(K::Char('r'), M::NONE   , Action::Rename         ),
-    bind(K::Char('o'), M::NONE   , Action::NewFile        ),
-    bind(K::Char('O'), M::SHIFT  , Action::NewFolder      ),
-    bind(K::Char('u'), M::NONE   , Action::Undo           ),
-    bind(K::Char('D'), M::SHIFT  , Action::DragOut        ),
-    bind(K::Char('/'), M::NONE   , Action::EnterSearch    ),
-    bind(K::Char('n'), M::NONE   , Action::SearchNext     ),
-    bind(K::Char('N'), M::SHIFT  , Action::SearchPrev     ),
-    bind(K::Char(':'), M::NONE   , Action::EnterCommand   ),
-    bind(K::Enter    , M::CONTROL, Action::OpenInNewTab   ),
-    bind(K::Char('m'), M::NONE   , Action::OpenMenu       ),
-    bind(K::Char('h'), M::CONTROL, Action::FocusLeft      ),
-    bind(K::Char('l'), M::CONTROL, Action::FocusRight     ),
-    bind(K::Char('k'), M::CONTROL, Action::EnterCrumbs    ),
-    bind(K::Char('?'), M::SHIFT  , Action::Help           ),
+    /*    key                 modifiers              action                  */
+    bind(KeyCode::Char('h'), KeyModifiers::NONE   , Action::MoveLeft       ),
+    bind(KeyCode::Char('j'), KeyModifiers::NONE   , Action::MoveDown       ),
+    bind(KeyCode::Char('k'), KeyModifiers::NONE   , Action::MoveUp         ),
+    bind(KeyCode::Char('l'), KeyModifiers::NONE   , Action::MoveRight      ),
+    bind(KeyCode::Char('G'), KeyModifiers::SHIFT  , Action::Bottom         ),
+    bind(KeyCode::Char('H'), KeyModifiers::SHIFT  , Action::ToggleHidden   ),
+    bind(KeyCode::Char('d'), KeyModifiers::CONTROL, Action::HalfPageDown   ),
+    bind(KeyCode::Char('u'), KeyModifiers::CONTROL, Action::HalfPageUp     ),
+    bind(KeyCode::Char('f'), KeyModifiers::CONTROL, Action::PageDown       ),
+    bind(KeyCode::Char('b'), KeyModifiers::CONTROL, Action::PageUp         ),
+    bind(KeyCode::Char('0'), KeyModifiers::NONE   , Action::RowStart       ),
+    bind(KeyCode::Char('$'), KeyModifiers::NONE   , Action::RowEnd         ),
+    bind(KeyCode::Char('v'), KeyModifiers::NONE   , Action::EnterVisual    ),
+    bind(KeyCode::Char('V'), KeyModifiers::SHIFT  , Action::EnterVisualLine),
+    bind(KeyCode::Char('y'), KeyModifiers::NONE   , Action::Copy           ),
+    bind(KeyCode::Char('d'), KeyModifiers::NONE   , Action::DeleteOp       ),
+    bind(KeyCode::Char('p'), KeyModifiers::NONE   , Action::Paste          ),
+    bind(KeyCode::Char('P'), KeyModifiers::SHIFT  , Action::DropIn         ),
+    bind(KeyCode::Char('x'), KeyModifiers::NONE   , Action::Trash          ),
+    bind(KeyCode::Char('r'), KeyModifiers::NONE   , Action::Rename         ),
+    bind(KeyCode::Char('o'), KeyModifiers::NONE   , Action::NewFile        ),
+    bind(KeyCode::Char('O'), KeyModifiers::SHIFT  , Action::NewFolder      ),
+    bind(KeyCode::Char('u'), KeyModifiers::NONE   , Action::Undo           ),
+    bind(KeyCode::Char('D'), KeyModifiers::SHIFT  , Action::DragOut        ),
+    bind(KeyCode::Char('/'), KeyModifiers::NONE   , Action::EnterSearch    ),
+    bind(KeyCode::Char('n'), KeyModifiers::NONE   , Action::SearchNext     ),
+    bind(KeyCode::Char('N'), KeyModifiers::SHIFT  , Action::SearchPrev     ),
+    bind(KeyCode::Char(':'), KeyModifiers::NONE   , Action::EnterCommand   ),
+    bind(KeyCode::Enter    , KeyModifiers::CONTROL, Action::OpenInNewTab   ),
+    bind(KeyCode::Char('m'), KeyModifiers::NONE   , Action::OpenMenu       ),
+    bind(KeyCode::Char('h'), KeyModifiers::CONTROL, Action::FocusLeft      ),
+    bind(KeyCode::Char('l'), KeyModifiers::CONTROL, Action::FocusRight     ),
+    bind(KeyCode::Char('k'), KeyModifiers::CONTROL, Action::EnterCrumbs    ),
+    bind(KeyCode::Char('?'), KeyModifiers::SHIFT  , Action::Help           ),
 ];
 
 /* The toolbar buttons, left to right, with the breadcrumb between the nav
    group and the rest. Ctrl+h / Ctrl+l step across the three groups; h and l
    walk the buttons inside one. */
-pub const NAV_BTNS: usize = 3;
-pub const TOOLBAR_BTNS: &[Action] = &[
+pub const NAV_BUTTON_COUNT: usize = 3;
+pub const TOOLBAR_BUTTONS: &[Action] = &[
     /* nav group, left of the breadcrumb */
     Action::Back,
     Action::Forward,
@@ -233,16 +271,26 @@ pub const TOOLBAR_BTNS: &[Action] = &[
 ];
 
 /* Two-key sequences: press the leader, then the follower. */
-pub const CHORDS: &[(char, char, Action)] = &[
-   /* lead  then action               */
-      ('g', 'g', Action::Top         ),
-      ('g', 'h', Action::GoHome      ),
-      ('g', 't', Action::NextTab     ),
-      ('g', 'T', Action::PrevTab     ),
-      ('g', 'u', Action::GoUp        ),
-      ('z', 'a', Action::ToggleExpand),
-      ('z', 'v', Action::CycleView   ),
-      ('c', 'w', Action::Rename      ),
+pub struct Chord {
+    pub leader  : char,
+    pub follower: char,
+    pub action  : Action,
+}
+
+const fn chord(leader: char, follower: char, action: Action) -> Chord {
+    Chord { leader, follower, action }
+}
+
+pub const CHORDS: &[Chord] = &[
+     /* leader  follower  action              */
+    chord('g'  , 'g'     , Action::Top         ),
+    chord('g'  , 'h'     , Action::GoHome      ),
+    chord('g'  , 't'     , Action::NextTab     ),
+    chord('g'  , 'T'     , Action::PrevTab     ),
+    chord('g'  , 'u'     , Action::GoUp        ),
+    chord('z'  , 'a'     , Action::ToggleExpand),
+    chord('z'  , 'v'     , Action::CycleView   ),
+    chord('c'  , 'w'     , Action::Rename      ),
 ];
 
 /* Leaders that must wait for a second key rather than acting immediately. */

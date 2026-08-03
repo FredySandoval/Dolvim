@@ -11,10 +11,21 @@ use std::process::{Command, Stdio};
 use crate::app::App;
 use crate::ops;
 
-const HELPERS: &[&str] = &["ripdrag", "dragon-drop", "dragon"];
+const DRAG_HELPER_BINARIES: &[&str] = &["ripdrag", "dragon-drop", "dragon"];
 
-fn helper() -> Option<(&'static str, PathBuf)> {
-    HELPERS.iter().find_map(|h| ops::which(h).map(|p| (*h, p)))
+/// An installed drag helper: the binary's name, and where it lives.
+struct DragHelper {
+    name: &'static str,
+    binary: PathBuf,
+}
+
+fn find_drag_helper() -> Option<DragHelper> {
+    DRAG_HELPER_BINARIES.iter().find_map(|helper_name| {
+        ops::which(helper_name).map(|helper_path| DragHelper {
+            name: helper_name,
+            binary: helper_path,
+        })
+    })
 }
 
 /// Terminal window origin and per-cell size, so the helper window can be put
@@ -23,32 +34,40 @@ fn cell_origin(col: u16, row: u16) -> Option<(i32, i32)> {
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
         return None;
     }
-    let id = Command::new("xdotool")
+    let xdotool_output = Command::new("xdotool")
         .arg("getactivewindow")
         .output()
         .ok()?;
-    let id = String::from_utf8_lossy(&id.stdout).trim().to_string();
-    if id.is_empty() {
+    let window_id = String::from_utf8_lossy(&xdotool_output.stdout)
+        .trim()
+        .to_string();
+    if window_id.is_empty() {
         return None;
     }
     let geo = Command::new("xdotool")
-        .args(["getwindowgeometry", "--shell", &id])
+        .args(["getwindowgeometry", "--shell", &window_id])
         .output()
         .ok()?;
-    let txt = String::from_utf8_lossy(&geo.stdout);
-    let get = |k: &str| -> Option<i32> {
-        txt.lines()
-            .find_map(|l| l.strip_prefix(k)?.strip_prefix('='))
-            .and_then(|v| v.trim().parse().ok())
+    let geometry_text = String::from_utf8_lossy(&geo.stdout);
+    let geometry_field = |field_name: &str| -> Option<i32> {
+        geometry_text
+            .lines()
+            .find_map(|line| line.strip_prefix(field_name)?.strip_prefix('='))
+            .and_then(|value| value.trim().parse().ok())
     };
-    let (x, y, w, h) = (get("X")?, get("Y")?, get("WIDTH")?, get("HEIGHT")?);
+    let (x, y, window_width_px, window_height_px) = (
+        geometry_field("X")?,
+        geometry_field("Y")?,
+        geometry_field("WIDTH")?,
+        geometry_field("HEIGHT")?,
+    );
     let (cols, rows) = crossterm::terminal::size().ok()?;
     if cols == 0 || rows == 0 {
         return None;
     }
     Some((
-        x + (w / cols as i32) * col as i32,
-        y + (h / rows as i32) * row as i32,
+        x + (window_width_px / cols as i32) * col as i32,
+        y + (window_height_px / rows as i32) * row as i32,
     ))
 }
 
@@ -59,48 +78,55 @@ pub fn drag_out(app: &mut App) {
     if paths.is_empty() {
         return;
     }
-    let Some((name, bin)) = helper() else {
+    let Some(helper) = find_drag_helper() else {
         app.error("Drag out needs `ripdrag` or `dragon-drop` on PATH — install one");
         return;
     };
-    let mut cmd = Command::new(bin);
-    cmd.arg("--and-exit");
-    if name == "ripdrag" {
+    let mut drag_out_cmd = Command::new(&helper.binary);
+    drag_out_cmd.arg("--and-exit");
+    if helper.name == "ripdrag" {
         if let Some((x, y)) = cell_origin(app.pane().area.x, app.pane().area.y) {
-            cmd.args(["-x", &x.to_string(), "-y", &y.to_string()]);
+            drag_out_cmd.args(["-x", &x.to_string(), "-y", &y.to_string()]);
         }
     }
-    cmd.args(&paths).stdout(Stdio::null()).stderr(Stdio::null());
-    match cmd.spawn() {
-        Ok(_) => app.info(format!("Dragging {} item(s) via {name}", paths.len())),
-        Err(e) => app.error(format!("{name} failed: {e}")),
+    drag_out_cmd
+        .args(&paths)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    match drag_out_cmd.spawn() {
+        Ok(_) => app.info(format!(
+            "Dragging {} item(s) via {}",
+            paths.len(),
+            helper.name
+        )),
+        Err(spawn_error) => app.error(format!("{} failed: {spawn_error}", helper.name)),
     }
 }
 
 /// Receive a drop from another application: the helper prints the dropped
 /// paths, and we copy them into the current directory.
 pub fn drop_in(app: &mut App) {
-    let Some((name, bin)) = helper() else {
+    let Some(helper) = find_drag_helper() else {
         app.error("Drop in needs `ripdrag` or `dragon-drop` on PATH — install one");
         return;
     };
-    let mut cmd = Command::new(bin);
-    if name == "ripdrag" {
-        cmd.args(["--target", "--and-exit", "--print-path"]);
+    let mut drop_in_cmd = Command::new(&helper.binary);
+    if helper.name == "ripdrag" {
+        drop_in_cmd.args(["--target", "--and-exit", "--print-path"]);
     } else {
-        cmd.args(["--target", "--print-path"]);
+        drop_in_cmd.args(["--target", "--print-path"]);
     }
-    let out = match cmd.output() {
-        Ok(o) => o,
-        Err(e) => {
-            app.error(format!("{name} failed: {e}"));
+    let helper_output = match drop_in_cmd.output() {
+        Ok(helper_output) => helper_output,
+        Err(spawn_error) => {
+            app.error(format!("{} failed: {spawn_error}", helper.name));
             return;
         }
     };
-    let paths: Vec<PathBuf> = String::from_utf8_lossy(&out.stdout)
+    let paths: Vec<PathBuf> = String::from_utf8_lossy(&helper_output.stdout)
         .lines()
-        .map(|l| l.trim().trim_start_matches("file://"))
-        .filter(|l| !l.is_empty())
+        .map(|line| line.trim().trim_start_matches("file://"))
+        .filter(|line| !line.is_empty())
         .map(PathBuf::from)
         .collect();
     if paths.is_empty() {
@@ -108,34 +134,45 @@ pub fn drop_in(app: &mut App) {
         return;
     }
     let dest = app.pane().cwd.clone();
-    app.progress = Some(ops::start_transfer(paths, dest, false));
+    app.transfer_progress = Some(ops::start_transfer(paths, dest, ops::TransferKind::Copy));
 }
 
 /// Complete an internal drag onto `dest`. Shift forces a move, Ctrl a copy,
 /// and the default is Dolphin's: move within a filesystem, copy across one.
 pub fn drop_internal(app: &mut App, dest: PathBuf, shift: bool, ctrl: bool) {
-    let Some(d) = app.drag.take() else { return };
-    if d.paths.iter().any(|p| dest.starts_with(p)) {
+    let Some(active_drag) = app.drag.take() else {
+        return;
+    };
+    if active_drag
+        .paths
+        .iter()
+        .any(|source_path| dest.starts_with(source_path))
+    {
         app.error("Cannot drop a folder into itself");
         return;
     }
-    if d.paths.iter().any(|p| p.parent() == Some(dest.as_path())) && !shift {
+    if active_drag
+        .paths
+        .iter()
+        .any(|source_path| source_path.parent() == Some(dest.as_path()))
+        && !shift
+    {
         app.info("Already there");
         return;
     }
-    let move_it = if ctrl {
-        false
-    } else if shift {
-        true
+    let transfer_kind = if !ctrl && (shift || same_device(&active_drag.paths[0], &dest)) {
+        ops::TransferKind::Move
     } else {
-        same_device(&d.paths[0], &dest)
+        ops::TransferKind::Copy
     };
-    app.progress = Some(ops::start_transfer(d.paths, dest, move_it));
+    app.transfer_progress = Some(ops::start_transfer(active_drag.paths, dest, transfer_kind));
 }
 
-fn same_device(a: &std::path::Path, b: &std::path::Path) -> bool {
+fn same_device(source: &std::path::Path, dest: &std::path::Path) -> bool {
     use std::os::unix::fs::MetadataExt;
-    let da = std::fs::metadata(a).map(|m| m.dev()).ok();
-    let db = std::fs::metadata(b).map(|m| m.dev()).ok();
-    da.is_some() && da == db
+    let source_dev = std::fs::metadata(source)
+        .map(|metadata| metadata.dev())
+        .ok();
+    let dest_dev = std::fs::metadata(dest).map(|metadata| metadata.dev()).ok();
+    source_dev.is_some() && source_dev == dest_dev
 }

@@ -69,7 +69,7 @@ pub enum Mode {
     Help,
     /// A dropdown of sibling directories hanging off a breadcrumb segment.
     CrumbMenu(usize),
-    /// Focus is on a toolbar button: an index into `config::TOOLBAR_BTNS`.
+    /// Focus is on a toolbar button: an index into `config::TOOLBAR_BUTTONS`.
     Buttons(usize),
     Menu(MenuKind),
 }
@@ -138,7 +138,7 @@ pub struct Pane {
     pub filter: String,
     pub expanded: HashSet<PathBuf>,
     pub history: Vec<PathBuf>,
-    pub hist_pos: usize,
+    pub history_pos: usize,
     pub seq: u64,
     pub loading: bool,
     pub error: Option<String>,
@@ -146,11 +146,11 @@ pub struct Pane {
     pub area: Rect,
     pub grid_cols: u16,
     pub grid_rows: u16,
-    pub cell_w: u16,
-    pub cell_h: u16,
+    pub cell_width: u16,
+    pub cell_height: u16,
     /// Compact sizes each column to its own longest name, so the one cell width
     /// above cannot describe it. Widths of the rendered columns, left to right.
-    pub col_w: Vec<u16>,
+    pub column_widths: Vec<u16>,
     /// Left edge of the icon grid, which floats inside the pane as the leftover
     /// columns are split into margin.
     pub grid_x: u16,
@@ -182,16 +182,16 @@ impl Pane {
             show_hidden: false,
             filter: String::new(),
             expanded: HashSet::new(),
-            hist_pos: 0,
+            history_pos: 0,
             seq: 0,
             loading: true,
             error: None,
             area: Rect::default(),
             grid_cols: 1,
             grid_rows: 1,
-            cell_w: 1,
-            cell_h: 1,
-            col_w: Vec::new(),
+            cell_width: 1,
+            cell_height: 1,
+            column_widths: Vec::new(),
             grid_x: 0,
             last_reveal: (0, ViewMode::Icons),
             crumb_focus: None,
@@ -207,8 +207,10 @@ impl Pane {
         self.visible.is_empty()
     }
 
-    pub fn entry_at(&self, vis: usize) -> Option<&Entry> {
-        self.visible.get(vis).and_then(|&i| self.entries.get(i))
+    pub fn entry_at(&self, visible_index: usize) -> Option<&Entry> {
+        self.visible
+            .get(visible_index)
+            .and_then(|&entry_index| self.entries.get(entry_index))
     }
 
     pub fn current(&self) -> Option<&Entry> {
@@ -240,7 +242,11 @@ impl Pane {
         fs::sort_entries(&mut self.entries, self.sort);
         self.revisible();
         self.cursor = keep
-            .and_then(|p| self.visible.iter().position(|&i| self.entries[i].path == p))
+            .and_then(|p| {
+                self.visible
+                    .iter()
+                    .position(|&entry_index| self.entries[entry_index].path == p)
+            })
             .unwrap_or_else(|| self.cursor.min(self.visible.len().saturating_sub(1)));
         self.clamp();
     }
@@ -248,17 +254,19 @@ impl Pane {
     /// Rebuild `visible` only. Kept separate from `refilter` because the
     /// Details tree is ordered positionally and must not be re-sorted.
     fn revisible(&mut self) {
-        let f = self.filter.to_lowercase();
+        let filter_lower = self.filter.to_lowercase();
         let hidden_ok = self.show_hidden;
-        let v: Vec<usize> = self
+        let visible_indices: Vec<usize> = self
             .entries
             .iter()
             .enumerate()
             .filter(|(_, e)| hidden_ok || !e.hidden)
-            .filter(|(_, e)| f.is_empty() || e.name.to_lowercase().contains(&f))
+            .filter(|(_, e)| {
+                filter_lower.is_empty() || e.name.to_lowercase().contains(&filter_lower)
+            })
             .map(|(i, _)| i)
             .collect();
-        self.visible = v;
+        self.visible = visible_indices;
     }
 
     pub fn clamp(&mut self) {
@@ -313,8 +321,8 @@ impl Pane {
         } else {
             self.visible
                 .iter()
-                .filter_map(|&i| {
-                    let e = &self.entries[i];
+                .filter_map(|&entry_index| {
+                    let e = &self.entries[entry_index];
                     self.selected.contains(&e.path).then(|| e.path.clone())
                 })
                 .collect()
@@ -333,19 +341,52 @@ impl Pane {
             .collect()
     }
 
-    pub fn counts(&self) -> (usize, usize, u64) {
-        let (mut d, mut f, mut bytes) = (0, 0, 0);
-        for &i in &self.visible {
-            let e = &self.entries[i];
+    pub fn counts(&self) -> PaneCounts {
+        let (mut dir_count, mut file_count, mut total_bytes) = (0, 0, 0);
+        for &entry_index in &self.visible {
+            let e = &self.entries[entry_index];
             if e.is_dir() {
-                d += 1;
+                dir_count += 1;
             } else {
-                f += 1;
-                bytes += e.size;
+                file_count += 1;
+                total_bytes += e.size;
             }
         }
-        (d, f, bytes)
+        PaneCounts {
+            dirs: dir_count,
+            files: file_count,
+            bytes: total_bytes,
+        }
     }
+}
+
+/// Which listing a streamed batch belongs to: the directory, and the pane
+/// sequence number that asked for it.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct StreamKey {
+    path: PathBuf,
+    seq: u64,
+}
+
+/// When the last left click landed, and on which visible row.
+#[derive(Clone, Copy)]
+pub struct LastClick {
+    pub at: Instant,
+    pub visible_index: usize,
+}
+
+/// The last `df` answer, and when it was taken.
+struct DiskCache {
+    path: PathBuf,
+    space: fs::DiskSpace,
+    measured_at: Instant,
+}
+
+/// What the status bar reports about a pane's visible entries.
+pub struct PaneCounts {
+    pub dirs: usize,
+    pub files: usize,
+    pub bytes: u64,
 }
 
 pub struct Tab {
@@ -370,7 +411,7 @@ impl Tab {
     }
 
     pub fn title(&self) -> String {
-        ops::name(&self.pane().cwd)
+        ops::file_name_of(&self.pane().cwd)
     }
 }
 
@@ -398,10 +439,17 @@ pub struct Hitboxes {
 }
 
 /// A drag in flight. Terminals have no native DnD, so we draw our own.
+/// A cell position in the terminal grid.
+#[derive(Clone, Copy)]
+pub struct CellPos {
+    pub x: u16,
+    pub y: u16,
+}
+
 pub struct Drag {
     pub paths: Vec<PathBuf>,
-    pub position: (u16, u16),
-    pub origin: (u16, u16),
+    pub position: CellPos,
+    pub origin: CellPos,
     pub started: bool,
 }
 
@@ -409,7 +457,7 @@ pub struct App {
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
     pub places: Vec<Row>,
-    pub places_sel: usize,
+    pub places_cursor: usize,
     pub places_visible: bool,
     pub info_visible: bool,
     pub filter_bar: bool,
@@ -426,40 +474,40 @@ pub struct App {
     pub typeahead_at: Option<Instant>,
     /// Pending vim state: count prefix and chord leader (`g`, `z`, `c`).
     pub count: String,
-    pub pending: Option<char>,
+    pub pending_chord_leader: Option<char>,
     /// A `d` waiting for its motion, holding the count typed before it (`3dd`).
     /// One operator exists, so this is that count and not an enum of operators.
     pub pending_delete: Option<usize>,
     pub search_last: String,
     pub drag: Option<Drag>,
     pub hits: Hitboxes,
-    pub menu_sel: usize,
+    pub menu_cursor: usize,
     /// Free/total bytes for the status bar, and when they were measured.
-    disk: Option<(PathBuf, (u64, u64), Instant)>,
+    disk: Option<DiskCache>,
     /// Last left-click (when, which item) — the double-click detector.
-    pub last_click: Option<(Instant, usize)>,
+    pub last_click: Option<LastClick>,
     pub thumbs: Thumbs,
-    pub progress: Option<Progress>,
+    pub transfer_progress: Option<Progress>,
     pub quit: bool,
     /// Set when something needs the terminal to itself; `main` hands it over.
     pub suspend: Option<Suspend>,
     lister: Lister,
-    pub rx: Receiver<fs::Msg>,
+    pub listing_rx: Receiver<fs::ListingMsg>,
     watcher: Watcher,
-    /// Directory listings cached per pane generation, keyed while streaming.
-    streaming: HashMap<(PathBuf, u64), Vec<Entry>>,
+    /// Directory listings cached per pane `seq` sequence number, keyed while streaming.
+    streaming: HashMap<StreamKey, Vec<Entry>>,
 }
 
 impl App {
     pub fn new(start: PathBuf) -> App {
-        let (tx, rx) = channel();
-        let lister = Lister::new(tx);
+        let (listing_tx, listing_rx) = channel();
+        let lister = Lister::new(listing_tx);
         let watcher = Watcher::new();
         let mut app = App {
             tabs: vec![Tab::new(start.clone())],
             active_tab: 0,
             places: places::build(),
-            places_sel: 1,
+            places_cursor: 1,
             places_visible: true,
             info_visible: false,
             filter_bar: false,
@@ -474,20 +522,20 @@ impl App {
             typeahead: String::new(),
             typeahead_at: None,
             count: String::new(),
-            pending: None,
+            pending_chord_leader: None,
             pending_delete: None,
             search_last: String::new(),
             drag: None,
             hits: Hitboxes::default(),
-            menu_sel: 0,
+            menu_cursor: 0,
             disk: None,
             last_click: None,
             thumbs: Thumbs::new(),
-            progress: None,
+            transfer_progress: None,
             quit: false,
             suspend: None,
             lister,
-            rx,
+            listing_rx,
             watcher,
             streaming: HashMap::new(),
         };
@@ -544,10 +592,10 @@ impl App {
         let seq = self.pane().seq + 1;
         let target = self.pane().target.clone();
         {
-            let p = self.pane_mut();
-            p.seq = seq;
-            p.loading = true;
-            p.error = None;
+            let pane = self.pane_mut();
+            pane.seq = seq;
+            pane.loading = true;
+            pane.error = None;
         }
         match target {
             Target::Dir(ref d) => {
@@ -573,56 +621,67 @@ impl App {
     }
 
     fn apply_listing(&mut self, seq: u64, entries: Vec<Entry>, err: Option<String>) {
-        let p = self.pane_mut();
-        if p.seq != seq {
+        let pane = self.pane_mut();
+        if pane.seq != seq {
             return;
         }
-        p.error = err;
-        p.loading = false;
-        p.set_entries(entries);
-        p.offset = 0;
+        pane.error = err;
+        pane.loading = false;
+        pane.set_entries(entries);
+        pane.offset = 0;
     }
 
     /// Drain worker messages. Called once per event-loop tick.
-    pub fn pump(&mut self) {
-        let msgs: Vec<fs::Msg> = self.rx.try_iter().collect();
-        for m in msgs {
-            match m {
-                fs::Msg::Batch(path, seq, chunk) => {
-                    self.streaming.entry((path, seq)).or_default().extend(chunk);
+    pub fn pump_fs_events(&mut self) {
+        let listing_messages: Vec<fs::ListingMsg> = self.listing_rx.try_iter().collect();
+        for message in listing_messages {
+            match message {
+                fs::ListingMsg::Batch { path, seq, entries } => {
+                    self.streaming
+                        .entry(StreamKey { path, seq })
+                        .or_default()
+                        .extend(entries);
                 }
-                fs::Msg::Done(path, seq) => {
+                fs::ListingMsg::Done { path, seq } => {
                     let entries = self
                         .streaming
-                        .remove(&(path.clone(), seq))
+                        .remove(&StreamKey {
+                            path: path.clone(),
+                            seq,
+                        })
                         .unwrap_or_default();
-                    // A pane other than the active one may own this generation.
-                    self.deliver(&path, seq, entries, None);
+                    // A pane other than the active one may own this `seq`.
+                    self.deliver_listing(&path, seq, entries, None);
                 }
-                fs::Msg::Listed(l) => {
-                    self.deliver(&l.path.clone(), l.seq, l.entries, l.error);
+                fs::ListingMsg::Listed(listing) => {
+                    self.deliver_listing(
+                        &listing.path.clone(),
+                        listing.seq,
+                        listing.entries,
+                        listing.error,
+                    );
                 }
             }
         }
         if self.watcher.take_dirty() {
             self.refresh_in_place();
         }
-        let live: HashSet<u64> = self
+        let live_seqs: HashSet<u64> = self
             .tabs
             .iter()
             .flat_map(|t| t.panes.iter())
-            .map(|p| p.seq)
+            .map(|pane| pane.seq)
             .collect();
-        self.streaming.retain(|(_, s), _| live.contains(s));
+        self.streaming.retain(|key, _| live_seqs.contains(&key.seq));
     }
 
-    fn deliver(&mut self, path: &Path, seq: u64, entries: Vec<Entry>, err: Option<String>) {
-        for t in &mut self.tabs {
-            for p in &mut t.panes {
-                if p.seq == seq && p.cwd == path {
-                    p.error = err.clone();
-                    p.loading = false;
-                    p.set_entries(entries.clone());
+    fn deliver_listing(&mut self, path: &Path, seq: u64, entries: Vec<Entry>, err: Option<String>) {
+        for tab in &mut self.tabs {
+            for pane in &mut tab.panes {
+                if pane.seq == seq && pane.cwd == path {
+                    pane.error = err.clone();
+                    pane.loading = false;
+                    pane.set_entries(entries.clone());
                 }
             }
         }
@@ -657,22 +716,22 @@ impl App {
             }
         }
         {
-            let p = self.pane_mut();
-            if push_history && p.cwd != cwd {
-                p.history.truncate(p.hist_pos + 1);
-                p.history.push(cwd.clone());
-                p.hist_pos = p.history.len() - 1;
+            let pane = self.pane_mut();
+            if push_history && pane.cwd != cwd {
+                pane.history.truncate(pane.history_pos + 1);
+                pane.history.push(cwd.clone());
+                pane.history_pos = pane.history.len() - 1;
             }
-            p.cwd = cwd;
-            p.target = target.clone();
-            p.cursor = 0;
-            p.offset = 0;
-            p.selected.clear();
-            p.filter.clear();
-            p.expanded.clear();
+            pane.cwd = cwd;
+            pane.target = target.clone();
+            pane.cursor = 0;
+            pane.offset = 0;
+            pane.selected.clear();
+            pane.filter.clear();
+            pane.expanded.clear();
         }
         if let Some(i) = places::index_of(&self.places, &target) {
-            self.places_sel = i;
+            self.places_cursor = i;
         }
         self.reload();
     }
@@ -691,44 +750,48 @@ impl App {
     }
 
     pub fn back(&mut self) {
-        let p = self.pane();
-        if p.hist_pos == 0 {
+        let pane = self.pane();
+        if pane.history_pos == 0 {
             return;
         }
-        let pos = p.hist_pos - 1;
-        let d = p.history[pos].clone();
-        self.pane_mut().hist_pos = pos;
+        let pos = pane.history_pos - 1;
+        let d = pane.history[pos].clone();
+        self.pane_mut().history_pos = pos;
         self.goto(Target::Dir(d), false);
     }
 
     pub fn forward(&mut self) {
-        let p = self.pane();
-        if p.hist_pos + 1 >= p.history.len() {
+        let pane = self.pane();
+        if pane.history_pos + 1 >= pane.history.len() {
             return;
         }
-        let pos = p.hist_pos + 1;
-        let d = p.history[pos].clone();
-        self.pane_mut().hist_pos = pos;
+        let pos = pane.history_pos + 1;
+        let d = pane.history[pos].clone();
+        self.pane_mut().history_pos = pos;
         self.goto(Target::Dir(d), false);
     }
 
     /// Put the cursor on `path` once it appears; used after `go_up` and rename.
     pub fn select_by_path(&mut self, path: &Path) {
-        let p = self.pane_mut();
-        if let Some(i) = p.visible.iter().position(|&i| p.entries[i].path == path) {
-            p.cursor = i;
+        let pane = self.pane_mut();
+        if let Some(i) = pane
+            .visible
+            .iter()
+            .position(|&entry_index| pane.entries[entry_index].path == path)
+        {
+            pane.cursor = i;
         }
     }
 
     /// Enter, `l`, or double-click.
     pub fn activate(&mut self) {
-        let Some(e) = self.pane().current().cloned() else {
+        let Some(entry) = self.pane().current().cloned() else {
             return;
         };
-        if e.is_dir() {
-            self.open_dir(e.path);
+        if entry.is_dir() {
+            self.open_dir(entry.path);
         } else {
-            self.open_external(&e.path);
+            self.open_external(&entry.path);
         }
     }
 
@@ -749,63 +812,65 @@ impl App {
             .stderr(Stdio::null())
             .spawn()
         {
-            Ok(_) => self.info(format!("Opening {}", ops::name(path))),
-            Err(e) => self.error(format!("xdg-open failed: {e}")),
+            Ok(_) => self.info(format!("Opening {}", ops::file_name_of(path))),
+            Err(spawn_error) => self.error(format!("xdg-open failed: {spawn_error}")),
         }
     }
 
     // -- cursor motion -----------------------------------------------------
 
     pub fn move_cursor(&mut self, delta: isize, extend: bool) {
-        let line = self.mode == Mode::VisualLine;
-        let p = self.pane_mut();
-        if p.visible.is_empty() {
+        let is_linewise = self.mode == Mode::VisualLine;
+        let pane = self.pane_mut();
+        if pane.visible.is_empty() {
             return;
         }
-        let last = p.visible.len() as isize - 1;
-        let next = (p.cursor as isize + delta).clamp(0, last) as usize;
-        p.cursor = next;
+        let last = pane.visible.len() as isize - 1;
+        let next = (pane.cursor as isize + delta).clamp(0, last) as usize;
+        pane.cursor = next;
         if extend {
-            let (mut a, mut b) = (p.anchor.min(next), p.anchor.max(next));
+            let (mut range_start, mut range_end) = (pane.anchor.min(next), pane.anchor.max(next));
             // Linewise: grow the range out to the row edges on both sides.
-            if line {
-                let s = p.stride();
-                a -= a % s;
-                b = (b - b % s + s - 1).min(last as usize);
+            if is_linewise {
+                let stride = pane.stride();
+                range_start -= range_start % stride;
+                range_end = (range_end - range_end % stride + stride - 1).min(last as usize);
             }
-            let range: Vec<PathBuf> = (a..=b)
-                .filter_map(|v| p.entry_at(v).map(|e| e.path.clone()))
+            let range: Vec<PathBuf> = (range_start..=range_end)
+                .filter_map(|visible_index| {
+                    pane.entry_at(visible_index).map(|entry| entry.path.clone())
+                })
                 .collect();
-            p.selected.clear();
-            p.selected.extend(range);
+            pane.selected.clear();
+            pane.selected.extend(range);
         }
     }
 
     /// A step along the line the index runs down — the row in Icons, the column
     /// in Compact. It stops at the end of the line instead of spilling into the
     /// next one, the way `l` stops at the end of a line in vim.
-    pub fn step_along(&mut self, n: isize, extend: bool) {
-        let s = self.pane().stride() as isize;
-        let i = self.pane().cursor as isize;
-        let lo = i - i % s;
-        let next = (i + n).clamp(lo, lo + s - 1);
-        self.move_cursor(next - i, extend);
+    pub fn step_along(&mut self, step: isize, extend: bool) {
+        let stride = self.pane().stride() as isize;
+        let cursor_index = self.pane().cursor as isize;
+        let row_start = cursor_index - cursor_index % stride;
+        let next = (cursor_index + step).clamp(row_start, row_start + stride - 1);
+        self.move_cursor(next - cursor_index, extend);
     }
 
     /// A step across lines, keeping the position along the line. A step past
     /// the first or last line stays where it is, as `k` does on vim's first
     /// line — clamping the raw index instead would slide sideways to item 0.
     /// A short final line is landed on at its end, which vim also does.
-    pub fn step_across(&mut self, n: isize, extend: bool) {
-        let s = self.pane().stride() as isize;
-        let i = self.pane().cursor as isize;
+    pub fn step_across(&mut self, step: isize, extend: bool) {
+        let stride = self.pane().stride() as isize;
+        let cursor_index = self.pane().cursor as isize;
         let last = self.pane().len() as isize - 1;
-        let line = i / s + n;
-        if last < 0 || line < 0 || line > last / s {
+        let target_row = cursor_index / stride + step;
+        if last < 0 || target_row < 0 || target_row > last / stride {
             return;
         }
-        let next = (line * s + i % s).min(last);
-        self.move_cursor(next - i, extend);
+        let next = (target_row * stride + cursor_index % stride).min(last);
+        self.move_cursor(next - cursor_index, extend);
     }
 
     pub fn goto_index(&mut self, i: usize, extend: bool) {
@@ -814,32 +879,32 @@ impl App {
     }
 
     pub fn toggle_select(&mut self) {
-        let Some(e) = self.pane().current().cloned() else {
+        let Some(entry) = self.pane().current().cloned() else {
             return;
         };
-        let p = self.pane_mut();
-        if !p.selected.remove(&e.path) {
-            p.selected.insert(e.path);
+        let pane = self.pane_mut();
+        if !pane.selected.remove(&entry.path) {
+            pane.selected.insert(entry.path);
         }
     }
 
     pub fn select_all(&mut self) {
-        let p = self.pane_mut();
-        p.selected = p
+        let pane = self.pane_mut();
+        pane.selected = pane
             .visible
             .iter()
-            .map(|&i| p.entries[i].path.clone())
+            .map(|&entry_index| pane.entries[entry_index].path.clone())
             .collect();
     }
 
     pub fn invert_selection(&mut self) {
-        let p = self.pane_mut();
-        let all: HashSet<PathBuf> = p
+        let pane = self.pane_mut();
+        let all: HashSet<PathBuf> = pane
             .visible
             .iter()
-            .map(|&i| p.entries[i].path.clone())
+            .map(|&entry_index| pane.entries[entry_index].path.clone())
             .collect();
-        p.selected = all.difference(&p.selected).cloned().collect();
+        pane.selected = all.difference(&pane.selected).cloned().collect();
     }
 
     // -- type-ahead --------------------------------------------------------
@@ -865,11 +930,11 @@ impl App {
         let from = if needle.len() == 1 { start + 1 } else { start };
         for k in 0..n {
             let i = (from + k) % n;
-            let hit = self
+            let name_matches = self
                 .pane()
                 .entry_at(i)
                 .is_some_and(|e| e.name.to_lowercase().starts_with(&needle));
-            if hit {
+            if name_matches {
                 self.pane_mut().cursor = i;
                 return;
             }
@@ -889,47 +954,53 @@ impl App {
     /// changes by the minute is bad on its own, and it was worse than that —
     /// `df` opens the directory, inotify reports the open, and the watcher
     /// treated our own status bar as a reason to relist. See docs/DECISIONS.md.
-    pub fn disk_space(&mut self) -> Option<(u64, u64)> {
+    pub fn disk_space(&mut self) -> Option<fs::DiskSpace> {
         let cwd = self.pane().cwd.clone();
-        let fresh = self.disk.as_ref().is_some_and(|(p, _, at)| {
-            *p == cwd && at.elapsed() < std::time::Duration::from_millis(config::DISK_POLL_MS)
+        let cache_is_fresh = self.disk.as_ref().is_some_and(|cache| {
+            cache.path == cwd
+                && cache.measured_at.elapsed()
+                    < std::time::Duration::from_millis(config::DISK_POLL_MS)
         });
-        if !fresh {
+        if !cache_is_fresh {
             let space = fs::disk_space(&cwd)?;
-            self.disk = Some((cwd, space, Instant::now()));
+            self.disk = Some(DiskCache {
+                path: cwd,
+                space,
+                measured_at: Instant::now(),
+            });
         }
-        self.disk.as_ref().map(|(_, s, _)| *s)
+        self.disk.as_ref().map(|cache| cache.space)
     }
 
     pub fn toggle_hidden(&mut self) {
-        let p = self.pane_mut();
-        p.show_hidden = !p.show_hidden;
-        p.refilter();
+        let pane = self.pane_mut();
+        pane.show_hidden = !pane.show_hidden;
+        pane.refilter();
     }
 
     pub fn set_sort(&mut self, key: SortKey) {
-        let p = self.pane_mut();
-        if p.sort.key == key {
-            p.sort.reverse = !p.sort.reverse;
+        let pane = self.pane_mut();
+        if pane.sort.key == key {
+            pane.sort.reverse = !pane.sort.reverse;
         } else {
-            p.sort.key = key;
-            p.sort.reverse = false;
+            pane.sort.key = key;
+            pane.sort.reverse = false;
         }
-        p.refilter();
+        pane.refilter();
     }
 
     pub fn toggle_split(&mut self) {
-        let t = self.tab_mut();
-        if t.panes.len() > 1 {
-            t.panes.truncate(1);
-            t.active = 0;
+        let tab = self.tab_mut();
+        if tab.panes.len() > 1 {
+            tab.panes.truncate(1);
+            tab.active = 0;
         } else {
-            let mut clone = Pane::new(t.panes[0].cwd.clone());
-            clone.view = t.panes[0].view;
-            clone.sort = t.panes[0].sort;
-            clone.show_hidden = t.panes[0].show_hidden;
-            t.panes.push(clone);
-            t.active = 1;
+            let mut second_pane = Pane::new(tab.panes[0].cwd.clone());
+            second_pane.view = tab.panes[0].view;
+            second_pane.sort = tab.panes[0].sort;
+            second_pane.show_hidden = tab.panes[0].show_hidden;
+            tab.panes.push(second_pane);
+            tab.active = 1;
         }
         self.reload();
     }
@@ -957,9 +1028,9 @@ impl App {
     }
 
     pub fn other_pane(&mut self) {
-        let t = self.tab_mut();
-        if t.panes.len() > 1 {
-            t.active = 1 - t.active;
+        let tab = self.tab_mut();
+        if tab.panes.len() > 1 {
+            tab.active = 1 - tab.active;
         }
     }
 
@@ -991,55 +1062,69 @@ impl App {
     /// Dolphin's expandable folders: splice the child listing in beneath the
     /// folder row, at depth+1, or remove it again.
     pub fn toggle_expand(&mut self) {
-        let Some(e) = self.pane().current().cloned() else {
+        let Some(entry) = self.pane().current().cloned() else {
             return;
         };
-        if !e.is_dir() {
+        if !entry.is_dir() {
             return;
         }
-        let collapsing = self.pane().expanded.contains(&e.path);
-        let kids = if collapsing {
+        let collapsing = self.pane().expanded.contains(&entry.path);
+        let child_entries = if collapsing {
             Vec::new()
         } else {
-            match fs::read_dir(&e.path, e.depth + 1) {
-                Ok(mut k) => {
-                    fs::sort_entries(&mut k, self.pane().sort);
-                    k
+            match fs::read_dir(&entry.path, entry.depth + 1) {
+                Ok(mut child_entries) => {
+                    fs::sort_entries(&mut child_entries, self.pane().sort);
+                    child_entries
                 }
                 Err(err) => {
-                    self.error(format!("Cannot read {}: {err}", e.name));
+                    self.error(format!("Cannot read {}: {err}", entry.name));
                     return;
                 }
             }
         };
-        let p = self.pane_mut();
-        let keep = p.visible.get(p.cursor).map(|&i| p.entries[i].path.clone());
+        let pane = self.pane_mut();
+        let keep_path = pane
+            .visible
+            .get(pane.cursor)
+            .map(|&entry_index| pane.entries[entry_index].path.clone());
         if collapsing {
-            p.expanded.remove(&e.path);
-            let prefix = e.path.clone();
-            p.expanded
-                .retain(|x| !x.starts_with(&prefix) || *x == prefix);
-            p.entries
-                .retain(|c| c.path == prefix || !c.path.starts_with(&prefix));
+            pane.expanded.remove(&entry.path);
+            let prefix = entry.path.clone();
+            pane.expanded.retain(|expanded_path| {
+                !expanded_path.starts_with(&prefix) || *expanded_path == prefix
+            });
+            pane.entries.retain(|candidate_entry| {
+                candidate_entry.path == prefix || !candidate_entry.path.starts_with(&prefix)
+            });
         } else {
-            let at = p.entries.iter().position(|c| c.path == e.path).unwrap_or(0);
-            p.entries.splice(at + 1..at + 1, kids);
-            p.expanded.insert(e.path.clone());
+            let insert_index = pane
+                .entries
+                .iter()
+                .position(|candidate_entry| candidate_entry.path == entry.path)
+                .unwrap_or(0);
+            pane.entries
+                .splice(insert_index + 1..insert_index + 1, child_entries);
+            pane.expanded.insert(entry.path.clone());
         }
-        for c in &mut p.entries {
-            if c.path == e.path {
-                c.expanded = !collapsing;
+        for candidate_entry in &mut pane.entries {
+            if candidate_entry.path == entry.path {
+                candidate_entry.expanded = !collapsing;
             }
         }
         // The tree order is positional, so re-sorting would destroy it; only
         // the filter is reapplied.
-        p.revisible();
-        if let Some(k) = keep {
-            if let Some(i) = p.visible.iter().position(|&i| p.entries[i].path == k) {
-                p.cursor = i;
+        pane.revisible();
+        if let Some(keep_path) = keep_path {
+            if let Some(i) = pane
+                .visible
+                .iter()
+                .position(|&entry_index| pane.entries[entry_index].path == keep_path)
+            {
+                pane.cursor = i;
             }
         }
-        p.clamp();
+        pane.clamp();
     }
 }
 
@@ -1050,20 +1135,20 @@ fn recent(root: &Path, days: u32) -> Vec<Entry> {
     let mut out = Vec::new();
     let mut queue = vec![(root.to_path_buf(), 0u32)];
     while let Some((dir, depth)) = queue.pop() {
-        if depth > 3 || out.len() > 2000 {
+        if depth > config::RECENT_MAX_DEPTH || out.len() > config::RECENT_MAX_ITEMS {
             break;
         }
         let Ok(kids) = fs::read_dir(&dir, 0) else {
             continue;
         };
-        for e in kids {
-            if e.hidden {
+        for entry in kids {
+            if entry.hidden {
                 continue;
             }
-            if e.is_dir() {
-                queue.push((e.path.clone(), depth + 1));
-            } else if e.mtime >= cutoff {
-                out.push(e);
+            if entry.is_dir() {
+                queue.push((entry.path.clone(), depth + 1));
+            } else if entry.mtime >= cutoff {
+                out.push(entry);
             }
         }
     }
@@ -1076,25 +1161,25 @@ mod tests {
     use super::*;
 
     fn pane_with(names: &[&str]) -> Pane {
-        let mut p = Pane::new(PathBuf::from("/tmp"));
-        p.entries = entries_named(names);
-        p.refilter();
-        p
+        let mut pane = Pane::new(PathBuf::from("/tmp"));
+        pane.entries = entries_named(names);
+        pane.refilter();
+        pane
     }
 
     /// In the order given, unsorted — a fresh listing arrives in readdir order.
     fn entries_named(names: &[&str]) -> Vec<Entry> {
         names
             .iter()
-            .map(|n| Entry {
-                name: (*n).into(),
-                path: PathBuf::from("/tmp").join(n),
+            .map(|name| Entry {
+                name: (*name).into(),
+                path: PathBuf::from("/tmp").join(name),
                 kind: fs::Kind::File,
                 size: 0,
                 mtime: 0,
                 mode: 0,
                 readable: true,
-                hidden: n.starts_with('.'),
+                hidden: name.starts_with('.'),
                 depth: 0,
                 expanded: false,
             })
@@ -1107,63 +1192,65 @@ mod tests {
     /// on every inotify tick.
     #[test]
     fn a_refresh_leaves_the_cursor_on_the_same_file() {
-        let mut p = pane_with(&["a", "b", "c", "d"]);
-        p.cursor = 2; // "c"
-        p.set_entries(entries_named(&["d", "b", "a", "c"]));
-        assert_eq!(p.current().unwrap().name, "c");
+        let mut pane = pane_with(&["a", "b", "c", "d"]);
+        pane.cursor = 2; // "c"
+        pane.set_entries(entries_named(&["d", "b", "a", "c"]));
+        assert_eq!(pane.current().unwrap().name, "c");
     }
 
     #[test]
     fn hidden_files_are_filtered_until_asked_for() {
-        let mut p = pane_with(&["a", ".b", "c"]);
-        assert_eq!(p.len(), 2);
-        p.show_hidden = true;
-        p.refilter();
-        assert_eq!(p.len(), 3);
+        let mut pane = pane_with(&["a", ".b", "c"]);
+        assert_eq!(pane.len(), 2);
+        pane.show_hidden = true;
+        pane.refilter();
+        assert_eq!(pane.len(), 3);
     }
 
     #[test]
     fn filter_matches_substring_case_insensitively() {
-        let mut p = pane_with(&["Alpha", "beta", "GAMMA"]);
-        p.filter = "a".into();
-        p.refilter();
-        assert_eq!(p.len(), 3);
-        p.filter = "mm".into();
-        p.refilter();
-        assert_eq!(p.len(), 1);
+        let mut pane = pane_with(&["Alpha", "beta", "GAMMA"]);
+        pane.filter = "a".into();
+        pane.refilter();
+        assert_eq!(pane.len(), 3);
+        pane.filter = "mm".into();
+        pane.refilter();
+        assert_eq!(pane.len(), 1);
     }
 
     #[test]
     fn refilter_keeps_the_cursor_on_the_same_file() {
-        let mut p = pane_with(&["a", "b", "c"]);
-        p.cursor = 2;
-        let before = p.current().unwrap().name.clone();
-        p.show_hidden = true;
-        p.refilter();
-        assert_eq!(p.current().unwrap().name, before);
+        let mut pane = pane_with(&["a", "b", "c"]);
+        pane.cursor = 2;
+        let before = pane.current().unwrap().name.clone();
+        pane.show_hidden = true;
+        pane.refilter();
+        assert_eq!(pane.current().unwrap().name, before);
     }
 
     #[test]
     fn counts_split_dirs_and_files() {
-        let p = pane_with(&["a", "b"]);
-        assert_eq!(p.counts(), (0, 2, 0));
+        let pane = pane_with(&["a", "b"]);
+        let counts = pane.counts();
+        assert_eq!((counts.dirs, counts.files, counts.bytes), (0, 2, 0));
     }
 
     /// `5dd` on the second-to-last file must take what is there and stop, not
     /// panic on the range and not wrap to the top.
     #[test]
     fn a_delete_range_clamps_to_the_listing() {
-        let p = pane_with(&["a", "b", "c"]);
-        let names = |v: Vec<PathBuf>| -> Vec<String> {
-            v.iter()
-                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        let pane = pane_with(&["a", "b", "c"]);
+        let file_names_of = |paths: Vec<PathBuf>| -> Vec<String> {
+            paths
+                .iter()
+                .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
                 .collect()
         };
-        assert_eq!(names(p.paths_in(1, 1)), ["b"]);
-        assert_eq!(names(p.paths_in(1, 99)), ["b", "c"]);
-        assert_eq!(names(p.paths_in(0, 2)), ["a", "b", "c"]);
+        assert_eq!(file_names_of(pane.paths_in(1, 1)), ["b"]);
+        assert_eq!(file_names_of(pane.paths_in(1, 99)), ["b", "c"]);
+        assert_eq!(file_names_of(pane.paths_in(0, 2)), ["a", "b", "c"]);
         // Past the end entirely: clamped to the last item, never empty.
-        assert_eq!(names(p.paths_in(9, 9)), ["c"]);
+        assert_eq!(file_names_of(pane.paths_in(9, 9)), ["c"]);
         assert!(pane_with(&[]).paths_in(0, 3).is_empty());
     }
 }

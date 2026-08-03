@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use crate::config;
 use crate::fs::{Entry, Kind};
 
 // ---------------------------------------------------------------------------
@@ -75,6 +76,24 @@ impl Clipboard {
     }
 }
 
+/// The tools that put a `text/uri-list` on the system clipboard, in the order
+/// they are tried.
+const CLIPBOARD_WRITE_TOOLS: [(&str, &[&str]); 3] = [
+    ("wl-copy", &["--type", "text/uri-list"]),
+    ("xclip", &["-selection", "clipboard", "-t", "text/uri-list"]),
+    ("xsel", &["--clipboard", "--input"]),
+];
+
+/// The tools that read a `text/uri-list` back off it.
+const CLIPBOARD_READ_TOOLS: [(&str, &[&str]); 3] = [
+    ("wl-paste", &["--type", "text/uri-list", "--no-newline"]),
+    (
+        "xclip",
+        &["-selection", "clipboard", "-o", "-t", "text/uri-list"],
+    ),
+    ("xsel", &["--clipboard", "--output"]),
+];
+
 /// Publish the selection as `text/uri-list` for other applications.
 ///
 /// Whichever of wl-copy/xclip/xsel exists wins; if none does, OSC 52 puts at
@@ -85,12 +104,7 @@ fn export_uris(paths: &[PathBuf]) {
         .iter()
         .map(|p| format!("file://{}\n", percent_encode(&p.to_string_lossy())))
         .collect();
-    let cmds: [(&str, &[&str]); 3] = [
-        ("wl-copy", &["--type", "text/uri-list"]),
-        ("xclip", &["-selection", "clipboard", "-t", "text/uri-list"]),
-        ("xsel", &["--clipboard", "--input"]),
-    ];
-    for (bin, args) in cmds {
+    for (bin, args) in CLIPBOARD_WRITE_TOOLS {
         if which(bin).is_none() {
             continue;
         }
@@ -100,10 +114,10 @@ fn export_uris(paths: &[PathBuf]) {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
-        if let Ok(mut c) = child {
+        if let Ok(mut clipboard_child) = child {
             use std::io::Write;
-            if let Some(mut si) = c.stdin.take() {
-                let _ = si.write_all(uris.as_bytes());
+            if let Some(mut child_stdin) = clipboard_child.stdin.take() {
+                let _ = child_stdin.write_all(uris.as_bytes());
             }
             // Selection owners must outlive us; do not wait on them.
             return;
@@ -122,20 +136,25 @@ fn osc52(text: &str) {
 
 /// Twenty lines of base64 beats a dependency for one escape sequence.
 fn base64(data: &[u8]) -> String {
-    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const BASE64_ALPHABET: &[u8] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for c in data.chunks(3) {
-        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
-        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-        out.push(T[(n >> 18) as usize & 63] as char);
-        out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if c.len() > 1 {
-            T[(n >> 6) as usize & 63] as char
+    for byte_triple in data.chunks(3) {
+        let padded = [
+            byte_triple[0],
+            *byte_triple.get(1).unwrap_or(&0),
+            *byte_triple.get(2).unwrap_or(&0),
+        ];
+        let packed = ((padded[0] as u32) << 16) | ((padded[1] as u32) << 8) | padded[2] as u32;
+        out.push(BASE64_ALPHABET[(packed >> 18) as usize & 63] as char);
+        out.push(BASE64_ALPHABET[(packed >> 12) as usize & 63] as char);
+        out.push(if byte_triple.len() > 1 {
+            BASE64_ALPHABET[(packed >> 6) as usize & 63] as char
         } else {
             '='
         });
-        out.push(if c.len() > 2 {
-            T[n as usize & 63] as char
+        out.push(if byte_triple.len() > 2 {
+            BASE64_ALPHABET[packed as usize & 63] as char
         } else {
             '='
         });
@@ -166,27 +185,19 @@ pub fn which(bin: &str) -> Option<PathBuf> {
 /// Read `text/uri-list` back out of the system clipboard, for Paste of files
 /// copied in another application.
 pub fn import_uris() -> Vec<PathBuf> {
-    let cmds: [(&str, &[&str]); 3] = [
-        ("wl-paste", &["--type", "text/uri-list", "--no-newline"]),
-        (
-            "xclip",
-            &["-selection", "clipboard", "-o", "-t", "text/uri-list"],
-        ),
-        ("xsel", &["--clipboard", "--output"]),
-    ];
-    for (bin, args) in cmds {
+    for (bin, args) in CLIPBOARD_READ_TOOLS {
         if which(bin).is_none() {
             continue;
         }
-        if let Ok(o) = std::process::Command::new(bin).args(args).output() {
-            let txt = String::from_utf8_lossy(&o.stdout);
-            let v: Vec<PathBuf> = txt
+        if let Ok(paste_output) = std::process::Command::new(bin).args(args).output() {
+            let uri_list_text = String::from_utf8_lossy(&paste_output.stdout);
+            let imported_paths: Vec<PathBuf> = uri_list_text
                 .lines()
-                .filter_map(|l| l.trim().strip_prefix("file://"))
-                .map(|l| PathBuf::from(percent_decode(l)))
+                .filter_map(|uri_line| uri_line.trim().strip_prefix("file://"))
+                .map(|uri_line| PathBuf::from(percent_decode(uri_line)))
                 .collect();
-            if !v.is_empty() {
-                return v;
+            if !imported_paths.is_empty() {
+                return imported_paths;
             }
         }
     }
@@ -194,21 +205,21 @@ pub fn import_uris() -> Vec<PathBuf> {
 }
 
 fn percent_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
-                i += 3;
+    let input_bytes = s.as_bytes();
+    let mut decoded = Vec::with_capacity(input_bytes.len());
+    let mut index = 0;
+    while index < input_bytes.len() {
+        if input_bytes[index] == b'%' && index + 2 < input_bytes.len() {
+            if let Ok(decoded_byte) = u8::from_str_radix(&s[index + 1..index + 3], 16) {
+                decoded.push(decoded_byte);
+                index += 3;
                 continue;
             }
         }
-        out.push(b[i]);
-        i += 1;
+        decoded.push(input_bytes[index]);
+        index += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -220,26 +231,35 @@ fn percent_decode(s: &str) -> String {
 /// deleting files the user may have since edited.
 #[derive(Clone, Debug)]
 pub enum UndoOp {
-    Rename { from: PathBuf, to: PathBuf },
-    Move { pairs: Vec<(PathBuf, PathBuf)> },
-    Trash { originals: Vec<PathBuf> },
-    Create { path: PathBuf },
+    Rename {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    Move {
+        moved_pairs: Vec<(PathBuf, PathBuf)>,
+    },
+    Trash {
+        originals: Vec<PathBuf>,
+    },
+    Create {
+        path: PathBuf,
+    },
 }
 
 pub fn undo(op: &UndoOp) -> Result<String, String> {
     match op {
         UndoOp::Rename { from, to } => {
             fs::rename(to, from).map_err(|e| e.to_string())?;
-            Ok(format!("Renamed back to {}", name(from)))
+            Ok(format!("Renamed back to {}", file_name_of(from)))
         }
-        UndoOp::Move { pairs } => {
-            for (from, to) in pairs {
+        UndoOp::Move { moved_pairs } => {
+            for (from, to) in moved_pairs {
                 if let Some(p) = from.parent() {
                     let _ = fs::create_dir_all(p);
                 }
                 fs::rename(to, from).map_err(|e| e.to_string())?;
             }
-            Ok(format!("Moved {} item(s) back", pairs.len()))
+            Ok(format!("Moved {} item(s) back", moved_pairs.len()))
         }
         UndoOp::Trash { originals } => {
             let restored = restore_from_trash(originals)?;
@@ -251,15 +271,15 @@ pub fn undo(op: &UndoOp) -> Result<String, String> {
             } else {
                 fs::remove_file(path).map_err(|e| e.to_string())?;
             }
-            Ok(format!("Removed {}", name(path)))
+            Ok(format!("Removed {}", file_name_of(path)))
         }
     }
 }
 
-pub fn name(p: &Path) -> String {
-    p.file_name()
+pub fn file_name_of(path: &Path) -> String {
+    path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -280,18 +300,18 @@ pub fn list_trash() -> Vec<Entry> {
     };
     items
         .into_iter()
-        .map(|it| {
-            let original = it.original_parent.join(&it.name);
+        .map(|trash_item| {
+            let original = trash_item.original_parent.join(&trash_item.name);
             let meta = fs::symlink_metadata(&original).ok();
             Entry {
-                name: it.name.to_string_lossy().into_owned(),
+                name: trash_item.name.to_string_lossy().into_owned(),
                 path: original,
                 kind: match meta.as_ref().map(|m| m.is_dir()) {
                     Some(true) => Kind::Dir,
                     _ => Kind::File,
                 },
                 size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
-                mtime: it.time_deleted,
+                mtime: trash_item.time_deleted,
                 mode: 0o644,
                 readable: true,
                 hidden: false,
@@ -307,7 +327,7 @@ pub fn list_trash() -> Vec<Entry> {
 fn trash_error(e: trash::Error) -> String {
     match e {
         trash::Error::CanonicalizePath { original } => {
-            format!("{}: no longer there", name(&original))
+            format!("{}: no longer there", file_name_of(&original))
         }
         // `path` here is a directory inside the trash can, not the file the
         // user asked about, so naming it would only mislead. The io error is
@@ -327,10 +347,10 @@ fn trash_items(originals: &[PathBuf]) -> Result<Vec<trash::TrashItem>, String> {
     let items = trash::os_limited::list().map_err(trash_error)?;
     let wanted: Vec<_> = items
         .into_iter()
-        .filter(|it| {
-            originals
-                .iter()
-                .any(|o| it.original_parent.join(&it.name) == *o)
+        .filter(|trash_item| {
+            originals.iter().any(|original_path| {
+                trash_item.original_parent.join(&trash_item.name) == *original_path
+            })
         })
         .collect();
     if wanted.is_empty() {
@@ -406,39 +426,41 @@ pub fn batch_rename(paths: &[PathBuf], pattern: &str) -> Result<UndoOp, String> 
     if !pattern.contains('#') {
         return Err("Pattern must contain # for the counter".into());
     }
-    let hashes = pattern.chars().filter(|c| *c == '#').count();
-    let mut pairs = Vec::new();
-    for (i, p) in paths.iter().enumerate() {
-        let num = format!("{:0width$}", i + 1, width = hashes);
-        let mut name = String::new();
-        let mut consumed = false;
-        for c in pattern.chars() {
-            if c == '#' {
-                if !consumed {
-                    name.push_str(&num);
-                    consumed = true;
+    let hash_count = pattern.chars().filter(|c| *c == '#').count();
+    let mut renamed_pairs = Vec::new();
+    for (index, source_path) in paths.iter().enumerate() {
+        let counter_text = format!("{:0width$}", index + 1, width = hash_count);
+        let mut new_name = String::new();
+        let mut counter_written = false;
+        for pattern_char in pattern.chars() {
+            if pattern_char == '#' {
+                if !counter_written {
+                    new_name.push_str(&counter_text);
+                    counter_written = true;
                 }
             } else {
-                name.push(c);
+                new_name.push(pattern_char);
             }
         }
         // Keep the original extension when the pattern does not supply one.
-        let name = if !name.contains('.') {
-            match p.extension() {
-                Some(e) => format!("{name}.{}", e.to_string_lossy()),
-                None => name,
+        let new_name = if !new_name.contains('.') {
+            match source_path.extension() {
+                Some(extension) => format!("{new_name}.{}", extension.to_string_lossy()),
+                None => new_name,
             }
         } else {
-            name
+            new_name
         };
-        let to = p.with_file_name(&name);
-        if to.exists() && to != *p {
-            return Err(format!("{name} already exists"));
+        let to = source_path.with_file_name(&new_name);
+        if to.exists() && to != *source_path {
+            return Err(format!("{new_name} already exists"));
         }
-        fs::rename(p, &to).map_err(|e| format!("{}: {e}", self::name(p)))?;
-        pairs.push((p.clone(), to));
+        fs::rename(source_path, &to).map_err(|e| format!("{}: {e}", file_name_of(source_path)))?;
+        renamed_pairs.push((source_path.clone(), to));
     }
-    Ok(UndoOp::Move { pairs })
+    Ok(UndoOp::Move {
+        moved_pairs: renamed_pairs,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -447,9 +469,9 @@ pub fn batch_rename(paths: &[PathBuf], pattern: &str) -> Result<UndoOp, String> 
 
 pub struct Progress {
     pub label: String,
-    pub total: Arc<AtomicU64>,
-    pub done: Arc<AtomicU64>,
-    pub current: Arc<Mutex<String>>,
+    pub total_bytes: Arc<AtomicU64>,
+    pub copied_bytes: Arc<AtomicU64>,
+    pub current_file: Arc<Mutex<String>>,
     pub cancel_requested: Arc<AtomicBool>,
     pub finished: Arc<AtomicBool>,
     pub outcome: Arc<Mutex<Option<Result<UndoOp, String>>>>,
@@ -457,126 +479,149 @@ pub struct Progress {
 
 impl Progress {
     pub fn fraction(&self) -> f64 {
-        let t = self.total.load(Ordering::Relaxed);
-        if t == 0 {
+        let total_bytes = self.total_bytes.load(Ordering::Relaxed);
+        if total_bytes == 0 {
             return 0.0;
         }
-        (self.done.load(Ordering::Relaxed) as f64 / t as f64).clamp(0.0, 1.0)
+        (self.copied_bytes.load(Ordering::Relaxed) as f64 / total_bytes as f64).clamp(0.0, 1.0)
     }
 }
 
+/// Whether a transfer leaves the sources in place or removes them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TransferKind {
+    Copy,
+    Move,
+}
+
 /// Start a copy or move in the background. Returns immediately.
-pub fn start_transfer(sources: Vec<PathBuf>, dest: PathBuf, move_it: bool) -> Progress {
-    let p = Progress {
+pub fn start_transfer(sources: Vec<PathBuf>, dest: PathBuf, kind: TransferKind) -> Progress {
+    let transfer_progress = Progress {
         label: format!(
             "{} {} item(s) to {}",
-            if move_it { "Moving" } else { "Copying" },
+            match kind {
+                TransferKind::Move => "Moving",
+                TransferKind::Copy => "Copying",
+            },
             sources.len(),
-            name(&dest)
+            file_name_of(&dest)
         ),
-        total: Arc::new(AtomicU64::new(0)),
-        done: Arc::new(AtomicU64::new(0)),
-        current: Arc::new(Mutex::new(String::new())),
+        total_bytes: Arc::new(AtomicU64::new(0)),
+        copied_bytes: Arc::new(AtomicU64::new(0)),
+        current_file: Arc::new(Mutex::new(String::new())),
         cancel_requested: Arc::new(AtomicBool::new(false)),
         finished: Arc::new(AtomicBool::new(false)),
         outcome: Arc::new(Mutex::new(None)),
     };
-    let (total, done, current, cancel_requested, finished, outcome) = (
-        Arc::clone(&p.total),
-        Arc::clone(&p.done),
-        Arc::clone(&p.current),
-        Arc::clone(&p.cancel_requested),
-        Arc::clone(&p.finished),
-        Arc::clone(&p.outcome),
+    let (total_bytes, copied_bytes, current_file, cancel_requested, finished, outcome) = (
+        Arc::clone(&transfer_progress.total_bytes),
+        Arc::clone(&transfer_progress.copied_bytes),
+        Arc::clone(&transfer_progress.current_file),
+        Arc::clone(&transfer_progress.cancel_requested),
+        Arc::clone(&transfer_progress.finished),
+        Arc::clone(&transfer_progress.outcome),
     );
 
     thread::spawn(move || {
-        total.store(
+        total_bytes.store(
             sources.iter().map(|s| tree_size(s)).sum(),
             Ordering::Relaxed,
         );
-        let mut pairs = Vec::new();
+        let mut moved_pairs = Vec::new();
         let mut err = None;
         for src in &sources {
             if cancel_requested.load(Ordering::Relaxed) {
                 break;
             }
-            let target = unique_target(&dest.join(name(src)));
+            let target = unique_target(&dest.join(file_name_of(src)));
             // A rename within one filesystem is instant; try it first.
-            if move_it && fs::rename(src, &target).is_ok() {
-                done.fetch_add(tree_size(src), Ordering::Relaxed);
-                pairs.push((src.clone(), target));
+            if kind == TransferKind::Move && fs::rename(src, &target).is_ok() {
+                copied_bytes.fetch_add(tree_size(src), Ordering::Relaxed);
+                moved_pairs.push((src.clone(), target));
                 continue;
             }
-            if let Err(e) = copy_tree(src, &target, &done, &current, &cancel_requested) {
-                err = Some(format!("{}: {e}", name(src)));
+            if let Err(e) = copy_tree(
+                src,
+                &target,
+                &copied_bytes,
+                &current_file,
+                &cancel_requested,
+            ) {
+                err = Some(format!("{}: {e}", file_name_of(src)));
                 break;
             }
-            if move_it && !cancel_requested.load(Ordering::Relaxed) {
-                if let Err(e) = remove_tree(src) {
-                    err = Some(format!("{}: {e}", name(src)));
+            if kind == TransferKind::Move && !cancel_requested.load(Ordering::Relaxed) {
+                if let Err(remove_error) = remove_tree(src) {
+                    err = Some(format!("{}: {remove_error}", file_name_of(src)));
                     break;
                 }
-                pairs.push((src.clone(), target));
+                moved_pairs.push((src.clone(), target));
             }
         }
         let result = match err {
             Some(e) => Err(e),
             None if cancel_requested.load(Ordering::Relaxed) => Err("Cancelled".into()),
-            None if move_it => Ok(UndoOp::Move { pairs }),
+            None if kind == TransferKind::Move => Ok(UndoOp::Move { moved_pairs }),
             // A copy leaves nothing to undo, so report it as a no-op journal
             // entry the caller drops.
-            None => Ok(UndoOp::Move { pairs: Vec::new() }),
+            None => Ok(UndoOp::Move {
+                moved_pairs: Vec::new(),
+            }),
         };
-        if let Ok(mut g) = outcome.lock() {
-            *g = Some(result);
+        if let Ok(mut outcome_guard) = outcome.lock() {
+            *outcome_guard = Some(result);
         }
         finished.store(true, Ordering::Relaxed);
     });
-    p
+    transfer_progress
 }
 
-fn tree_size(p: &Path) -> u64 {
-    let Ok(m) = fs::symlink_metadata(p) else {
+fn tree_size(path: &Path) -> u64 {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
         return 0;
     };
-    if m.is_dir() {
-        fs::read_dir(p)
-            .map(|d| d.flatten().map(|e| tree_size(&e.path())).sum())
+    if metadata.is_dir() {
+        fs::read_dir(path)
+            .map(|read_dir| {
+                read_dir
+                    .flatten()
+                    .map(|dir_entry| tree_size(&dir_entry.path()))
+                    .sum()
+            })
             .unwrap_or(0)
     } else {
-        m.len()
+        metadata.len()
     }
 }
 
 /// Never clobber silently: `file.txt` becomes `file (1).txt`, as Dolphin does
 /// when you paste into the directory a file already lives in.
-fn unique_target(p: &Path) -> PathBuf {
-    if !p.exists() {
-        return p.to_path_buf();
+fn unique_target(path: &Path) -> PathBuf {
+    if !path.exists() {
+        return path.to_path_buf();
     }
-    let stem = p
+    let stem = path
         .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
+        .map(|stem_os| stem_os.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let ext = p
+    let ext = path
         .extension()
-        .map(|s| format!(".{}", s.to_string_lossy()))
+        .map(|ext_os| format!(".{}", ext_os.to_string_lossy()))
         .unwrap_or_default();
-    for n in 1..10_000 {
-        let cand = p.with_file_name(format!("{stem} ({n}){ext}"));
-        if !cand.exists() {
-            return cand;
+    for suffix_number in 1..10_000 {
+        let candidate = path.with_file_name(format!("{stem} ({suffix_number}){ext}"));
+        if !candidate.exists() {
+            return candidate;
         }
     }
-    p.to_path_buf()
+    path.to_path_buf()
 }
 
 fn copy_tree(
     src: &Path,
-    dst: &Path,
-    done: &Arc<AtomicU64>,
-    current: &Arc<Mutex<String>>,
+    dest: &Path,
+    copied_bytes: &Arc<AtomicU64>,
+    current_file: &Arc<Mutex<String>>,
     cancel_requested: &Arc<AtomicBool>,
 ) -> io::Result<()> {
     if cancel_requested.load(Ordering::Relaxed) {
@@ -585,18 +630,18 @@ fn copy_tree(
     let meta = fs::symlink_metadata(src)?;
     if meta.file_type().is_symlink() {
         let target = fs::read_link(src)?;
-        std::os::unix::fs::symlink(target, dst)?;
+        std::os::unix::fs::symlink(target, dest)?;
         return Ok(());
     }
     if meta.is_dir() {
-        fs::create_dir_all(dst)?;
-        for e in fs::read_dir(src)? {
-            let e = e?;
+        fs::create_dir_all(dest)?;
+        for dir_entry in fs::read_dir(src)? {
+            let dir_entry = dir_entry?;
             copy_tree(
-                &e.path(),
-                &dst.join(e.file_name()),
-                done,
-                current,
+                &dir_entry.path(),
+                &dest.join(dir_entry.file_name()),
+                copied_bytes,
+                current_file,
                 cancel_requested,
             )?;
             if cancel_requested.load(Ordering::Relaxed) {
@@ -605,40 +650,40 @@ fn copy_tree(
         }
         return Ok(());
     }
-    if let Ok(mut g) = current.lock() {
-        *g = name(src);
+    if let Ok(mut current_file_guard) = current_file.lock() {
+        *current_file_guard = file_name_of(src);
     }
-    copy_file_streaming(src, dst, done, cancel_requested)
+    copy_file_streaming(src, dest, copied_bytes, cancel_requested)
 }
 
 /// Copy in chunks so the progress bar moves during a 4 GiB file and cancel is
 /// honoured mid-file rather than only between files.
 fn copy_file_streaming(
     src: &Path,
-    dst: &Path,
-    done: &Arc<AtomicU64>,
+    dest: &Path,
+    copied_bytes: &Arc<AtomicU64>,
     cancel_requested: &Arc<AtomicBool>,
 ) -> io::Result<()> {
     use io::{Read, Write};
-    let mut r = fs::File::open(src)?;
-    let mut w = fs::File::create(dst)?;
-    let mut buf = vec![0u8; 256 * 1024];
+    let mut source_file = fs::File::open(src)?;
+    let mut dest_file = fs::File::create(dest)?;
+    let mut buf = vec![0u8; config::COPY_CHUNK_BYTES];
     loop {
         if cancel_requested.load(Ordering::Relaxed) {
             // A half-written file is worse than none; take it back out.
-            drop(w);
-            let _ = fs::remove_file(dst);
+            drop(dest_file);
+            let _ = fs::remove_file(dest);
             return Ok(());
         }
-        let n = r.read(&mut buf)?;
+        let n = source_file.read(&mut buf)?;
         if n == 0 {
             break;
         }
-        w.write_all(&buf[..n])?;
-        done.fetch_add(n as u64, Ordering::Relaxed);
+        dest_file.write_all(&buf[..n])?;
+        copied_bytes.fetch_add(n as u64, Ordering::Relaxed);
     }
     if let Ok(m) = fs::metadata(src) {
-        let _ = fs::set_permissions(dst, m.permissions());
+        let _ = fs::set_permissions(dest, m.permissions());
     }
     Ok(())
 }
@@ -655,7 +700,7 @@ pub fn remove_tree(p: &Path) -> io::Result<()> {
 pub fn delete_permanently(paths: &[PathBuf]) -> Result<usize, String> {
     let mut n = 0;
     for p in paths {
-        remove_tree(p).map_err(|e| format!("{}: {e}", name(p)))?;
+        remove_tree(p).map_err(|e| format!("{}: {e}", file_name_of(p)))?;
         n += 1;
     }
     Ok(n)
@@ -665,7 +710,7 @@ pub fn delete_permanently(paths: &[PathBuf]) -> Result<usize, String> {
 // Archives — shelled out, presence-checked, as PLAN.md specifies
 // ---------------------------------------------------------------------------
 
-pub fn extract(archive: &Path, into: &Path) -> Result<String, String> {
+pub fn extract(archive: &Path, dest_dir: &Path) -> Result<String, String> {
     let ext = archive
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
@@ -677,7 +722,7 @@ pub fn extract(archive: &Path, into: &Path) -> Result<String, String> {
                 "-o".into(),
                 archive.to_string_lossy().into(),
                 "-d".into(),
-                into.to_string_lossy().into(),
+                dest_dir.to_string_lossy().into(),
             ],
         ),
         "tar" | "gz" | "tgz" | "bz2" | "xz" | "zst" => (
@@ -686,7 +731,7 @@ pub fn extract(archive: &Path, into: &Path) -> Result<String, String> {
                 "-xaf".into(),
                 archive.to_string_lossy().into(),
                 "-C".into(),
-                into.to_string_lossy().into(),
+                dest_dir.to_string_lossy().into(),
             ],
         ),
         _ => return Err(format!("Cannot extract .{ext}")),
@@ -699,7 +744,7 @@ pub fn extract(archive: &Path, into: &Path) -> Result<String, String> {
         .output()
         .map_err(|e| e.to_string())?;
     if out.status.success() {
-        Ok(format!("Extracted {}", name(archive)))
+        Ok(format!("Extracted {}", file_name_of(archive)))
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }
@@ -716,11 +761,11 @@ pub fn compress(paths: &[PathBuf], dest: &Path) -> Result<String, String> {
     let mut cmd = std::process::Command::new("tar");
     cmd.arg("-czf").arg(dest).arg("-C").arg(parent);
     for p in paths {
-        cmd.arg(name(p));
+        cmd.arg(file_name_of(p));
     }
     let out = cmd.output().map_err(|e| e.to_string())?;
     if out.status.success() {
-        Ok(format!("Created {}", name(dest)))
+        Ok(format!("Created {}", file_name_of(dest)))
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }
@@ -731,101 +776,108 @@ mod tests {
     use super::*;
 
     fn tmpdir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("dolvim-test-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
-        fs::create_dir_all(&d).unwrap();
-        d
+        let temp_dir =
+            std::env::temp_dir().join(format!("dolvim-test-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+        temp_dir
     }
 
     #[test]
     fn rename_round_trips_through_undo() {
-        let d = tmpdir("rename");
-        let a = d.join("a.txt");
-        fs::write(&a, b"x").unwrap();
-        let op = rename(&a, "b.txt").unwrap();
-        assert!(d.join("b.txt").exists() && !a.exists());
-        undo(&op).unwrap();
-        assert!(a.exists() && !d.join("b.txt").exists());
-        fs::remove_dir_all(&d).unwrap();
+        let temp_dir = tmpdir("rename");
+        let file_path = temp_dir.join("a.txt");
+        fs::write(&file_path, b"x").unwrap();
+        let undo_op = rename(&file_path, "b.txt").unwrap();
+        assert!(temp_dir.join("b.txt").exists() && !file_path.exists());
+        undo(&undo_op).unwrap();
+        assert!(file_path.exists() && !temp_dir.join("b.txt").exists());
+        fs::remove_dir_all(&temp_dir).unwrap();
     }
 
     #[test]
     fn rename_refuses_to_clobber() {
-        let d = tmpdir("clobber");
-        fs::write(d.join("a"), b"1").unwrap();
-        fs::write(d.join("b"), b"2").unwrap();
-        assert!(rename(&d.join("a"), "b").is_err());
-        assert_eq!(fs::read(d.join("b")).unwrap(), b"2");
-        fs::remove_dir_all(&d).unwrap();
+        let temp_dir = tmpdir("clobber");
+        fs::write(temp_dir.join("a"), b"1").unwrap();
+        fs::write(temp_dir.join("b"), b"2").unwrap();
+        assert!(rename(&temp_dir.join("a"), "b").is_err());
+        assert_eq!(fs::read(temp_dir.join("b")).unwrap(), b"2");
+        fs::remove_dir_all(&temp_dir).unwrap();
     }
 
     #[test]
     fn batch_rename_pads_to_the_hash_count() {
-        let d = tmpdir("batch");
+        let temp_dir = tmpdir("batch");
         let paths: Vec<PathBuf> = (0..3)
             .map(|i| {
-                let p = d.join(format!("src{i}.jpg"));
-                fs::write(&p, b"x").unwrap();
-                p
+                let file_path = temp_dir.join(format!("src{i}.jpg"));
+                fs::write(&file_path, b"x").unwrap();
+                file_path
             })
             .collect();
         batch_rename(&paths, "Holiday ##").unwrap();
-        assert!(d.join("Holiday 01.jpg").exists());
-        assert!(d.join("Holiday 03.jpg").exists());
-        fs::remove_dir_all(&d).unwrap();
+        assert!(temp_dir.join("Holiday 01.jpg").exists());
+        assert!(temp_dir.join("Holiday 03.jpg").exists());
+        fs::remove_dir_all(&temp_dir).unwrap();
     }
 
     #[test]
     fn batch_rename_is_undoable_as_a_move() {
-        let d = tmpdir("batchundo");
-        let p = d.join("one.txt");
-        fs::write(&p, b"x").unwrap();
-        let op = batch_rename(std::slice::from_ref(&p), "n#").unwrap();
-        assert!(d.join("n1.txt").exists());
-        undo(&op).unwrap();
-        assert!(p.exists());
-        fs::remove_dir_all(&d).unwrap();
+        let temp_dir = tmpdir("batchundo");
+        let file_path = temp_dir.join("one.txt");
+        fs::write(&file_path, b"x").unwrap();
+        let undo_op = batch_rename(std::slice::from_ref(&file_path), "n#").unwrap();
+        assert!(temp_dir.join("n1.txt").exists());
+        undo(&undo_op).unwrap();
+        assert!(file_path.exists());
+        fs::remove_dir_all(&temp_dir).unwrap();
     }
 
     #[test]
     fn unique_target_never_overwrites() {
-        let d = tmpdir("unique");
-        let a = d.join("f.txt");
-        fs::write(&a, b"x").unwrap();
-        assert_eq!(unique_target(&a), d.join("f (1).txt"));
-        fs::remove_dir_all(&d).unwrap();
+        let temp_dir = tmpdir("unique");
+        let file_path = temp_dir.join("f.txt");
+        fs::write(&file_path, b"x").unwrap();
+        assert_eq!(unique_target(&file_path), temp_dir.join("f (1).txt"));
+        fs::remove_dir_all(&temp_dir).unwrap();
     }
 
     #[test]
     fn copy_tree_reproduces_the_whole_subtree() {
-        let d = tmpdir("copytree");
-        fs::create_dir_all(d.join("src/sub")).unwrap();
-        fs::write(d.join("src/sub/f"), b"hello").unwrap();
+        let temp_dir = tmpdir("copytree");
+        fs::create_dir_all(temp_dir.join("src/sub")).unwrap();
+        fs::write(temp_dir.join("src/sub/f"), b"hello").unwrap();
         let done = Arc::new(AtomicU64::new(0));
-        let cur = Arc::new(Mutex::new(String::new()));
+        let current_file = Arc::new(Mutex::new(String::new()));
         let cancel_requested = Arc::new(AtomicBool::new(false));
         copy_tree(
-            &d.join("src"),
-            &d.join("dst"),
+            &temp_dir.join("src"),
+            &temp_dir.join("dst"),
             &done,
-            &cur,
+            &current_file,
             &cancel_requested,
         )
         .unwrap();
-        assert_eq!(fs::read(d.join("dst/sub/f")).unwrap(), b"hello");
+        assert_eq!(fs::read(temp_dir.join("dst/sub/f")).unwrap(), b"hello");
         assert_eq!(done.load(Ordering::Relaxed), 5);
-        fs::remove_dir_all(&d).unwrap();
+        fs::remove_dir_all(&temp_dir).unwrap();
     }
 
     #[test]
     fn cancelling_mid_copy_leaves_no_partial_file() {
-        let d = tmpdir("cancel");
-        fs::write(d.join("big"), vec![0u8; 1024]).unwrap();
+        let temp_dir = tmpdir("cancel");
+        fs::write(temp_dir.join("big"), vec![0u8; 1024]).unwrap();
         let done = Arc::new(AtomicU64::new(0));
         let cancel_requested = Arc::new(AtomicBool::new(true));
-        copy_file_streaming(&d.join("big"), &d.join("out"), &done, &cancel_requested).unwrap();
-        assert!(!d.join("out").exists());
-        fs::remove_dir_all(&d).unwrap();
+        copy_file_streaming(
+            &temp_dir.join("big"),
+            &temp_dir.join("out"),
+            &done,
+            &cancel_requested,
+        )
+        .unwrap();
+        assert!(!temp_dir.join("out").exists());
+        fs::remove_dir_all(&temp_dir).unwrap();
     }
 
     #[test]
@@ -837,7 +889,7 @@ mod tests {
 
     #[test]
     fn uri_encoding_round_trips_spaces() {
-        assert_eq!(percent_encode("/a b/c"), "/a%20b/c");
-        assert_eq!(percent_decode("/a%20b/c"), "/a b/c");
+        assert_eq!(percent_encode("/file_path b/c"), "/file_path%20b/c");
+        assert_eq!(percent_decode("/file_path%20b/c"), "/file_path b/c");
     }
 }

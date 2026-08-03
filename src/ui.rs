@@ -12,14 +12,14 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Focus, MenuKind, Mode, Pane, ViewMode};
-use crate::config::{self, color, glyph as g};
+use crate::config::{self, color};
 use crate::fs::{self, SortKey};
 use crate::places::Row;
 use crate::vim;
 
-pub fn draw(f: &mut Frame, app: &mut App) {
-    let area = f.area();
-    paint(f, area, color::VIEW_BG);
+pub fn draw(frame: &mut Frame, app: &mut App) {
+    let area = frame.area();
+    paint(frame, area, color::VIEW_BG);
 
     let tabbar = if app.tabs.len() > 1 { 1 } else { 0 };
     let filter = if app.filter_bar { 1 } else { 0 };
@@ -34,17 +34,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         ])
         .split(area);
 
-    toolbar(f, app, rows[0]);
+    toolbar(frame, app, rows[0]);
     if tabbar == 1 {
-        tab_bar(f, app, rows[1]);
+        tab_bar(frame, app, rows[1]);
     }
-    body(f, app, rows[2]);
+    body(frame, app, rows[2]);
     if filter == 1 {
-        filter_bar(f, app, rows[3]);
+        filter_bar(frame, app, rows[3]);
     }
-    status_bar(f, app, rows[4]);
+    status_bar(frame, app, rows[4]);
 
-    overlays(f, app, area);
+    overlays(frame, app, area);
 }
 
 // ---------------------------------------------------------------------------
@@ -60,6 +60,13 @@ pub fn crumb_paths(p: &Path) -> Vec<PathBuf> {
 
 /// Dolphin shows `Home` rather than the literal home path, and hides the
 /// leading components of anything below it.
+/// One drawn breadcrumb segment: its label, and where it sits in the full
+/// trail (which elision from the left does not renumber).
+struct CrumbSeg {
+    path_index: usize,
+    label: String,
+}
+
 fn crumb_label(p: &Path) -> String {
     let home = crate::places::home();
     if p == home {
@@ -68,19 +75,19 @@ fn crumb_label(p: &Path) -> String {
     if p == Path::new("/") {
         return "/".into();
     }
-    crate::ops::name(p)
+    crate::ops::file_name_of(p)
 }
 
-fn toolbar(f: &mut Frame, app: &mut App, area: Rect) {
-    paint(f, area, color::TOOLBAR_BG);
+fn toolbar(frame: &mut Frame, app: &mut App, area: Rect) {
+    paint(frame, area, color::TOOLBAR_BG);
     // Where the text cursor should end up, applied once the buffer borrow ends.
     let mut cursor: Option<(u16, u16)> = None;
-    let buf = f.buffer_mut();
+    let buf = frame.buffer_mut();
     let base = Style::default().bg(color::TOOLBAR_BG).fg(color::TEXT);
     let dim = base.fg(color::DIM);
     let p = app.pane();
-    let can_back = p.hist_pos > 0;
-    let can_fwd = p.hist_pos + 1 < p.history.len();
+    let can_back = p.history_pos > 0;
+    let can_fwd = p.history_pos + 1 < p.history.len();
 
     // The focused toolbar button wears the same fill a selected file does. A
     // button whose menu is open is focused too — the open menu *is* the focus.
@@ -89,39 +96,39 @@ fn toolbar(f: &mut Frame, app: &mut App, area: Rect) {
         Mode::Menu(kind) => vim::menu_owner(kind),
         _ => None,
     };
-    let sel = |n: usize, st: Style| match focused {
+    let focused_style = |n: usize, st: Style| match focused {
         Some(i) if i == n => st.bg(color::SELECTION),
         _ => st,
     };
 
     let mut x = area.x;
-    let put = |buf: &mut Buffer, s: &str, st: Style, x: &mut u16| -> Rect {
-        let w = s.width() as u16;
-        buf.set_string(*x, area.y, s, st);
+    let put_left = |buf: &mut Buffer, text: &str, style: Style, x: &mut u16| -> Rect {
+        let w = text.width() as u16;
+        buf.set_string(*x, area.y, text, style);
         let r = Rect::new(*x, area.y, w, 1);
         *x += w;
         r
     };
 
-    put(buf, " ", base, &mut x);
-    let back_st = sel(0, if can_back { base } else { dim });
-    app.hits.back = put(buf, g::BACK, back_st, &mut x);
-    put(buf, "  ", base, &mut x);
-    let fwd_st = sel(1, if can_fwd { base } else { dim });
-    app.hits.forward = put(buf, g::FORWARD, fwd_st, &mut x);
-    put(buf, "   ", base, &mut x);
+    put_left(buf, " ", base, &mut x);
+    let back_st = focused_style(0, if can_back { base } else { dim });
+    app.hits.back = put_left(buf, config::glyph::BACK, back_st, &mut x);
+    put_left(buf, "  ", base, &mut x);
+    let fwd_st = focused_style(1, if can_fwd { base } else { dim });
+    app.hits.forward = put_left(buf, config::glyph::FORWARD, fwd_st, &mut x);
+    put_left(buf, "   ", base, &mut x);
 
     // Dolphin's split button: the icon shows the current mode and cycles it,
     // the caret beside it opens the full list. Two hitboxes, not one.
     let vg = match app.pane().view {
-        ViewMode::Icons => g::VIEW_ICONS,
-        ViewMode::Compact => g::VIEW_COMPACT,
-        ViewMode::Details => g::VIEW_DETAILS,
+        ViewMode::Icons => config::glyph::VIEW_ICONS,
+        ViewMode::Compact => config::glyph::VIEW_COMPACT,
+        ViewMode::Details => config::glyph::VIEW_DETAILS,
     };
-    let view_st = sel(2, base);
-    app.hits.view_cycle = put(buf, vg, view_st, &mut x);
-    put(buf, " ", view_st, &mut x);
-    app.hits.view_menu = put(buf, g::DROPDOWN, view_st, &mut x);
+    let view_st = focused_style(2, base);
+    app.hits.view_cycle = put_left(buf, vg, view_st, &mut x);
+    put_left(buf, " ", view_st, &mut x);
+    app.hits.view_menu = put_left(buf, config::glyph::DROPDOWN, view_st, &mut x);
 
     // The navigation group sits over the Places panel and the breadcrumb
     // starts where the file view does, which is how Dolphin lines them up.
@@ -130,13 +137,12 @@ fn toolbar(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     // Breadcrumb, or the editable path field when path edit is active.
-    let right_w: u16 = 22;
     let crumb_area = Rect::new(
         x,
         area.y,
         area.width
             .saturating_sub(x - area.x)
-            .saturating_sub(right_w),
+            .saturating_sub(config::TOOLBAR_RIGHT_WIDTH),
         1,
     );
     app.hits.path_bar = crumb_area;
@@ -155,10 +161,13 @@ fn toolbar(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         let paths = crumb_paths(&app.pane().cwd);
         // Dolphin elides from the left when the trail does not fit.
-        let mut segs: Vec<(usize, String)> = paths
+        let mut segs: Vec<CrumbSeg> = paths
             .iter()
             .enumerate()
-            .map(|(i, p)| (i, crumb_label(p)))
+            .map(|(path_index, p)| CrumbSeg {
+                path_index,
+                label: crumb_label(p),
+            })
             .collect();
         while total_crumb_width(&segs) > crumb_area.width && segs.len() > 1 {
             segs.remove(0);
@@ -169,61 +178,72 @@ fn toolbar(f: &mut Frame, app: &mut App, area: Rect) {
             Mode::CrumbMenu(i) => Some(i),
             _ => None,
         };
-        let mut cx = crumb_area.x;
+        let mut crumb_x = crumb_area.x;
         let last = segs.len().saturating_sub(1);
-        for (n, (i, label)) in segs.iter().enumerate() {
+        for (draw_position, seg) in segs.iter().enumerate() {
             // One marker at the head of the trail, then blanks. A separator per
             // hop is three columns each of punctuation the path already implies.
-            let sep = if n == 0 {
-                format!(" {} ", g::CRUMB_SEP)
+            let sep = if draw_position == 0 {
+                format!(" {} ", config::glyph::CRUMB_SEP)
             } else {
                 "  ".to_string()
             };
-            buf.set_string(cx, area.y, &sep, dim);
-            cx += sep.width() as u16;
-            let open = open_seg == Some(*i);
+            buf.set_string(crumb_x, area.y, &sep, dim);
+            crumb_x += sep.width() as u16;
+            let open = open_seg == Some(seg.path_index);
             let st = if open {
                 base.bg(color::SELECTION)
-            } else if n == last {
+            } else if draw_position == last {
                 base.add_modifier(Modifier::BOLD)
             } else {
                 base
             };
-            let w = label.width() as u16;
-            if cx + w > crumb_area.right() {
+            let w = seg.label.width() as u16;
+            if crumb_x + w > crumb_area.right() {
                 break;
             }
-            buf.set_string(cx, area.y, label, st);
-            app.hits
-                .crumbs
-                .push((Rect::new(cx, area.y, w, 1), paths[*i].clone()));
-            cx += w;
-            let arrow = Rect::new(cx, area.y, 1, 1);
-            let (glyph, ast) = if open {
-                (g::DROPDOWN, st)
+            buf.set_string(crumb_x, area.y, &seg.label, st);
+            app.hits.crumbs.push((
+                Rect::new(crumb_x, area.y, w, 1),
+                paths[seg.path_index].clone(),
+            ));
+            crumb_x += w;
+            let arrow = Rect::new(crumb_x, area.y, 1, 1);
+            let (glyph, arrow_style) = if open {
+                (config::glyph::DROPDOWN, st)
             } else {
-                (g::CRUMB_SHUT, dim)
+                (config::glyph::CRUMB_SHUT, dim)
             };
-            buf.set_string(cx, area.y, glyph, ast);
-            app.hits.crumb_arrows.push((arrow, *i));
-            cx += 1;
+            buf.set_string(crumb_x, area.y, glyph, arrow_style);
+            app.hits.crumb_arrows.push((arrow, seg.path_index));
+            crumb_x += 1;
         }
     }
 
     // Right-aligned controls, laid out from the edge inward.
-    let mut rx = area.right();
-    let put_r = |buf: &mut Buffer, s: &str, st: Style, rx: &mut u16| -> Rect {
-        let w = s.width() as u16;
-        *rx = rx.saturating_sub(w);
-        buf.set_string(*rx, area.y, s, st);
-        Rect::new(*rx, area.y, w, 1)
+    let mut right_x = area.right();
+    let put_right = |buf: &mut Buffer, text: &str, style: Style, right_x: &mut u16| -> Rect {
+        let w = text.width() as u16;
+        *right_x = right_x.saturating_sub(w);
+        buf.set_string(*right_x, area.y, text, style);
+        Rect::new(*right_x, area.y, w, 1)
     };
-    put_r(buf, " ", base, &mut rx);
-    app.hits.menu = put_r(buf, g::MENU, sel(5, base), &mut rx);
-    put_r(buf, "   ", base, &mut rx);
-    app.hits.search = put_r(buf, g::SEARCH, sel(4, base), &mut rx);
-    put_r(buf, "   ", base, &mut rx);
-    let split_style = sel(
+    put_right(buf, " ", base, &mut right_x);
+    app.hits.menu = put_right(
+        buf,
+        config::glyph::MENU,
+        focused_style(5, base),
+        &mut right_x,
+    );
+    put_right(buf, "   ", base, &mut right_x);
+    app.hits.search = put_right(
+        buf,
+        config::glyph::SEARCH,
+        focused_style(4, base),
+        &mut right_x,
+    );
+    put_right(buf, "   ", base, &mut right_x);
+    let split_style = focused_style(
         3,
         if app.split_on() {
             base.fg(color::ACCENT)
@@ -231,25 +251,32 @@ fn toolbar(f: &mut Frame, app: &mut App, area: Rect) {
             base
         },
     );
-    app.hits.split = put_r(buf, &format!("{} Split", g::SPLIT), split_style, &mut rx);
+    app.hits.split = put_right(
+        buf,
+        &format!("{} Split", config::glyph::SPLIT),
+        split_style,
+        &mut right_x,
+    );
 
     if let Some(pos) = cursor {
-        f.set_cursor_position(pos);
+        frame.set_cursor_position(pos);
     }
 }
 
 /// Label plus arrow plus the blanks in front: three columns for the leading
 /// ` › `, two for every hop after it.
-fn total_crumb_width(segs: &[(usize, String)]) -> u16 {
+fn total_crumb_width(segs: &[CrumbSeg]) -> u16 {
     segs.iter()
         .enumerate()
-        .map(|(n, (_, s))| s.width() as u16 + 1 + if n == 0 { 3 } else { 2 })
+        .map(|(draw_position, seg)| {
+            seg.label.width() as u16 + 1 + if draw_position == 0 { 3 } else { 2 }
+        })
         .sum()
 }
 
-fn tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
-    paint(f, area, color::PANEL_BG);
-    let buf = f.buffer_mut();
+fn tab_bar(frame: &mut Frame, app: &mut App, area: Rect) {
+    paint(frame, area, color::PANEL_BG);
+    let buf = frame.buffer_mut();
     app.hits.tabs.clear();
     let mut x = area.x;
     for (i, t) in app.tabs.iter().enumerate() {
@@ -276,13 +303,13 @@ fn tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
 // Body
 // ---------------------------------------------------------------------------
 
-fn body(f: &mut Frame, app: &mut App, area: Rect) {
-    let pw = if app.places_visible {
+fn body(frame: &mut Frame, app: &mut App, area: Rect) {
+    let places_width = if app.places_visible {
         config::PLACES_WIDTH
     } else {
         0
     };
-    let iw = if app.info_visible {
+    let info_width = if app.info_visible {
         config::INFO_WIDTH
     } else {
         0
@@ -290,14 +317,14 @@ fn body(f: &mut Frame, app: &mut App, area: Rect) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(pw),
+            Constraint::Length(places_width),
             Constraint::Min(10),
-            Constraint::Length(iw),
+            Constraint::Length(info_width),
         ])
         .split(area);
 
-    if pw > 0 {
-        places_panel(f, app, cols[0]);
+    if places_width > 0 {
+        places_panel(frame, app, cols[0]);
     }
     app.hits.places = cols[0];
 
@@ -308,28 +335,28 @@ fn body(f: &mut Frame, app: &mut App, area: Rect) {
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(cols[1]);
         for i in 0..n {
-            view(f, app, halves[i], i);
+            draw_pane(frame, app, halves[i], i);
         }
         // The divider between the two views.
         let x = halves[1].x.saturating_sub(1);
         for y in cols[1].y..cols[1].bottom() {
-            if let Some(c) = f.buffer_mut().cell_mut((x, y)) {
+            if let Some(c) = frame.buffer_mut().cell_mut((x, y)) {
                 c.set_char('\u{2502}').set_fg(color::SEPARATOR);
             }
         }
     } else {
-        view(f, app, cols[1], 0);
+        draw_pane(frame, app, cols[1], 0);
     }
 
-    if iw > 0 {
-        info_panel(f, app, cols[2]);
+    if info_width > 0 {
+        info_panel(frame, app, cols[2]);
     }
 }
 
-fn places_panel(f: &mut Frame, app: &mut App, area: Rect) {
-    paint(f, area, color::PANEL_BG);
+fn places_panel(frame: &mut Frame, app: &mut App, area: Rect) {
+    paint(frame, area, color::PANEL_BG);
     let focused = app.focus == Focus::Places;
-    let buf = f.buffer_mut();
+    let buf = frame.buffer_mut();
     // No splitter rule: PANEL_BG against the view's white already reads as an
     // edge, and a drawn line only competes with it. Full width is ours.
     let w = area.width;
@@ -357,7 +384,7 @@ fn places_panel(f: &mut Frame, app: &mut App, area: Rect) {
                 eject,
                 ..
             } => {
-                let selected = i == app.places_sel;
+                let selected = i == app.places_cursor;
                 let bg = if selected {
                     color::SELECTION
                 } else {
@@ -370,9 +397,10 @@ fn places_panel(f: &mut Frame, app: &mut App, area: Rect) {
                     }
                 }
                 // Devices carry a free-space gauge behind the label.
-                if let Some((used, total)) = gauge {
-                    if *total > 0 {
-                        let filled = ((*used as f64 / *total as f64) * w as f64) as u16;
+                if let Some(usage) = gauge {
+                    if usage.total_bytes > 0 {
+                        let filled = ((usage.used_bytes as f64 / usage.total_bytes as f64)
+                            * w as f64) as u16;
                         for x in area.x..area.x + filled.min(w) {
                             if let Some(c) = buf.cell_mut((x, y)) {
                                 c.set_bg(if selected {
@@ -398,7 +426,7 @@ fn places_panel(f: &mut Frame, app: &mut App, area: Rect) {
                 // The eject affordance sits at the right edge, so the label
                 // has to give up its columns before it is clipped, not after.
                 let ew = if *eject {
-                    g::EJECT.width().max(1) as u16 + 1
+                    config::glyph::EJECT.width().max(1) as u16 + 1
                 } else {
                     0
                 };
@@ -412,7 +440,7 @@ fn places_panel(f: &mut Frame, app: &mut App, area: Rect) {
                     buf.set_string(
                         area.x + w.saturating_sub(ew),
                         y,
-                        g::EJECT,
+                        config::glyph::EJECT,
                         Style::default().fg(color::DIM),
                     );
                 }
@@ -435,25 +463,25 @@ fn places_panel(f: &mut Frame, app: &mut App, area: Rect) {
 // File views
 // ---------------------------------------------------------------------------
 
-fn view(f: &mut Frame, app: &mut App, area: Rect, idx: usize) {
-    let is_active = idx == app.tab().active && app.focus == Focus::View;
-    paint(f, area, color::VIEW_BG);
+fn draw_pane(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
+    let is_active = pane_index == app.tab().active && app.focus == Focus::View;
+    paint(frame, area, color::VIEW_BG);
     {
-        let p = app.pane_at_mut(idx);
+        let p = app.pane_at_mut(pane_index);
         p.area = area;
     }
 
-    let mode = app.pane_at(idx).view;
+    let mode = app.pane_at(pane_index).view;
     match mode {
-        ViewMode::Icons => icons_view(f, app, area, idx, is_active),
-        ViewMode::Compact => compact_view(f, app, area, idx, is_active),
-        ViewMode::Details => details_view(f, app, area, idx, is_active),
+        ViewMode::Icons => draw_icons_view(frame, app, area, pane_index, is_active),
+        ViewMode::Compact => draw_compact_view(frame, app, area, pane_index, is_active),
+        ViewMode::Details => draw_details_view(frame, app, area, pane_index, is_active),
     }
 
-    let p = app.pane_at(idx);
+    let p = app.pane_at(pane_index);
     if p.loading && p.entries.is_empty() {
         centred(
-            f.buffer_mut(),
+            frame.buffer_mut(),
             area,
             "Loading…",
             Style::default().fg(color::DIM).bg(color::VIEW_BG),
@@ -461,7 +489,7 @@ fn view(f: &mut Frame, app: &mut App, area: Rect, idx: usize) {
     } else if let Some(e) = &p.error {
         let msg = e.clone();
         centred(
-            f.buffer_mut(),
+            frame.buffer_mut(),
             area,
             &msg,
             Style::default().fg(color::ERROR).bg(color::VIEW_BG),
@@ -473,7 +501,7 @@ fn view(f: &mut Frame, app: &mut App, area: Rect, idx: usize) {
             "No items match the filter."
         };
         centred(
-            f.buffer_mut(),
+            frame.buffer_mut(),
             area,
             msg,
             Style::default().fg(color::DIM).bg(color::VIEW_BG),
@@ -481,10 +509,10 @@ fn view(f: &mut Frame, app: &mut App, area: Rect, idx: usize) {
     }
 }
 
-fn entry_style(p: &Pane, vis: usize, cut: bool) -> Style {
-    let e = &p.entries[p.visible[vis]];
-    let selected = p.selected.contains(&e.path);
-    let fg = if cut {
+fn entry_style(pane: &Pane, visible_index: usize, is_cut: bool) -> Style {
+    let e = &pane.entries[pane.visible[visible_index]];
+    let selected = pane.selected.contains(&e.path);
+    let fg = if is_cut {
         color::CUT
     } else if e.is_locked() {
         color::OFFLINE
@@ -510,13 +538,13 @@ fn entry_style(p: &Pane, vis: usize, cut: bool) -> Style {
 /// Dolphin's wheel scrolls the view and leaves the selection alone, even off
 /// screen, so the renderer must not drag the viewport back on the next frame.
 /// A view change is in the key, since it reorients the axis the cursor sits on.
-fn reveal(p: &mut Pane, line: usize, visible: usize) {
-    let state = (p.cursor, p.view);
-    if p.last_reveal == state {
+fn reveal_cursor(pane: &mut Pane, cursor_line: usize, visible_lines: usize) {
+    let state = (pane.cursor, pane.view);
+    if pane.last_reveal == state {
         return;
     }
-    p.last_reveal = state;
-    scroll_to(&mut p.offset, line, visible);
+    pane.last_reveal = state;
+    scroll_to(&mut pane.offset, cursor_line, visible_lines);
 }
 
 /// Scroll so `cursor` is on screen, in units of whichever axis scrolls.
@@ -534,37 +562,52 @@ fn scroll_to(offset: &mut usize, cursor_line: usize, visible_lines: usize) {
 /// columns. The cursor frame is drawn in that margin, so it costs no row of
 /// content and no two names can touch. Its bottom edge lands on the blank row
 /// the cell below starts with, which is why the grid keeps one row spare.
-pub fn icon_grid(area: Rect) -> (u16, u16, u16) {
-    let (cw, ch) = (config::CELL_W, config::CELL_H);
-    let cols = (area.width.saturating_sub(2) / cw).max(1);
-    let rows = (area.height.saturating_sub(1) / ch).max(1);
-    // Columns never divide the pane evenly. The remainder becomes margin, split
-    // between the two sides, so the grid stays centred as the pane is resized.
-    (cols, rows, area.width.saturating_sub(cols * cw) / 2)
+pub struct IconGrid {
+    pub cols: u16,
+    pub rows: u16,
+    /// Left margin that centres the grid in the pane.
+    pub margin_x: u16,
 }
 
-fn icons_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool) {
-    let (cw, ch) = (config::CELL_W, config::CELL_H);
-    let (cols, rows, mx) = icon_grid(area);
+pub fn icon_grid(area: Rect) -> IconGrid {
+    let (cell_width, cell_height) = (config::CELL_WIDTH, config::CELL_HEIGHT);
+    let cols = (area.width.saturating_sub(2) / cell_width).max(1);
+    let rows = (area.height.saturating_sub(1) / cell_height).max(1);
+    // Columns never divide the pane evenly. The remainder becomes margin, split
+    // between the two sides, so the grid stays centred as the pane is resized.
+    IconGrid {
+        cols,
+        rows,
+        margin_x: area.width.saturating_sub(cols * cell_width) / 2,
+    }
+}
+
+fn draw_icons_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool) {
+    let (cell_width, cell_height) = (config::CELL_WIDTH, config::CELL_HEIGHT);
+    let IconGrid {
+        cols,
+        rows,
+        margin_x,
+    } = icon_grid(area);
     let cut = app.clipboard.cut;
     let cut_set = app.clipboard.paths.clone();
     {
         let p = app.pane_at_mut(idx);
         p.grid_cols = cols;
         p.grid_rows = rows;
-        p.cell_w = cw;
-        p.cell_h = ch;
-        p.grid_x = area.x + mx;
+        p.cell_width = cell_width;
+        p.cell_height = cell_height;
+        p.grid_x = area.x + margin_x;
         let cur_row = p.cursor / cols as usize;
-        reveal(p, cur_row, rows as usize);
+        reveal_cursor(p, cur_row, rows as usize);
     }
     let p_len = app.pane_at(idx).visible.len();
     let offset = app.pane_at(idx).offset;
     let first = offset * cols as usize;
 
-    let gap = config::CELL_GAP.min(cw.saturating_sub(3));
-    let tile_w = cw - gap;
-    let body_h = ch - 1;
+    let gap = config::CELL_GAP.min(cell_width.saturating_sub(3));
+    let tile_w = cell_width - gap;
+    let body_h = cell_height - 1;
     // The name always gets its rows; the icon takes what is left.
     let name_lines = config::NAME_LINES.clamp(1, body_h.saturating_sub(1).max(1));
     let icon_h = body_h.saturating_sub(name_lines);
@@ -575,13 +618,13 @@ fn icons_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool
             break;
         }
         let (r, c) = (slot / cols as usize, slot % cols as usize);
-        let x0 = area.x + mx + c as u16 * cw;
-        let y0 = area.y + r as u16 * ch;
+        let x0 = area.x + margin_x + c as u16 * cell_width;
+        let y0 = area.y + r as u16 * cell_height;
         let cell = Rect::new(
             x0,
             y0,
-            cw.min(area.right().saturating_sub(x0)),
-            ch.min(area.bottom().saturating_sub(y0)),
+            cell_width.min(area.right().saturating_sub(x0)),
+            cell_height.min(area.bottom().saturating_sub(y0)),
         );
         if cell.width == 0 || cell.height == 0 {
             continue;
@@ -595,7 +638,7 @@ fn icons_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool
 
         // Selection fill covers the whole cell.
         if st.bg == Some(color::SELECTION) {
-            fill(f.buffer_mut(), cell, color::SELECTION);
+            fill(frame.buffer_mut(), cell, color::SELECTION);
         }
 
         // Thumbnail, or the glyph stand-in while one is being decoded.
@@ -609,10 +652,10 @@ fn icons_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool
         let drew = e.is_image()
             && thumb_area.width > 1
             && thumb_area.height > 0
-            && thumb(f, &mut app.thumbs, thumb_area, &e.path);
+            && try_draw_thumbnail(frame, &mut app.thumbs, thumb_area, &e.path);
         if !drew {
             centred(
-                f.buffer_mut(),
+                frame.buffer_mut(),
                 thumb_area,
                 e.glyph(),
                 st.fg(icon_color(&e, is_cut)),
@@ -627,7 +670,7 @@ fn icons_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool
                 break;
             }
             let x = body.x + body.width.saturating_sub(part.width() as u16) / 2;
-            f.buffer_mut().set_string(x, y, part, st);
+            frame.buffer_mut().set_string(x, y, part, st);
         }
 
         if vis == app.pane_at(idx).cursor {
@@ -638,7 +681,7 @@ fn icons_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool
             let used = (name.len() as u16).max(1);
             let h = (icon_h + used + 2).min(area.bottom().saturating_sub(y0));
             outline(
-                f.buffer_mut(),
+                frame.buffer_mut(),
                 Rect::new(cell.x, cell.y, cell.width, h),
                 active,
             );
@@ -646,7 +689,7 @@ fn icons_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool
     }
 }
 
-fn compact_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool) {
+fn draw_compact_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool) {
     let rows = area.height.max(1);
     let cut = app.clipboard.cut;
     let cut_set = app.clipboard.paths.clone();
@@ -657,7 +700,7 @@ fn compact_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
     {
         let p = app.pane_at_mut(idx);
         p.grid_rows = rows;
-        p.cell_h = 1;
+        p.cell_height = 1;
         // Compact flows down columns, so the scroll axis is columns.
         let cur_col = p.cursor / rows as usize;
         if p.last_reveal != (p.cursor, p.view) {
@@ -682,8 +725,8 @@ fn compact_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
     {
         let p = app.pane_at_mut(idx);
         p.grid_cols = shown.len().max(1) as u16;
-        p.cell_w = shown.first().copied().unwrap_or(1);
-        p.col_w = shown.clone();
+        p.cell_width = shown.first().copied().unwrap_or(1);
+        p.column_widths = shown.clone();
         p.grid_x = area.x + config::VIEW_MARGIN;
     }
 
@@ -707,14 +750,15 @@ fn compact_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
             let w = (*cw).min(area.right() - x);
             let cell = Rect::new(x, y, w, 1);
             if st.bg == Some(color::SELECTION) {
-                fill(f.buffer_mut(), cell, color::SELECTION);
+                fill(frame.buffer_mut(), cell, color::SELECTION);
             }
             let text = format!("{} {}", e.glyph(), e.name);
-            f.buffer_mut()
+            frame
+                .buffer_mut()
                 .set_string(x, y, clip(&text, w.saturating_sub(1) as usize), st);
             if vis == app.pane_at(idx).cursor {
                 let icon = icon_cell(x, y, e.glyph());
-                cursor_block(f.buffer_mut(), icon, cell, active);
+                cursor_block(frame.buffer_mut(), icon, cell, active);
             }
         }
         x += cw;
@@ -729,7 +773,7 @@ fn compact_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
 fn compact_widths(p: &crate::app::Pane, rows: u16, avail: u16) -> Vec<u16> {
     let mut out = Vec::new();
     for col in p.visible.chunks(rows as usize) {
-        let text = col
+        let max_item_width = col
             .iter()
             .map(|&i| {
                 let e = &p.entries[i];
@@ -738,7 +782,7 @@ fn compact_widths(p: &crate::app::Pane, rows: u16, avail: u16) -> Vec<u16> {
             .max()
             .unwrap_or(1);
         // One trailing blank keeps neighbouring columns from touching.
-        out.push(((text + 1) as u16).min(avail.max(1)));
+        out.push(((max_item_width + 1) as u16).min(avail.max(1)));
     }
     out
 }
@@ -763,14 +807,88 @@ fn scroll_columns(offset: &mut usize, col: usize, widths: &[u16], avail: u16) {
     }
 }
 
-/// Column widths for Details. Name flexes; the rest are fixed like Dolphin's.
-fn detail_columns(width: u16) -> [u16; 4] {
-    let (size, modified, kind) = (12u16, 17u16, 14u16);
-    let name = width.saturating_sub(size + modified + kind + 3).max(8);
-    [name, size, modified, kind]
+/// One Details column: where it sits and how its text is placed in it.
+///
+/// Header, click target and cell are all drawn from this one value. The
+/// alternative — widths here, x positions worked out again at each draw site —
+/// is what let the headings drift off their own data.
+#[derive(Clone, Copy)]
+struct Col {
+    x: u16,
+    width: u16,
+    /// Numeric columns right-align, and their heading right-aligns with them.
+    right_aligned: bool,
 }
 
-fn details_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool) {
+impl Col {
+    fn draw_text(self, buf: &mut Buffer, y: u16, s: &str, st: Style) {
+        let s = clip(s, self.width as usize);
+        let x = if self.right_aligned {
+            self.x + self.width - s.width() as u16
+        } else {
+            self.x
+        };
+        buf.set_string(x, y, s, st);
+    }
+}
+
+/// Blank columns between one column and the next.
+const DETAIL_GAP: u16 = 1;
+
+/// What a rendered year costs: a space and four digits.
+const YEAR_W: u16 = 5;
+
+/// What the Modified column needs for this listing. `Short` prints the year
+/// only outside the current one, so a directory touched entirely this year
+/// wants `YEAR_W` fewer columns — and handing them to Name instead is what
+/// Compact already does with its own widths. The year is the only part that
+/// varies in width, so this scans integers rather than formatted strings.
+fn time_width(p: &crate::app::Pane) -> u16 {
+    let this_year = fs::year_of(fs::now_epoch());
+    let dated = |e: &fs::Entry| fs::year_of(e.mtime) != this_year;
+    if config::TIME_STYLE == fs::TimeStyle::Iso || p.entries.iter().any(dated) {
+        config::TIME_WIDTH
+    } else {
+        config::TIME_WIDTH - YEAR_W
+    }
+}
+
+/// Column geometry for Details. Name flexes; the rest are fixed like Dolphin's.
+/// The row's left margin is the first column's offset, not something every
+/// caller remembers to add.
+///
+/// `modified_width` is passed rather than taken from config because the width a
+/// timestamp needs depends on the listing — see `time_width`.
+fn detail_columns(area: Rect, modified_width: u16) -> [Col; 4] {
+    let (size, kind) = (config::SIZE_WIDTH, config::TYPE_WIDTH);
+    let name = area
+        .width
+        .saturating_sub(config::VIEW_MARGIN + size + modified_width + kind + 3 * DETAIL_GAP)
+        .max(8);
+
+    let mut cols = [Col {
+        x: 0,
+        width: 0,
+        right_aligned: false,
+    }; 4];
+    let mut x = area.x + config::VIEW_MARGIN;
+    for (col, (width, right_aligned)) in cols.iter_mut().zip([
+        (name, false),
+        (size, true),
+        (modified_width, true),
+        (kind, false),
+    ]) {
+        *col = Col {
+            x,
+            width,
+            right_aligned,
+        };
+        x += width + DETAIL_GAP;
+    }
+    cols
+}
+
+fn draw_details_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool) {
     // One item per row, always: Details is Dolphin's list, not a grid.
     let head = area.y;
     let list = Rect::new(
@@ -780,7 +898,7 @@ fn details_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
         area.height.saturating_sub(1),
     );
     let rows = list.height.max(1);
-    let cols = detail_columns(area.width);
+    let cols = detail_columns(area, time_width(app.pane_at(idx)));
     let sort = app.pane_at(idx).sort;
     let cut = app.clipboard.cut;
     let cut_set = app.clipboard.paths.clone();
@@ -789,38 +907,44 @@ fn details_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
         let p = app.pane_at_mut(idx);
         p.grid_cols = 1;
         p.grid_rows = rows;
-        p.cell_w = area.width;
-        p.cell_h = 1;
-        reveal(p, p.cursor, rows as usize);
+        p.cell_width = area.width;
+        p.cell_height = 1;
+        reveal_cursor(p, p.cursor, rows as usize);
     }
 
     // Header, clickable, with the sort arrow on the active column.
     let hst = Style::default().bg(color::TOOLBAR_BG).fg(color::DIM);
     fill(
-        f.buffer_mut(),
+        frame.buffer_mut(),
         Rect::new(area.x, head, area.width, 1),
         color::TOOLBAR_BG,
     );
     app.hits.headers.clear();
     let keys = [SortKey::Name, SortKey::Size, SortKey::Date, SortKey::Type];
+    // A click anywhere up to the next column sorts by this one: the gaps belong
+    // to the column on their left, so no cell of the header row is dead.
     let mut hx = area.x;
-    for (i, key) in keys.iter().enumerate() {
-        let arrow = if sort.key == *key {
+    for (col, key) in cols.iter().zip(keys) {
+        let arrow = if sort.key == key {
             if sort.reverse {
-                g::SORT_DESC
+                config::glyph::SORT_DESC
             } else {
-                g::SORT_ASC
+                config::glyph::SORT_ASC
             }
         } else {
             " "
         };
-        let label = format!("{}{}", key.label(), arrow);
-        f.buffer_mut()
-            .set_string(hx + 1, head, clip(&label, cols[i] as usize), hst);
+        col.draw_text(
+            frame.buffer_mut(),
+            head,
+            &format!("{}{}", key.label(), arrow),
+            hst,
+        );
+        let end = col.x + col.width;
         app.hits
             .headers
-            .push((Rect::new(hx, head, cols[i], 1), *key));
-        hx += cols[i] + 1;
+            .push((Rect::new(hx, head, end - hx, 1), key));
+        hx = end;
     }
 
     let p_len = app.pane_at(idx).visible.len();
@@ -842,16 +966,16 @@ fn details_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
         let st = entry_style(app.pane_at(idx), vis, is_cut);
         let row = Rect::new(area.x, y, area.width, 1);
         if st.bg == Some(color::SELECTION) {
-            fill(f.buffer_mut(), row, color::SELECTION);
+            fill(frame.buffer_mut(), row, color::SELECTION);
         }
 
         // Expandable-folder arrow plus indent, Dolphin's tree column.
         let indent = e.depth * 2;
         let arrow = if e.is_dir() {
             if e.expanded {
-                g::EXPAND_OPEN
+                config::glyph::EXPAND_OPEN
             } else {
-                g::EXPAND_CLOSED
+                config::glyph::EXPAND_CLOSED
             }
         } else {
             " "
@@ -863,31 +987,15 @@ fn details_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
             e.glyph(),
             e.name
         );
-        let mut x = area.x;
-        f.buffer_mut().set_string(
-            x + config::VIEW_MARGIN,
-            y,
-            clip(&name, cols[0] as usize),
-            st,
-        );
-        x += cols[0] + 1;
-        f.buffer_mut().set_string(
-            x,
-            y,
-            right(&fs::format_entry_size(&e), cols[1] as usize),
-            st,
-        );
-        x += cols[1] + 1;
-        f.buffer_mut()
-            .set_string(x, y, clip(&fs::format_time(e.mtime), cols[2] as usize), st);
-        x += cols[2] + 1;
-        f.buffer_mut()
-            .set_string(x, y, clip(&e.type_name(), cols[3] as usize), st);
+        cols[0].draw_text(frame.buffer_mut(), y, &name, st);
+        cols[1].draw_text(frame.buffer_mut(), y, &fs::format_entry_size(&e), st);
+        cols[2].draw_text(frame.buffer_mut(), y, &fs::format_time(e.mtime), st);
+        cols[3].draw_text(frame.buffer_mut(), y, &e.type_name(), st);
 
         if vis == app.pane_at(idx).cursor {
             // The tree column pushes the icon right: indent, arrow, one blank.
-            let ix = area.x + config::VIEW_MARGIN + indent + arrow.width().max(1) as u16 + 1;
-            cursor_block(f.buffer_mut(), icon_cell(ix, y, e.glyph()), row, active);
+            let ix = cols[0].x + indent + arrow.width().max(1) as u16 + 1;
+            cursor_block(frame.buffer_mut(), icon_cell(ix, y, e.glyph()), row, active);
         }
     }
 }
@@ -896,15 +1004,15 @@ fn details_view(f: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bo
 // Information panel (F11)
 // ---------------------------------------------------------------------------
 
-fn info_panel(f: &mut Frame, app: &mut App, area: Rect) {
-    paint(f, area, color::PANEL_BG);
+fn info_panel(frame: &mut Frame, app: &mut App, area: Rect) {
+    paint(frame, area, color::PANEL_BG);
     let Some(e) = app.pane().current().cloned() else {
         return;
     };
     let preview = Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), 10);
-    if !(e.is_image() && thumb(f, &mut app.thumbs, preview, &e.path)) {
+    if !(e.is_image() && try_draw_thumbnail(frame, &mut app.thumbs, preview, &e.path)) {
         centred(
-            f.buffer_mut(),
+            frame.buffer_mut(),
             preview,
             e.glyph(),
             Style::default()
@@ -916,30 +1024,41 @@ fn info_panel(f: &mut Frame, app: &mut App, area: Rect) {
     let dim = st.fg(color::DIM);
     let mut y = preview.bottom() + 1;
     let w = area.width.saturating_sub(2) as usize;
-    let line = |f: &mut Frame, s: String, style: Style, y: &mut u16| {
+    let draw_info_line = |frame: &mut Frame, s: String, style: Style, y: &mut u16| {
         if *y < area.bottom() {
-            f.buffer_mut()
+            frame
+                .buffer_mut()
                 .set_string(area.x + 1, *y, clip(&s, w), style);
             *y += 1;
         }
     };
-    line(f, e.name.clone(), st.add_modifier(Modifier::BOLD), &mut y);
+    draw_info_line(
+        frame,
+        e.name.clone(),
+        st.add_modifier(Modifier::BOLD),
+        &mut y,
+    );
     y += 1;
-    line(f, format!("Type      {}", e.type_name()), dim, &mut y);
-    line(
-        f,
+    draw_info_line(frame, format!("Type      {}", e.type_name()), dim, &mut y);
+    draw_info_line(
+        frame,
         format!("Size      {}", fs::format_entry_size(&e)),
         dim,
         &mut y,
     );
-    line(
-        f,
+    draw_info_line(
+        frame,
         format!("Modified  {}", fs::format_time(e.mtime)),
         dim,
         &mut y,
     );
-    line(f, format!("Perms     {}", perms(e.mode)), dim, &mut y);
-    line(f, format!("Path      {}", e.path.display()), dim, &mut y);
+    draw_info_line(frame, format!("Perms     {}", perms(e.mode)), dim, &mut y);
+    draw_info_line(
+        frame,
+        format!("Path      {}", e.path.display()),
+        dim,
+        &mut y,
+    );
 }
 
 fn perms(mode: u32) -> String {
@@ -962,8 +1081,8 @@ fn perms(mode: u32) -> String {
 // Filter bar and status bar
 // ---------------------------------------------------------------------------
 
-fn filter_bar(f: &mut Frame, app: &mut App, area: Rect) {
-    fill(f.buffer_mut(), area, color::TOOLBAR_BG);
+fn filter_bar(frame: &mut Frame, app: &mut App, area: Rect) {
+    fill(frame.buffer_mut(), area, color::TOOLBAR_BG);
     let st = Style::default().bg(color::TOOLBAR_BG).fg(color::TEXT);
     let shown = if app.mode == Mode::Filter {
         &app.input
@@ -971,29 +1090,31 @@ fn filter_bar(f: &mut Frame, app: &mut App, area: Rect) {
         &app.pane().filter
     };
     let label = format!(" Filter: {shown}");
-    f.buffer_mut()
+    frame
+        .buffer_mut()
         .set_string(area.x, area.y, clip(&label, area.width as usize), st);
     if app.mode == Mode::Filter {
-        f.set_cursor_position((area.x + 9 + app.input_cursor as u16, area.y));
+        frame.set_cursor_position((area.x + 9 + app.input_cursor as u16, area.y));
     }
 }
 
-fn status_bar(f: &mut Frame, app: &mut App, area: Rect) {
+fn status_bar(frame: &mut Frame, app: &mut App, area: Rect) {
     // On a one-row terminal the layout hands us a zero-height rect whose `y` is
     // already past the buffer. Nothing here may touch it.
     if area.height == 0 || area.width == 0 {
         return;
     }
-    fill(f.buffer_mut(), area, color::TOOLBAR_BG);
+    fill(frame.buffer_mut(), area, color::TOOLBAR_BG);
     let st = Style::default().bg(color::TOOLBAR_BG).fg(color::TEXT);
 
     // Command and search lines take over the status bar, as in vim.
     if matches!(app.mode, Mode::Command | Mode::Search) {
         let prefix = if app.mode == Mode::Command { ':' } else { '/' };
         let text = format!("{prefix}{}", app.input);
-        f.buffer_mut()
+        frame
+            .buffer_mut()
             .set_string(area.x, area.y, clip(&text, area.width as usize), st);
-        f.set_cursor_position((area.x + 1 + app.input_cursor as u16, area.y));
+        frame.set_cursor_position((area.x + 1 + app.input_cursor as u16, area.y));
         return;
     }
     if let Mode::Rename(_) | Mode::BatchRename | Mode::NewFolder | Mode::NewFile = app.mode {
@@ -1004,13 +1125,13 @@ fn status_bar(f: &mut Frame, app: &mut App, area: Rect) {
             _ => "New file:",
         };
         let text = format!(" {label} {}", app.input);
-        f.buffer_mut().set_string(
+        frame.buffer_mut().set_string(
             area.x,
             area.y,
             clip(&text, area.width as usize),
             st.fg(color::ACCENT),
         );
-        f.set_cursor_position((
+        frame.set_cursor_position((
             area.x + 2 + label.width() as u16 + app.input_cursor as u16,
             area.y,
         ));
@@ -1022,7 +1143,7 @@ fn status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // be able to hide which mode owns the keyboard.
     let tag = format!(" -- {} --  ", app.mode.name());
     let tw = (tag.width() as u16).min(area.width);
-    f.buffer_mut().set_string(
+    frame.buffer_mut().set_string(
         area.x,
         area.y,
         clip(&tag, area.width as usize),
@@ -1033,16 +1154,18 @@ fn status_bar(f: &mut Frame, app: &mut App, area: Rect) {
         app.status.clone()
     } else {
         let p = app.pane();
-        let (d, fi, bytes) = p.counts();
+        let counts = p.counts();
         let mut s = format!(
-            "{d} folder{}, {fi} file{} ({})",
-            plural(d),
-            plural(fi),
-            fs::format_size(bytes)
+            "{} folder{}, {} file{} ({})",
+            counts.dirs,
+            plural(counts.dirs),
+            counts.files,
+            plural(counts.files),
+            fs::format_size(counts.bytes)
         );
-        let sel = p.selected.len();
-        if sel > 0 {
-            s.push_str(&format!("   —   {sel} selected"));
+        let selected_count = p.selected.len();
+        if selected_count > 0 {
+            s.push_str(&format!("   —   {selected_count} selected"));
         }
         s
     };
@@ -1051,7 +1174,7 @@ fn status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         st
     };
-    f.buffer_mut().set_string(
+    frame.buffer_mut().set_string(
         area.x + tw,
         area.y,
         clip(&left, area.width.saturating_sub(tw) as usize),
@@ -1060,10 +1183,10 @@ fn status_bar(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Right side: free space, where stock Dolphin puts it.
     let free = match app.disk_space() {
-        Some((avail, total)) => format!(
+        Some(space) => format!(
             "  {} free of {}",
-            fs::format_size(avail),
-            fs::format_size(total)
+            fs::format_size(space.available_bytes),
+            fs::format_size(space.total_bytes)
         ),
         None => String::new(),
     };
@@ -1071,7 +1194,8 @@ fn status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let rw = right_text.width() as u16;
     if rw < area.width {
         let x = area.right() - rw;
-        f.buffer_mut()
+        frame
+            .buffer_mut()
             .set_string(x, area.y, &right_text, st.fg(color::DIM));
     }
 }
@@ -1088,25 +1212,34 @@ fn plural(n: usize) -> &'static str {
 // Overlays
 // ---------------------------------------------------------------------------
 
-fn overlays(f: &mut Frame, app: &mut App, area: Rect) {
-    if let Some(pr) = &app.progress {
-        let r = centre_rect(area, 60, 6);
-        let frac = pr.fraction();
-        let cur = pr.current.lock().map(|g| g.clone()).unwrap_or_default();
+fn overlays(frame: &mut Frame, app: &mut App, area: Rect) {
+    if let Some(transfer_progress) = &app.transfer_progress {
+        let r = centre_rect(area, config::PROGRESS_POPUP_W, config::PROGRESS_POPUP_H);
+        let fraction = transfer_progress.fraction();
+        let current_file = transfer_progress
+            .current_file
+            .lock()
+            .map(|current_file_guard| current_file_guard.clone())
+            .unwrap_or_default();
         let body = vec![
-            Line::from(pr.label.clone()),
-            Line::from(Span::styled(cur, Style::default().fg(color::DIM))),
-            Line::from(bar(frac, 56)),
+            Line::from(transfer_progress.label.clone()),
+            Line::from(Span::styled(current_file, Style::default().fg(color::DIM))),
+            Line::from(progress_bar(fraction, config::PROGRESS_BAR_WIDTH)),
             Line::from(Span::styled("Esc cancel", Style::default().fg(color::DIM))),
         ];
-        popup(f, r, "Progress", body);
+        popup(frame, r, "Progress", body);
         return;
     }
 
     match app.mode.clone() {
         Mode::Menu(kind) => {
             let items = vim::menu_items(&kind);
-            let w = items.iter().map(|(s, _)| s.width()).max().unwrap_or(20) as u16 + 4;
+            let w = items
+                .iter()
+                .map(|item| item.label.width())
+                .max()
+                .unwrap_or(20) as u16
+                + 4;
             let h = items.len() as u16 + 2;
             let anchor = match kind {
                 MenuKind::ViewMode => app.hits.view_menu,
@@ -1118,16 +1251,19 @@ fn overlays(f: &mut Frame, app: &mut App, area: Rect) {
             let r = Rect::new(x, area.y + 1, w, h.min(area.height.saturating_sub(1)));
             app.hits.menu_popup = inner_of(r);
             menu_popup(
-                f,
+                frame,
                 r,
-                app.menu_sel,
-                &items.iter().map(|(s, _)| s.to_string()).collect::<Vec<_>>(),
+                app.menu_cursor,
+                &items
+                    .iter()
+                    .map(|item| item.label.to_string())
+                    .collect::<Vec<_>>(),
             );
         }
-        Mode::CrumbMenu(seg) => {
-            let items: Vec<String> = vim::crumb_siblings(app, seg)
+        Mode::CrumbMenu(segment_index) => {
+            let items: Vec<String> = vim::crumb_siblings(app, segment_index)
                 .iter()
-                .map(|p| format!("{} {}", g::FOLDER, crate::ops::name(p)))
+                .map(|p| format!("{} {}", config::glyph::FOLDER, crate::ops::file_name_of(p)))
                 .collect();
             if items.is_empty() {
                 return;
@@ -1138,12 +1274,12 @@ fn overlays(f: &mut Frame, app: &mut App, area: Rect) {
                 .hits
                 .crumb_arrows
                 .iter()
-                .find(|(_, i)| *i == seg)
+                .find(|(_, i)| *i == segment_index)
                 .map(|(r, _)| r.x)
                 .unwrap_or(area.x);
             let r = Rect::new(x.min(area.right().saturating_sub(w)), area.y + 1, w, h);
             app.hits.menu_popup = inner_of(r);
-            menu_popup(f, r, app.menu_sel, &items);
+            menu_popup(frame, r, app.menu_cursor, &items);
         }
         Mode::Confirm(c) => {
             let (title, text) = match &c {
@@ -1168,7 +1304,7 @@ fn overlays(f: &mut Frame, app: &mut App, area: Rect) {
             };
             let r = centre_rect(area, 60, 5);
             popup(
-                f,
+                frame,
                 r,
                 title,
                 vec![
@@ -1192,29 +1328,29 @@ fn overlays(f: &mut Frame, app: &mut App, area: Rect) {
                     Style::default().add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
-                kv("Type", &e.type_name()),
-                kv("Size", &fs::format_entry_size(&e)),
-                kv("Modified", &fs::format_time(e.mtime)),
-                kv("Permissions", &perms(e.mode)),
-                kv(
+                labelled_row("Type", &e.type_name()),
+                labelled_row("Size", &fs::format_entry_size(&e)),
+                labelled_row("Modified", &fs::format_time(e.mtime)),
+                labelled_row("Permissions", &perms(e.mode)),
+                labelled_row(
                     "Location",
                     &e.path
                         .parent()
                         .map(|p| p.display().to_string())
                         .unwrap_or_default(),
                 ),
-                kv("Full path", &e.path.display().to_string()),
+                labelled_row("Full path", &e.path.display().to_string()),
                 Line::from(""),
                 Line::from(Span::styled(
                     "any key to close",
                     Style::default().fg(color::DIM),
                 )),
             ];
-            popup(f, r, "Properties", body);
+            popup(frame, r, "Properties", body);
         }
         Mode::Help => {
             let r = centre_rect(area, 76, area.height.saturating_sub(4).min(30));
-            popup(f, r, "Dolvim — keys", help_lines());
+            popup(frame, r, "Dolvim — keys", help_lines());
         }
         _ => {}
     }
@@ -1224,9 +1360,9 @@ fn overlays(f: &mut Frame, app: &mut App, area: Rect) {
         if d.started {
             let label = format!(" {} item{} ", d.paths.len(), plural(d.paths.len()));
             let w = label.width() as u16;
-            let x = (d.position.0 + 1).min(area.right().saturating_sub(w));
-            let y = (d.position.1 + 1).min(area.bottom().saturating_sub(1));
-            f.buffer_mut().set_string(
+            let x = (d.position.x + 1).min(area.right().saturating_sub(w));
+            let y = (d.position.y + 1).min(area.bottom().saturating_sub(1));
+            frame.buffer_mut().set_string(
                 x,
                 y,
                 &label,
@@ -1236,15 +1372,15 @@ fn overlays(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-fn kv(k: &str, v: &str) -> Line<'static> {
+fn labelled_row(label: &str, value: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{k:<13}"), Style::default().fg(color::DIM)),
-        Span::raw(v.to_string()),
+        Span::styled(format!("{label:<13}"), Style::default().fg(color::DIM)),
+        Span::raw(value.to_string()),
     ])
 }
 
 fn help_lines() -> Vec<Line<'static>> {
-    let sect = |s: &str| {
+    let section_heading = |s: &str| {
         Line::from(Span::styled(
             s.to_string(),
             Style::default()
@@ -1252,60 +1388,60 @@ fn help_lines() -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         ))
     };
-    let row = |k: &str, d: &str| {
+    let key_row = |keys: &str, description: &str| {
         Line::from(vec![
-            Span::styled(format!("  {k:<22}"), Style::default().fg(color::TEXT)),
-            Span::styled(d.to_string(), Style::default().fg(color::DIM)),
+            Span::styled(format!("  {keys:<22}"), Style::default().fg(color::TEXT)),
+            Span::styled(description.to_string(), Style::default().fg(color::DIM)),
         ])
     };
     vec![
-        sect("Motion"),
-        row("h j k l", "left / down / up / right (grid-aware)"),
-        row("gg  G  5j  0  $", "top, bottom, counts, row start/end"),
-        row("Ctrl+d / Ctrl+u", "half page"),
-        row("Enter / l", "open        Backspace / h  up"),
-        row("Alt+← / Alt+→", "back / forward in history"),
-        sect("Selection"),
-        row("Space  v  V", "toggle, visual, visual by row"),
-        row("Ctrl+A  Ctrl+Shift+A", "select all / invert"),
-        sect("Files"),
-        row("x  5x", "trash the item / n items"),
-        row("dd  3dd  dj  dk  dG", "trash: this, n, or to a motion"),
-        row("y  Ctrl+X  p", "copy, cut, paste"),
-        row("r / cw / F2", "rename (batch when multi-selected)"),
-        row("o  O / F10", "new file / new folder"),
-        row("u", "undo        Shift+Del  delete forever"),
-        row("D  P", "drag out / drop in (needs ripdrag)"),
-        sect("View"),
-        row("Ctrl+1/2/3", "icons / compact / details"),
-        row("H", "toggle hidden files"),
-        row("F3  F9  F11  Ctrl+I", "split, places, info, filter"),
-        row("Ctrl+h / Ctrl+l", "focus the panel left / right"),
-        sect("Toolbar row"),
-        row("Ctrl+k / Ctrl+j", "up into the row, back down"),
-        row("Ctrl+h  Ctrl+l", "nav buttons / trail / right buttons"),
-        row("h  l", "previous / next item; a menu button opens"),
-        row("j  k / Ctrl+n  Ctrl+p", "down / up an open menu"),
-        row("Ctrl+y  Enter  Tab", "accept          Esc  cancel"),
-        row("F4", "shell here (suspends Dolvim)"),
-        sect("Tabs and commands"),
-        row("Ctrl+T Ctrl+W gt gT", "new, close, next, previous"),
-        row(":e :cd :sort :view", ":split :q :qa"),
-        row("/  n  N", "search        m  menu"),
+        section_heading("Motion"),
+        key_row("h j k l", "left / down / up / right (grid-aware)"),
+        key_row("gg  G  5j  0  $", "top, bottom, counts, row start/end"),
+        key_row("Ctrl+d / Ctrl+u", "half page"),
+        key_row("Enter / l", "open        Backspace / h  up"),
+        key_row("Alt+← / Alt+→", "back / forward in history"),
+        section_heading("Selection"),
+        key_row("Space  v  V", "toggle, visual, visual by row"),
+        key_row("Ctrl+A  Ctrl+Shift+A", "select all / invert"),
+        section_heading("Files"),
+        key_row("x  5x", "trash the item / n items"),
+        key_row("dd  3dd  dj  dk  dG", "trash: this, n, or to a motion"),
+        key_row("y  Ctrl+X  p", "copy, cut, paste"),
+        key_row("r / cw / F2", "rename (batch when multi-selected)"),
+        key_row("o  O / F10", "new file / new folder"),
+        key_row("u", "undo        Shift+Del  delete forever"),
+        key_row("D  P", "drag out / drop in (needs ripdrag)"),
+        section_heading("View"),
+        key_row("Ctrl+1/2/3", "icons / compact / details"),
+        key_row("H", "toggle hidden files"),
+        key_row("F3  F9  F11  Ctrl+I", "split, places, info, filter"),
+        key_row("Ctrl+h / Ctrl+l", "focus the panel left / right"),
+        section_heading("Toolbar row"),
+        key_row("Ctrl+k / Ctrl+j", "up into the row, back down"),
+        key_row("Ctrl+h  Ctrl+l", "nav buttons / trail / right buttons"),
+        key_row("h  l", "previous / next item; a menu button opens"),
+        key_row("j  k / Ctrl+n  Ctrl+p", "down / up an open menu"),
+        key_row("Ctrl+y  Enter  Tab", "accept          Esc  cancel"),
+        key_row("F4", "shell here (suspends Dolvim)"),
+        section_heading("Tabs and commands"),
+        key_row("Ctrl+T Ctrl+W gt gT", "new, close, next, previous"),
+        key_row(":e :cd :sort :view", ":split :q :qa"),
+        key_row("/  n  N", "search        m  menu"),
     ]
 }
 
-fn bar(frac: f64, w: usize) -> String {
-    let filled = (frac * w as f64).round() as usize;
+fn progress_bar(fraction: f64, width: usize) -> String {
+    let filled = (fraction * width as f64).round() as usize;
     format!(
         "{}{}",
-        "\u{2588}".repeat(filled.min(w)),
-        "\u{2591}".repeat(w.saturating_sub(filled))
+        "\u{2588}".repeat(filled.min(width)),
+        "\u{2591}".repeat(width.saturating_sub(filled))
     )
 }
 
-fn popup(f: &mut Frame, r: Rect, title: &str, body: Vec<Line<'static>>) {
-    f.render_widget(Clear, r);
+fn popup(frame: &mut Frame, r: Rect, title: &str, body: Vec<Line<'static>>) {
+    frame.render_widget(Clear, r);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -1313,8 +1449,8 @@ fn popup(f: &mut Frame, r: Rect, title: &str, body: Vec<Line<'static>>) {
         .style(Style::default().bg(color::PANEL_BG).fg(color::TEXT))
         .border_style(Style::default().fg(color::ACCENT));
     let inner = block.inner(r);
-    f.render_widget(block, r);
-    f.render_widget(Paragraph::new(body), inner);
+    frame.render_widget(block, r);
+    frame.render_widget(Paragraph::new(body), inner);
 }
 
 /// The clickable area inside a bordered popup.
@@ -1327,22 +1463,22 @@ fn inner_of(r: Rect) -> Rect {
     )
 }
 
-fn menu_popup(f: &mut Frame, r: Rect, sel: usize, items: &[String]) {
-    f.render_widget(Clear, r);
+fn menu_popup(frame: &mut Frame, r: Rect, selected_row: usize, items: &[String]) {
+    frame.render_widget(Clear, r);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .style(Style::default().bg(color::PANEL_BG).fg(color::TEXT))
         .border_style(Style::default().fg(color::SEPARATOR));
     let inner = block.inner(r);
-    f.render_widget(block, r);
-    let buf = f.buffer_mut();
+    frame.render_widget(block, r);
+    let buf = frame.buffer_mut();
     // Scroll the menu when it is taller than the screen allows.
     let h = inner.height as usize;
-    let first = sel.saturating_sub(h.saturating_sub(1));
+    let first = selected_row.saturating_sub(h.saturating_sub(1));
     for (i, s) in items.iter().enumerate().skip(first).take(h) {
         let y = inner.y + (i - first) as u16;
-        let st = if i == sel {
+        let st = if i == selected_row {
             Style::default().bg(color::SELECTION).fg(color::TEXT)
         } else {
             Style::default().bg(color::PANEL_BG).fg(color::TEXT)
@@ -1363,8 +1499,8 @@ fn menu_popup(f: &mut Frame, r: Rect, sel: usize, items: &[String]) {
 
 /// Lay a background colour under a whole region, so the gaps between widgets
 /// are Breeze, not terminal default.
-fn paint(f: &mut Frame, r: Rect, bg: ratatui::style::Color) {
-    f.render_widget(Block::default().style(Style::default().bg(bg)), r);
+fn paint(frame: &mut Frame, r: Rect, bg: ratatui::style::Color) {
+    frame.render_widget(Block::default().style(Style::default().bg(bg)), r);
 }
 
 fn fill(buf: &mut Buffer, r: Rect, bg: ratatui::style::Color) {
@@ -1388,9 +1524,9 @@ fn centred(buf: &mut Buffer, r: Rect, s: &str, st: Style) {
 }
 
 /// Dolphin's focus rectangle: an outline, not a fill.
-fn outline(buf: &mut Buffer, r: Rect, active: bool) {
-    if r.width < 2 || r.height < 2 {
-        cursor_block(buf, Rect::new(r.x, r.y, 1, 1), r, active);
+fn outline(buf: &mut Buffer, rect: Rect, active: bool) {
+    if rect.width < 2 || rect.height < 2 {
+        cursor_block(buf, Rect::new(rect.x, rect.y, 1, 1), rect, active);
         return;
     }
     let c = if active {
@@ -1398,9 +1534,9 @@ fn outline(buf: &mut Buffer, r: Rect, active: bool) {
     } else {
         color::SEPARATOR
     };
-    let (l, t, rt, b) = (r.x, r.y, r.right() - 1, r.bottom() - 1);
-    for x in l..=rt {
-        for y in [t, b] {
+    let (left, top, right, bottom) = (rect.x, rect.y, rect.right() - 1, rect.bottom() - 1);
+    for x in left..=right {
+        for y in [top, bottom] {
             if let Some(cell) = buf.cell_mut((x, y)) {
                 if cell.symbol() == " " {
                     cell.set_char('\u{2500}');
@@ -1409,8 +1545,8 @@ fn outline(buf: &mut Buffer, r: Rect, active: bool) {
             }
         }
     }
-    for y in t..=b {
-        for x in [l, rt] {
+    for y in top..=bottom {
+        for x in [left, right] {
             if let Some(cell) = buf.cell_mut((x, y)) {
                 if cell.symbol() == " " {
                     cell.set_char('\u{2502}');
@@ -1420,10 +1556,10 @@ fn outline(buf: &mut Buffer, r: Rect, active: bool) {
         }
     }
     for (x, y, ch) in [
-        (l, t, '\u{256d}'),
-        (rt, t, '\u{256e}'),
-        (l, b, '\u{2570}'),
-        (rt, b, '\u{256f}'),
+        (left, top, '\u{256d}'),
+        (right, top, '\u{256e}'),
+        (left, bottom, '\u{2570}'),
+        (right, bottom, '\u{256f}'),
     ] {
         if let Some(cell) = buf.cell_mut((x, y)) {
             cell.set_char(ch).set_fg(c);
@@ -1479,10 +1615,18 @@ fn icon_color(e: &fs::Entry, cut: bool) -> ratatui::style::Color {
 /// Draw `path`'s thumbnail into `r`, requesting a decode if there is none yet.
 /// False means "nothing to draw" and the caller falls back to the glyph; the
 /// thumbnail pops in on a later frame, like Dolphin.
-fn thumb(f: &mut Frame, thumbs: &mut crate::thumbs::Thumbs, r: Rect, path: &Path) -> bool {
-    match thumbs.get(path, r.width, r.height).cloned() {
-        Some(t) => {
-            blit(f.buffer_mut(), r, &t);
+fn try_draw_thumbnail(
+    frame: &mut Frame,
+    thumbs: &mut crate::thumbs::Thumbs,
+    rect: Rect,
+    path: &Path,
+) -> bool {
+    match thumbs
+        .get_or_request(path, rect.width, rect.height)
+        .cloned()
+    {
+        Some(thumb) => {
+            draw_thumbnail(frame.buffer_mut(), rect, &thumb);
             true
         }
         None => false,
@@ -1491,13 +1635,14 @@ fn thumb(f: &mut Frame, thumbs: &mut crate::thumbs::Thumbs, r: Rect, path: &Path
 
 /// Paint a decoded thumbnail. Each cell is `▀`: fg is the top pixel row, bg
 /// the bottom one — two pixels of vertical resolution per terminal cell.
-fn blit(buf: &mut Buffer, r: Rect, t: &crate::thumbs::Thumb) {
-    let ox = r.x + (r.width.saturating_sub(t.w)) / 2;
-    let oy = r.y + (r.height.saturating_sub(t.h)) / 2;
-    for cy in 0..t.h.min(r.height) {
-        for cx in 0..t.w.min(r.width) {
-            let (top, bot) = t.cells[(cy as usize) * t.w as usize + cx as usize];
-            if let Some(c) = buf.cell_mut((ox + cx, oy + cy)) {
+fn draw_thumbnail(buf: &mut Buffer, rect: Rect, thumb: &crate::thumbs::Thumb) {
+    let origin_x = rect.x + (rect.width.saturating_sub(thumb.cell_width)) / 2;
+    let origin_y = rect.y + (rect.height.saturating_sub(thumb.cell_height)) / 2;
+    for cell_y in 0..thumb.cell_height.min(rect.height) {
+        for cell_x in 0..thumb.cell_width.min(rect.width) {
+            let (top, bot) =
+                thumb.cells[(cell_y as usize) * thumb.cell_width as usize + cell_x as usize];
+            if let Some(c) = buf.cell_mut((origin_x + cell_x, origin_y + cell_y)) {
                 c.set_char('\u{2580}')
                     .set_fg(ratatui::style::Color::Rgb(top[0], top[1], top[2]))
                     .set_bg(ratatui::style::Color::Rgb(bot[0], bot[1], bot[2]));
@@ -1514,11 +1659,11 @@ pub fn clip(s: &str, w: usize) -> String {
     if s.width() <= w {
         return s.to_string();
     }
-    format!("{}\u{2026}", cut(s, w - 1))
+    format!("{}\u{2026}", truncate_to_width(s, w - 1))
 }
 
 /// Truncate to `w` display columns, saying nothing about what was dropped.
-fn cut(s: &str, w: usize) -> String {
+fn truncate_to_width(s: &str, w: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
     for c in s.chars() {
@@ -1530,11 +1675,6 @@ fn cut(s: &str, w: usize) -> String {
         used += cw;
     }
     out
-}
-
-fn right(s: &str, w: usize) -> String {
-    let s = clip(s, w);
-    format!("{}{}", " ".repeat(w.saturating_sub(s.width())), s)
 }
 
 /// Wrap a name into at most `lines` rows of `w` columns, ellipsising the last.
@@ -1603,7 +1743,7 @@ pub fn wrap_name(s: &str, w: usize, lines: usize) -> Vec<String> {
     let last = out.last_mut().unwrap();
     *last = format!(
         "{}{tail}",
-        cut(last.trim_end_matches('\u{2026}'), w - tail.width())
+        truncate_to_width(last.trim_end_matches('\u{2026}'), w - tail.width())
     );
     out
 }
@@ -1634,54 +1774,63 @@ mod tests {
 
     #[test]
     fn wrap_respects_the_line_budget() {
-        let v = wrap("abcdefghij", 4, 2);
-        assert_eq!(v.len(), 2);
-        assert_eq!(v[0], "abcd");
-        assert!(v[1].ends_with('\u{2026}'));
+        let wrapped_lines = wrap("abcdefghij", 4, 2);
+        assert_eq!(wrapped_lines.len(), 2);
+        assert_eq!(wrapped_lines[0], "abcd");
+        assert!(wrapped_lines[1].ends_with('\u{2026}'));
     }
 
     #[test]
     fn a_truncated_name_keeps_its_extension() {
-        let v = wrap_name("WhatsApp Image 2024-01-09 at 4.30.15 PM.jpeg", 13, 3);
-        assert_eq!(v.len(), 3);
-        assert_eq!(v[2], "at 4.\u{2026}PM.jpeg");
+        let wrapped_lines = wrap_name("WhatsApp Image 2024-01-09 at 4.30.15 PM.jpeg", 13, 3);
+        assert_eq!(wrapped_lines.len(), 3);
+        assert_eq!(wrapped_lines[2], "at 4.\u{2026}PM.jpeg");
         // An extension too long to leave room falls back to a plain ellipsis.
-        let v = wrap_name("sketch of the flashcards concept.excalidraw", 13, 3);
-        assert!(v[2].ends_with('\u{2026}'));
+        let wrapped_lines = wrap_name("sketch of the flashcards concept.excalidraw", 13, 3);
+        assert!(wrapped_lines[2].ends_with('\u{2026}'));
         // A dotfile has no extension to protect.
-        let v = wrap_name(&format!(".{}", "a".repeat(60)), 13, 3);
-        assert!(v[2].ends_with('\u{2026}'));
+        let wrapped_lines = wrap_name(&format!(".{}", "a".repeat(60)), 13, 3);
+        assert!(wrapped_lines[2].ends_with('\u{2026}'));
     }
 
     #[test]
-    fn detail_columns_always_leave_room_for_a_name() {
-        for w in [10u16, 40, 80, 200] {
-            let c = detail_columns(w);
-            assert!(c[0] >= 8);
+    fn detail_columns_tile_the_pane_without_overrunning_it() {
+        for pane_width in [10u16, 40, 80, 200] {
+            let area = Rect::new(3, 0, pane_width, 1);
+            let columns = detail_columns(area, config::TIME_WIDTH);
+            assert!(columns[0].width >= 8);
+            assert_eq!(columns[0].x, area.x + config::VIEW_MARGIN);
+            for pair in columns.windows(2) {
+                assert_eq!(pair[1].x, pair[0].x + pair[0].width + DETAIL_GAP);
+            }
+            // Only a pane too narrow to hold the fixed columns may overflow.
+            if pane_width >= 200 {
+                assert!(columns[3].x + columns[3].width <= area.right());
+            }
         }
     }
 
     #[test]
     fn crumbs_run_root_first() {
-        let v = crumb_paths(Path::new("/a/b"));
-        assert_eq!(v.first().unwrap(), Path::new("/"));
-        assert_eq!(v.last().unwrap(), Path::new("/a/b"));
+        let crumbs = crumb_paths(Path::new("/a/b"));
+        assert_eq!(crumbs.first().unwrap(), Path::new("/"));
+        assert_eq!(crumbs.last().unwrap(), Path::new("/a/b"));
     }
 
     #[test]
     fn scroll_follows_the_cursor_both_ways() {
-        let mut off = 0;
-        scroll_to(&mut off, 12, 10);
-        assert_eq!(off, 3);
-        scroll_to(&mut off, 1, 10);
-        assert_eq!(off, 1);
+        let mut offset = 0;
+        scroll_to(&mut offset, 12, 10);
+        assert_eq!(offset, 3);
+        scroll_to(&mut offset, 1, 10);
+        assert_eq!(offset, 1);
     }
 
     #[test]
     fn the_whole_window_renders_without_panicking() {
         let mut app = App::new(std::env::temp_dir());
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        term.draw(|frame| draw(frame, &mut app)).unwrap();
         let buf = term.backend().buffer().clone();
         // The toolbar row must carry the Breeze toolbar background.
         assert_eq!(buf.cell((0, 0)).unwrap().bg, color::TOOLBAR_BG);
@@ -1697,7 +1846,7 @@ mod tests {
         let mut app = App::new(std::env::temp_dir());
         for (w, h) in [(1u16, 1u16), (5, 3), (20, 4)] {
             let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-            term.draw(|f| draw(f, &mut app)).unwrap();
+            term.draw(|frame| draw(frame, &mut app)).unwrap();
         }
     }
 }

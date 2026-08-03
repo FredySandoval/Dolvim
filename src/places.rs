@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use crate::config::glyph as g;
+use crate::config::glyph;
 use crate::fs;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -13,6 +13,13 @@ pub enum Target {
     Network,
     /// A saved search: entries under `home` modified within N days.
     RecentDays(u32),
+}
+
+/// How much of a device is in use, for the Places free-space gauge.
+#[derive(Clone, Copy)]
+pub struct DiskUsage {
+    pub used_bytes: u64,
+    pub total_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -25,8 +32,8 @@ pub enum Row {
         label: String,
         glyph: &'static str,
         target: Target,
-        /// (used, total) bytes — devices draw a free-space gauge behind the label.
-        gauge: Option<(u64, u64)>,
+        /// Devices draw a free-space gauge behind the label.
+        gauge: Option<DiskUsage>,
         /// A partition that is not mounted: reachable only by mounting it
         /// first, so its icon is flagged rather than its row hidden.
         offline: bool,
@@ -58,58 +65,77 @@ pub fn home() -> PathBuf {
 fn xdg_dir(key: &str, fallback: &str) -> Option<PathBuf> {
     // Respect user-dirs.dirs without writing a config parser: it is
     // `KEY="$HOME/Name"` lines, which `split_once` handles in three lines.
-    let cfg = std::env::var_os("XDG_CONFIG_HOME")
+    let config_dir = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".config"));
-    if let Ok(txt) = std::fs::read_to_string(cfg.join("user-dirs.dirs")) {
-        for line in txt.lines() {
+    if let Ok(user_dirs_text) = std::fs::read_to_string(config_dir.join("user-dirs.dirs")) {
+        for line in user_dirs_text.lines() {
             let line = line.trim();
-            if let Some(rest) = line.strip_prefix(key).and_then(|r| r.strip_prefix('=')) {
-                let v = rest.trim_matches('"');
-                let p = if let Some(tail) = v.strip_prefix("$HOME/") {
-                    home().join(tail)
+            if let Some(after_key) = line
+                .strip_prefix(key)
+                .and_then(|rest| rest.strip_prefix('='))
+            {
+                let quoted_path = after_key.trim_matches('"');
+                let xdg_path = if let Some(path_after_home) = quoted_path.strip_prefix("$HOME/") {
+                    home().join(path_after_home)
                 } else {
-                    PathBuf::from(v)
+                    PathBuf::from(quoted_path)
                 };
-                return p.is_dir().then_some(p);
+                return xdg_path.is_dir().then_some(xdg_path);
             }
         }
     }
-    let p = home().join(fallback);
-    p.is_dir().then_some(p)
+    let fallback_path = home().join(fallback);
+    fallback_path.is_dir().then_some(fallback_path)
 }
 
 /// Build the panel. Called at startup and whenever mounts change.
 pub fn build() -> Vec<Row> {
     let mut rows = vec![Row::Heading("Places")];
-    let h = home();
-    rows.push(item("Home", g::HOME, Target::Dir(h.clone())));
+    let home_dir = home();
+    rows.push(place_row(
+        "Home",
+        glyph::HOME,
+        Target::Dir(home_dir.clone()),
+    ));
 
     // The directory name doubles as the label, so there is no second spelling
     // to keep in sync — `Download` vs `Downloads` is exactly how this row went
     // missing before.
-    for &(key, name, gl) in crate::config::XDG_DIRS {
-        if let Some(p) = xdg_dir(key, name) {
-            rows.push(item(name, gl, Target::Dir(p)));
+    for xdg_dir_row in crate::config::XDG_DIRS {
+        if let Some(p) = xdg_dir(xdg_dir_row.env_key, xdg_dir_row.name) {
+            rows.push(place_row(
+                xdg_dir_row.name,
+                xdg_dir_row.glyph,
+                Target::Dir(p),
+            ));
         }
     }
-    rows.push(item("Trash", g::TRASH, Target::Trash));
+    rows.push(place_row("Trash", glyph::TRASH, Target::Trash));
 
     section(&mut rows, "Remote");
-    rows.push(item("Network", g::NETWORK, Target::Network));
+    rows.push(place_row("Network", glyph::NETWORK, Target::Network));
 
     section(&mut rows, "Recent");
-    rows.push(item("Modified Today", g::CLOCK, Target::RecentDays(1)));
-    rows.push(item("Modified Yesterday", g::CLOCK, Target::RecentDays(2)));
+    rows.push(place_row(
+        "Modified Today",
+        glyph::CLOCK,
+        Target::RecentDays(1),
+    ));
+    rows.push(place_row(
+        "Modified Yesterday",
+        glyph::CLOCK,
+        Target::RecentDays(2),
+    ));
 
-    let (fixed, removable) = device_rows();
-    if !fixed.is_empty() {
+    let device_rows = device_rows();
+    if !device_rows.fixed.is_empty() {
         section(&mut rows, "Devices");
-        rows.extend(fixed);
+        rows.extend(device_rows.fixed);
     }
-    if !removable.is_empty() {
+    if !device_rows.removable.is_empty() {
         section(&mut rows, "Removable Devices");
-        rows.extend(removable);
+        rows.extend(device_rows.removable);
     }
     rows
 }
@@ -120,7 +146,7 @@ fn section(rows: &mut Vec<Row>, title: &'static str) {
     rows.push(Row::Heading(title));
 }
 
-fn item(label: &str, glyph: &'static str, target: Target) -> Row {
+fn place_row(label: &str, glyph: &'static str, target: Target) -> Row {
     Row::Item {
         label: label.to_string(),
         glyph,
@@ -134,38 +160,46 @@ fn item(label: &str, glyph: &'static str, target: Target) -> Row {
 /// Split partitions the way Dolphin does: hotpluggable buses under Removable
 /// Devices, everything else under Devices. Unmounted partitions are listed
 /// too — Dolphin shows them, badged, because mounting one is a click away.
-fn device_rows() -> (Vec<Row>, Vec<Row>) {
+struct DeviceRows {
+    fixed: Vec<Row>,
+    removable: Vec<Row>,
+}
+
+fn device_rows() -> DeviceRows {
     let (mut fixed, mut removable) = (Vec::new(), Vec::new());
-    for d in fs::devices() {
+    for device in fs::devices() {
         // Dolphin names a partition by its label and falls back to its size,
         // which is the only name an unlabelled disk has.
-        let label = if d.label.is_empty() {
-            format!("{} Internal Drive", fs::format_size(d.size))
+        let label = if device.label.is_empty() {
+            format!("{} Internal Drive", fs::format_size(device.size))
         } else {
-            d.label.clone()
+            device.label.clone()
         };
         // Free space needs a mounted filesystem; an offline disk has no gauge.
-        let gauge = d
+        let gauge = device
             .mount
             .as_deref()
             .and_then(fs::disk_space)
-            .map(|(avail, total)| (total.saturating_sub(avail), total));
-        let glyph = match (&d.mount, d.removable) {
-            (None, _) => g::DEVICE_OFF,
-            (Some(_), true) => g::DEVICE_USB,
-            (Some(_), false) => g::DEVICE,
+            .map(|space| DiskUsage {
+                used_bytes: space.total_bytes.saturating_sub(space.available_bytes),
+                total_bytes: space.total_bytes,
+            });
+        let device_glyph = match (&device.mount, device.removable) {
+            (None, _) => glyph::DEVICE_OFF,
+            (Some(_), true) => glyph::DEVICE_USB,
+            (Some(_), false) => glyph::DEVICE,
         };
         let row = Row::Item {
             label,
-            glyph,
+            glyph: device_glyph,
             // Nowhere to navigate until it is mounted, so point an offline
             // disk at itself: selectable, and it fails honestly when opened.
-            target: Target::Dir(d.mount.clone().unwrap_or_else(|| PathBuf::from("/"))),
+            target: Target::Dir(device.mount.clone().unwrap_or_else(|| PathBuf::from("/"))),
             gauge,
-            offline: d.mount.is_none(),
-            eject: d.removable && d.mount.is_some(),
+            offline: device.mount.is_none(),
+            eject: device.removable && device.mount.is_some(),
         };
-        if d.removable {
+        if device.removable {
             removable.push(row);
         } else {
             fixed.push(row);
@@ -173,18 +207,25 @@ fn device_rows() -> (Vec<Row>, Vec<Row>) {
     }
     // Dolphin lists each section by name, not by the order the kernel happens
     // to have enumerated the buses in.
-    for section in [&mut fixed, &mut removable] {
-        section.sort_by(|a, b| match (a, b) {
-            (Row::Item { label: x, .. }, Row::Item { label: y, .. }) => x.cmp(y),
+    for group in [&mut fixed, &mut removable] {
+        group.sort_by(|a, b| match (a, b) {
+            (
+                Row::Item {
+                    label: left_label, ..
+                },
+                Row::Item {
+                    label: right_label, ..
+                },
+            ) => left_label.cmp(right_label),
             _ => std::cmp::Ordering::Equal,
         });
     }
-    (fixed, removable)
+    DeviceRows { fixed, removable }
 }
 
-/// Index of the row whose target is `path`, for highlighting the current place.
+/// Index of the row whose target is `target`, for highlighting the current place.
 pub fn index_of(rows: &[Row], target: &Target) -> Option<usize> {
-    rows.iter().position(|r| r.target() == Some(target))
+    rows.iter().position(|row| row.target() == Some(target))
 }
 
 #[cfg(test)]

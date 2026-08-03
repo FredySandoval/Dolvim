@@ -32,38 +32,38 @@ use ratatui::Terminal;
 use app::{App, Suspend};
 
 fn main() {
-    let start = match std::env::args().nth(1) {
-        Some(a) if a == "-h" || a == "--help" => {
+    let start_dir = match std::env::args().nth(1) {
+        Some(first_arg) if first_arg == "-h" || first_arg == "--help" => {
             println!(
                 "usage: dolvim [DIR]\n\nKDE Dolphin, in the terminal. Press F1 inside for keys."
             );
             return;
         }
-        Some(a) => PathBuf::from(a),
+        Some(first_arg) => PathBuf::from(first_arg),
         None => std::env::current_dir().unwrap_or_else(|_| places::home()),
     };
-    if !start.is_dir() {
-        eprintln!("dolvim: {}: not a directory", start.display());
+    if !start_dir.is_dir() {
+        eprintln!("dolvim: {}: not a directory", start_dir.display());
         std::process::exit(1);
     }
-    let start = start.canonicalize().unwrap_or(start);
+    let start_dir = start_dir.canonicalize().unwrap_or(start_dir);
 
-    if let Err(e) = run(start) {
-        restore();
-        eprintln!("dolvim: {e}");
+    if let Err(run_error) = run(start_dir) {
+        restore_terminal();
+        eprintln!("dolvim: {run_error}");
         std::process::exit(1);
     }
 }
 
-fn setup() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
+fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
-    let mut out = io::stdout();
-    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
-    Terminal::new(CrosstermBackend::new(out))
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    Terminal::new(CrosstermBackend::new(stdout))
 }
 
 /// Idempotent: safe from the panic hook and again on the way out.
-fn restore() {
+fn restore_terminal() {
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
     let _ = io::stdout().flush();
@@ -74,35 +74,35 @@ fn run(start: PathBuf) -> io::Result<()> {
     // echo. Restore first, then let the default hook print its report.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        restore();
+        restore_terminal();
         default_hook(info);
     }));
 
-    let mut term = setup()?;
+    let mut terminal = setup_terminal()?;
     let mut app = App::new(start);
-    let tick = Duration::from_millis(config::TICK_MS);
+    let poll_timeout = Duration::from_millis(config::TICK_MS);
 
     while !app.quit {
-        term.draw(|f| ui::draw(f, &mut app))?;
+        terminal.draw(|frame| ui::draw(frame, &mut app))?;
 
-        if event::poll(tick)? {
+        if event::poll(poll_timeout)? {
             match event::read()? {
-                Event::Key(k) if k.kind != KeyEventKind::Release => {
+                Event::Key(key_event) if key_event.kind != KeyEventKind::Release => {
                     app.status.clear();
                     app.status_is_error = false;
-                    vim::handle_key_event(&mut app, k);
+                    vim::handle_key_event(&mut app, key_event);
                 }
-                Event::Mouse(m) => mouse::handle(&mut app, m),
+                Event::Mouse(mouse_event) => mouse::handle_mouse_event(&mut app, mouse_event),
                 _ => {}
             }
         }
 
-        app.pump();
-        app.thumbs.pump();
-        finish_progress(&mut app);
+        app.pump_fs_events();
+        app.thumbs.pump_decoded_thumbs();
+        finish_transfer(&mut app);
 
-        if let Some(what) = app.suspend.take() {
-            hand_over(&mut term, || match what {
+        if let Some(suspend_request) = app.suspend.take() {
+            hand_over(&mut terminal, || match suspend_request {
                 Suspend::Shell(dir) => {
                     let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
                     println!("dolvim: shell in {} — exit to return", dir.display());
@@ -116,38 +116,38 @@ fn run(start: PathBuf) -> io::Result<()> {
         }
     }
 
-    restore();
+    restore_terminal();
     Ok(())
 }
 
 /// Collect a finished background transfer: journal it, report it, relist.
-fn finish_progress(app: &mut App) {
+fn finish_transfer(app: &mut App) {
     let done = app
-        .progress
+        .transfer_progress
         .as_ref()
-        .is_some_and(|p| p.finished.load(std::sync::atomic::Ordering::Relaxed));
+        .is_some_and(|transfer| transfer.finished.load(std::sync::atomic::Ordering::Relaxed));
     if !done {
         return;
     }
-    let Some(active_transfer) = app.progress.take() else {
+    let Some(active_transfer) = app.transfer_progress.take() else {
         return;
     };
     let outcome = active_transfer
         .outcome
         .lock()
         .ok()
-        .and_then(|mut g| g.take());
+        .and_then(|mut outcome_guard| outcome_guard.take());
     match outcome {
-        Some(Ok(op)) => {
+        Some(Ok(undo_op)) => {
             // A pure copy journals nothing — there is nothing to put back.
-            if let ops::UndoOp::Move { pairs } = &op {
-                if !pairs.is_empty() {
-                    app.undo.push(op.clone());
+            if let ops::UndoOp::Move { moved_pairs } = &undo_op {
+                if !moved_pairs.is_empty() {
+                    app.undo.push(undo_op.clone());
                 }
             }
             app.info(format!("{} — done", active_transfer.label));
         }
-        Some(Err(e)) => app.error(e),
+        Some(Err(transfer_error)) => app.error(transfer_error),
         None => {}
     }
     app.pane_mut().selected.clear();
@@ -160,13 +160,13 @@ fn finish_progress(app: &mut App) {
 /// two programs in raw mode on one tty fight over the cursor and the screen.
 /// See docs/DECISIONS.md for why there is no PTY here.
 fn hand_over(
-    term: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    f: impl FnOnce(),
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    run_child: impl FnOnce(),
 ) -> io::Result<()> {
-    restore();
-    f();
+    restore_terminal();
+    run_child();
     enable_raw_mode()?;
     execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
-    term.clear()?;
+    terminal.clear()?;
     Ok(())
 }

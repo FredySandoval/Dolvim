@@ -8,27 +8,33 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
-use crate::app::{App, Drag, Focus, MenuKind, Mode, ViewMode};
+use crate::app::{App, CellPos, Drag, Focus, MenuKind, Mode, ViewMode};
 use crate::config;
 use crate::drag;
 use crate::places::Target;
 use crate::vim;
 use crate::vim::Action;
 
-fn hit(r: Rect, x: u16, y: u16) -> bool {
-    r.width > 0 && r.height > 0 && x >= r.x && x < r.right() && y >= r.y && y < r.bottom()
+/// Which Places row the pointer is on. The panel is one row per entry, so the
+/// mapping is the offset from its top edge.
+fn places_row_at(app: &App, y: u16) -> usize {
+    (y - app.hits.places.y) as usize
 }
 
-/// Double-click window. Dolphin selects on the first click and opens on the
-/// second — verified on a stock install with no `SingleClick` key set in
-/// kdeglobals. We do the same.
-const DOUBLE_MS: u64 = 400;
+fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
+    rect.width > 0
+        && rect.height > 0
+        && x >= rect.x
+        && x < rect.right()
+        && y >= rect.y
+        && y < rect.bottom()
+}
 
-pub fn handle(app: &mut App, m: MouseEvent) {
+pub fn handle_mouse_event(app: &mut App, m: MouseEvent) {
     // Modal, for the reason given in `vim::handle_key_event` — a click can
     // reach Paste through the menu just as a key can, so blocking only the
     // keyboard would leave the orphaned-transfer hole open.
-    if app.progress.is_some() {
+    if app.transfer_progress.is_some() {
         return;
     }
     let (x, y) = (m.column, m.row);
@@ -36,24 +42,24 @@ pub fn handle(app: &mut App, m: MouseEvent) {
     let shift = m.modifiers.contains(KeyModifiers::SHIFT);
 
     match m.kind {
-        MouseEventKind::ScrollDown => scroll(app, x, y, 1),
-        MouseEventKind::ScrollUp => scroll(app, x, y, -1),
-        MouseEventKind::Down(MouseButton::Left) => press(app, x, y, ctrl, shift),
-        MouseEventKind::Down(MouseButton::Middle) => middle(app, x, y),
+        MouseEventKind::ScrollDown => handle_scroll(app, x, y, 1),
+        MouseEventKind::ScrollUp => handle_scroll(app, x, y, -1),
+        MouseEventKind::Down(MouseButton::Left) => handle_left_press(app, x, y, ctrl, shift),
+        MouseEventKind::Down(MouseButton::Middle) => handle_middle_press(app, x, y),
         MouseEventKind::Down(MouseButton::Right) => {
             hit_pane(app, x, y);
             vim::open_menu(app, MenuKind::Hamburger);
         }
-        MouseEventKind::Drag(MouseButton::Left) => dragging(app, x, y),
-        MouseEventKind::Up(MouseButton::Left) => release(app, x, y, shift, ctrl),
-        MouseEventKind::Moved => hover(app, x, y),
+        MouseEventKind::Drag(MouseButton::Left) => handle_left_drag(app, x, y),
+        MouseEventKind::Up(MouseButton::Left) => handle_left_release(app, x, y, shift, ctrl),
+        MouseEventKind::Moved => handle_pointer_move(app, x, y),
         _ => {}
     }
 }
 
 /// Over one of the two toolbar buttons that drop a menu.
 fn on_menu_button(app: &App, x: u16, y: u16) -> bool {
-    hit(app.hits.view_menu, x, y) || hit(app.hits.menu, x, y)
+    rect_contains(app.hits.view_menu, x, y) || rect_contains(app.hits.menu, x, y)
 }
 
 /// The one thing the pointer does without a click: a toolbar button that drops
@@ -65,32 +71,32 @@ fn on_menu_button(app: &App, x: u16, y: u16) -> bool {
 /// Nothing else tracks the pointer, and no redraw is added: the loop already
 /// draws every tick and this changes no state unless the pointer is over one
 /// of two buttons.
-fn hover(app: &mut App, x: u16, y: u16) {
+fn handle_pointer_move(app: &mut App, x: u16, y: u16) {
     // Never take a mode that is in the middle of something.
     if !matches!(app.mode, Mode::Normal | Mode::Buttons(_) | Mode::Menu(_)) {
         return;
     }
-    let h = app.hits.clone();
+    let hitboxes = app.hits.clone();
     // The caret, not the icon beside it: on a split button the icon is the
     // action and only the caret drops the list, which is how clicking works too.
-    let want = if hit(h.view_menu, x, y) {
+    let menu_to_open = if rect_contains(hitboxes.view_menu, x, y) {
         MenuKind::ViewMode
-    } else if hit(h.menu, x, y) {
+    } else if rect_contains(hitboxes.menu, x, y) {
         MenuKind::Hamburger
     } else {
         return;
     };
-    if app.mode != Mode::Menu(want.clone()) {
-        vim::open_menu(app, want);
+    if app.mode != Mode::Menu(menu_to_open.clone()) {
+        vim::open_menu(app, menu_to_open);
     }
 }
 
-fn scroll(app: &mut App, x: u16, y: u16, dir: isize) {
-    if app.places_visible && hit(app.hits.places, x, y) {
+fn handle_scroll(app: &mut App, x: u16, y: u16, scroll_delta: isize) {
+    if app.places_visible && rect_contains(app.hits.places, x, y) {
         let n = app.places.len();
-        let next = (app.places_sel as isize + dir).clamp(0, n as isize - 1) as usize;
+        let next = (app.places_cursor as isize + scroll_delta).clamp(0, n as isize - 1) as usize;
         if app.places[next].is_selectable() {
-            app.places_sel = next;
+            app.places_cursor = next;
         }
         return;
     }
@@ -106,18 +112,18 @@ fn scroll(app: &mut App, x: u16, y: u16, dir: isize) {
         // choosing. The bound is the last screenful, so the wheel cannot run
         // off into blank space.
         let max = p.max_offset() as isize;
-        p.offset = (p.offset as isize + dir * step).clamp(0, max) as usize;
+        p.offset = (p.offset as isize + scroll_delta * step).clamp(0, max) as usize;
     }
 }
 
-fn press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
+fn handle_left_press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
     // An open menu swallows the click: inside picks, outside dismisses.
     if let Mode::Menu(kind) = app.mode.clone() {
         let items = vim::menu_items(&kind);
         if let Some(i) = menu_index(app, x, y, items.len()) {
-            let a = items[i].1;
+            let action = items[i].action;
             vim::leave_toolbar(app);
-            vim::act(app, a, 1);
+            vim::run_action(app, action, 1);
         } else if !on_menu_button(app, x, y) {
             // Clicking the button the menu hangs from would close it, and the
             // next pointer motion would open it again. Leave it be.
@@ -125,8 +131,8 @@ fn press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
         }
         return;
     }
-    if let Mode::CrumbMenu(seg) = app.mode.clone() {
-        let items = vim::crumb_siblings(app, seg);
+    if let Mode::CrumbMenu(segment_index) = app.mode.clone() {
+        let items = vim::crumb_siblings(app, segment_index);
         if let Some(i) = menu_index(app, x, y, items.len()) {
             let d = items[i].clone();
             vim::leave_toolbar(app);
@@ -142,63 +148,61 @@ fn press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
     }
 
     // Toolbar.
-    let h = app.hits.clone();
-    if hit(h.back, x, y) {
+    let hitboxes = app.hits.clone();
+    if rect_contains(hitboxes.back, x, y) {
         return app.back();
     }
-    if hit(h.forward, x, y) {
+    if rect_contains(hitboxes.forward, x, y) {
         return app.forward();
     }
-    if hit(h.view_cycle, x, y) {
-        return vim::act(app, Action::CycleView, 1);
+    if rect_contains(hitboxes.view_cycle, x, y) {
+        return vim::run_action(app, Action::CycleView, 1);
     }
-    if hit(h.view_menu, x, y) {
+    if rect_contains(hitboxes.view_menu, x, y) {
         return vim::open_menu(app, MenuKind::ViewMode);
     }
-    if hit(h.split, x, y) {
+    if rect_contains(hitboxes.split, x, y) {
         return app.toggle_split();
     }
-    if hit(h.search, x, y) {
-        return vim::act(app, Action::EnterSearch, 1);
+    if rect_contains(hitboxes.search, x, y) {
+        return vim::run_action(app, Action::EnterSearch, 1);
     }
-    if hit(h.menu, x, y) {
+    if rect_contains(hitboxes.menu, x, y) {
         return vim::open_menu(app, MenuKind::Hamburger);
     }
-    for (r, seg) in &h.crumb_arrows {
-        if hit(*r, x, y) {
-            return vim::open_crumb(app, *seg);
+    for (rect, segment_index) in &hitboxes.crumb_arrows {
+        if rect_contains(*rect, x, y) {
+            return vim::open_crumb(app, *segment_index);
         }
     }
-    for (r, p) in &h.crumbs {
-        if hit(*r, x, y) {
-            let p = p.clone();
-            return app.goto(Target::Dir(p), true);
+    for (rect, crumb_path) in &hitboxes.crumbs {
+        if rect_contains(*rect, x, y) {
+            return app.goto(Target::Dir(crumb_path.clone()), true);
         }
     }
     // Clicking the empty part of the location bar edits it, as in Dolphin.
-    if hit(h.path_bar, x, y) && app.mode != Mode::PathEdit {
-        return vim::act(app, Action::EnterPathEdit, 1);
+    if rect_contains(hitboxes.path_bar, x, y) && app.mode != Mode::PathEdit {
+        return vim::run_action(app, Action::EnterPathEdit, 1);
     }
-    for (i, r) in h.tabs.iter().enumerate() {
-        if hit(*r, x, y) {
-            app.active_tab = i;
+    for (tab_index, rect) in hitboxes.tabs.iter().enumerate() {
+        if rect_contains(*rect, x, y) {
+            app.active_tab = tab_index;
             return;
         }
     }
     // Details column headers sort, and re-sort in reverse on a second click.
-    for (r, key) in &h.headers {
-        if hit(*r, x, y) {
-            let k = *key;
-            return app.set_sort(k);
+    for (rect, sort_key) in &hitboxes.headers {
+        if rect_contains(*rect, x, y) {
+            return app.set_sort(*sort_key);
         }
     }
-    if app.places_visible && hit(h.places, x, y) {
-        let i = (y - h.places.y) as usize;
-        if let Some(row) = app.places.get(i) {
-            if let Some(t) = row.target().cloned() {
-                app.places_sel = i;
+    if app.places_visible && rect_contains(hitboxes.places, x, y) {
+        let places_row_index = places_row_at(app, y);
+        if let Some(row) = app.places.get(places_row_index) {
+            if let Some(place_target) = row.target().cloned() {
+                app.places_cursor = places_row_index;
                 app.focus = Focus::Places;
-                app.goto(t, true);
+                app.goto(place_target, true);
                 app.focus = Focus::View;
             }
         }
@@ -206,7 +210,11 @@ fn press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
     }
 
     // The file view.
-    let Some((pane_idx, vis)) = hit_item(app, x, y) else {
+    let Some(ItemHit {
+        pane_index: pane_idx,
+        visible_index: vis,
+    }) = hit_item(app, x, y)
+    else {
         if let Some(i) = pane_at(app, x, y) {
             app.tabs[app.active_tab].active = i;
             app.focus = Focus::View;
@@ -251,10 +259,11 @@ fn press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
         p.cursor = vis;
     } else {
         let was_selected = app.pane().selected.contains(&path);
-        let double = app
-            .last_click
-            .is_some_and(|(t, v)| v == vis && t.elapsed() < Duration::from_millis(DOUBLE_MS));
-        if double {
+        let is_double_click = app.last_click.is_some_and(|last_click| {
+            last_click.visible_index == vis
+                && last_click.at.elapsed() < Duration::from_millis(config::DOUBLE_CLICK_MS)
+        });
+        if is_double_click {
             app.pane_mut().cursor = vis;
             app.last_click = None;
             app.activate();
@@ -274,17 +283,24 @@ fn press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
         };
         app.drag = Some(Drag {
             paths,
-            position: (x, y),
-            origin: (x, y),
+            position: CellPos { x, y },
+            origin: CellPos { x, y },
             started: false,
         });
     }
-    app.last_click = Some((Instant::now(), vis));
+    app.last_click = Some(crate::app::LastClick {
+        at: Instant::now(),
+        visible_index: vis,
+    });
 }
 
-fn middle(app: &mut App, x: u16, y: u16) {
+fn handle_middle_press(app: &mut App, x: u16, y: u16) {
     // Middle-click a folder to open it in a new tab, as Dolphin does.
-    if let Some((pane_idx, vis)) = hit_item(app, x, y) {
+    if let Some(ItemHit {
+        pane_index: pane_idx,
+        visible_index: vis,
+    }) = hit_item(app, x, y)
+    {
         app.tabs[app.active_tab].active = pane_idx;
         if let Some(e) = app.pane().entry_at(vis).cloned() {
             if e.is_dir() {
@@ -293,34 +309,48 @@ fn middle(app: &mut App, x: u16, y: u16) {
         }
         return;
     }
-    if app.places_visible && hit(app.hits.places, x, y) {
-        let i = (y - app.hits.places.y) as usize;
-        if let Some(Target::Dir(d)) = app.places.get(i).and_then(|r| r.target()).cloned() {
+    if app.places_visible && rect_contains(app.hits.places, x, y) {
+        let places_row_index = places_row_at(app, y);
+        if let Some(Target::Dir(d)) = app
+            .places
+            .get(places_row_index)
+            .and_then(|r| r.target())
+            .cloned()
+        {
             app.new_tab(d);
         }
     }
 }
 
-fn dragging(app: &mut App, x: u16, y: u16) {
-    let Some(d) = app.drag.as_mut() else { return };
-    d.position = (x, y);
-    let moved = x.abs_diff(d.origin.0) + y.abs_diff(d.origin.1);
-    if moved > config::DRAG_THRESHOLD {
-        d.started = true;
+fn handle_left_drag(app: &mut App, x: u16, y: u16) {
+    let Some(active_drag) = app.drag.as_mut() else {
+        return;
+    };
+    active_drag.position = CellPos { x, y };
+    let moved_cells = x.abs_diff(active_drag.origin.x) + y.abs_diff(active_drag.origin.y);
+    if moved_cells > config::DRAG_THRESHOLD {
+        active_drag.started = true;
     }
 }
 
-fn release(app: &mut App, x: u16, y: u16, shift: bool, ctrl: bool) {
-    let Some(d) = app.drag.as_ref() else { return };
-    if !d.started {
+fn handle_left_release(app: &mut App, x: u16, y: u16, shift: bool, ctrl: bool) {
+    let Some(active_drag) = app.drag.as_ref() else {
+        return;
+    };
+    if !active_drag.started {
         app.drag = None;
         return;
     }
 
     // Dropping on a Places entry moves/copies into that place.
-    if app.places_visible && hit(app.hits.places, x, y) {
-        let i = (y - app.hits.places.y) as usize;
-        if let Some(Target::Dir(dir)) = app.places.get(i).and_then(|r| r.target()).cloned() {
+    if app.places_visible && rect_contains(app.hits.places, x, y) {
+        let places_row_index = places_row_at(app, y);
+        if let Some(Target::Dir(dir)) = app
+            .places
+            .get(places_row_index)
+            .and_then(|r| r.target())
+            .cloned()
+        {
             return drag::drop_internal(app, dir, shift, ctrl);
         }
         app.drag = None;
@@ -329,7 +359,11 @@ fn release(app: &mut App, x: u16, y: u16, shift: bool, ctrl: bool) {
 
     // Dropping on a folder puts the items inside it; anywhere else in a pane
     // drops into that pane's directory — which is how split-view transfer works.
-    if let Some((pane_idx, vis)) = hit_item(app, x, y) {
+    if let Some(ItemHit {
+        pane_index: pane_idx,
+        visible_index: vis,
+    }) = hit_item(app, x, y)
+    {
         let target = app
             .pane_at(pane_idx)
             .entry_at(vis)
@@ -350,7 +384,10 @@ fn release(app: &mut App, x: u16, y: u16, shift: bool, ctrl: bool) {
 // ---------------------------------------------------------------------------
 
 fn pane_at(app: &App, x: u16, y: u16) -> Option<usize> {
-    app.tab().panes.iter().position(|p| hit(p.area, x, y))
+    app.tab()
+        .panes
+        .iter()
+        .position(|p| rect_contains(p.area, x, y))
 }
 
 fn hit_pane(app: &mut App, x: u16, y: u16) {
@@ -362,21 +399,27 @@ fn hit_pane(app: &mut App, x: u16, y: u16) {
 
 /// Which visible index is under the pointer, using the same arithmetic the
 /// renderer used — the geometry is cached on the pane, not recomputed.
-fn hit_item(app: &App, x: u16, y: u16) -> Option<(usize, usize)> {
+#[derive(Debug, PartialEq, Eq)]
+struct ItemHit {
+    pane_index: usize,
+    visible_index: usize,
+}
+
+fn hit_item(app: &App, x: u16, y: u16) -> Option<ItemHit> {
     let idx = pane_at(app, x, y)?;
-    let p = app.pane_at(idx);
-    let dy = y - p.area.y;
-    let vis = match p.view {
+    let pane = app.pane_at(idx);
+    let row_offset_in_pane = y - pane.area.y;
+    let visible_index = match pane.view {
         ViewMode::Icons => {
             // The grid is centred, so its left edge is not the pane's.
-            let c = x.saturating_sub(p.grid_x) / p.cell_w.max(1);
-            let r = dy / p.cell_h.max(1);
+            let column = x.saturating_sub(pane.grid_x) / pane.cell_width.max(1);
+            let row = row_offset_in_pane / pane.cell_height.max(1);
             // The grid rarely fills the pane exactly: past the last row and
             // right of the last column is empty space, not a phantom item.
-            if x < p.grid_x || c >= p.grid_cols || r >= p.grid_rows {
+            if x < pane.grid_x || column >= pane.grid_cols || row >= pane.grid_rows {
                 return None;
             }
-            p.offset * p.grid_cols as usize + r as usize * p.grid_cols as usize + c as usize
+            (pane.offset + row as usize) * pane.grid_cols as usize + column as usize
         }
         ViewMode::Compact => {
             // Columns are individually sized, so the hit is found by walking
@@ -385,25 +428,28 @@ fn hit_item(app: &App, x: u16, y: u16) -> Option<(usize, usize)> {
             // the length check below would wave it through. Rows need no such
             // guard: a compact row is one line and the grid is the full pane
             // height.
-            if x < p.grid_x {
+            if x < pane.grid_x {
                 return None;
             }
-            let dx = x - p.grid_x;
-            let mut edge = 0;
-            let c = p.col_w.iter().position(|w| {
-                edge += w;
-                dx < edge
+            let x_offset_in_grid = x - pane.grid_x;
+            let mut edge_x = 0;
+            let column = pane.column_widths.iter().position(|column_width| {
+                edge_x += column_width;
+                x_offset_in_grid < edge_x
             })?;
-            (p.offset + c) * p.grid_rows as usize + dy as usize
+            (pane.offset + column) * pane.grid_rows as usize + row_offset_in_pane as usize
         }
         ViewMode::Details => {
-            if dy == 0 {
+            if row_offset_in_pane == 0 {
                 return None; // the header row
             }
-            p.offset + ((dy - 1) / p.cell_h.max(1)) as usize
+            pane.offset + ((row_offset_in_pane - 1) / pane.cell_height.max(1)) as usize
         }
     };
-    (vis < p.len()).then_some((idx, vis))
+    (visible_index < pane.len()).then_some(ItemHit {
+        pane_index: idx,
+        visible_index,
+    })
 }
 
 /// Whether `x` lands on the ▸/▾ glyph of a Details row that draws one. The
@@ -426,7 +472,7 @@ fn on_expand_arrow(app: &App, x: u16, vis: usize) -> bool {
 /// Row index inside whichever popup is open, or None when the click missed.
 fn menu_index(app: &App, x: u16, y: u16, len: usize) -> Option<usize> {
     let r = app.hits.menu_popup;
-    if !hit(r, x, y) {
+    if !rect_contains(r, x, y) {
         return None;
     }
     let i = (y - r.y) as usize;
@@ -440,9 +486,9 @@ mod tests {
 
     #[test]
     fn hit_rejects_zero_sized_rects() {
-        assert!(!hit(Rect::new(0, 0, 0, 0), 0, 0));
-        assert!(hit(Rect::new(2, 3, 4, 1), 5, 3));
-        assert!(!hit(Rect::new(2, 3, 4, 1), 6, 3));
+        assert!(!rect_contains(Rect::new(0, 0, 0, 0), 0, 0));
+        assert!(rect_contains(Rect::new(2, 3, 4, 1), 5, 3));
+        assert!(!rect_contains(Rect::new(2, 3, 4, 1), 6, 3));
     }
 
     #[test]
@@ -450,7 +496,7 @@ mod tests {
         let mut app = App::new(std::env::temp_dir());
         app.pane_mut().view = ViewMode::Details;
         app.pane_mut().area = Rect::new(0, 0, 80, 20);
-        app.pane_mut().cell_h = 1;
+        app.pane_mut().cell_height = 1;
         assert_eq!(hit_item(&app, 5, 0), None);
     }
 
@@ -460,7 +506,7 @@ mod tests {
     fn expand_arrow_follows_the_tree_indent() {
         use crate::fs::{Entry, Kind};
 
-        let mk = |depth: u16, kind: Kind| Entry {
+        let make_entry = |depth: u16, kind: Kind| Entry {
             name: "d".into(),
             path: "/d".into(),
             kind,
@@ -473,11 +519,15 @@ mod tests {
             expanded: false,
         };
         let mut app = App::new(std::env::temp_dir());
-        let p = app.pane_mut();
-        p.view = ViewMode::Details;
-        p.area = Rect::new(4, 0, 60, 20);
-        p.entries = vec![mk(0, Kind::Dir), mk(2, Kind::Dir), mk(0, Kind::File)];
-        p.visible = vec![0, 1, 2];
+        let pane = app.pane_mut();
+        pane.view = ViewMode::Details;
+        pane.area = Rect::new(4, 0, 60, 20);
+        pane.entries = vec![
+            make_entry(0, Kind::Dir),
+            make_entry(2, Kind::Dir),
+            make_entry(0, Kind::File),
+        ];
+        pane.visible = vec![0, 1, 2];
 
         // depth 0: pane edge + one cell of padding.
         assert!(on_expand_arrow(&app, 5, 0));
@@ -495,21 +545,27 @@ mod tests {
     #[test]
     fn compact_right_margin_is_not_an_item() {
         let mut app = App::new(std::env::temp_dir());
-        let p = app.pane_mut();
-        p.view = ViewMode::Compact;
-        p.area = Rect::new(0, 0, 25, 4);
-        p.cell_w = 10;
-        p.cell_h = 1;
-        p.grid_x = 1; // VIEW_MARGIN: columns start one in from the pane edge
-        p.col_w = vec![10, 10]; // 21..24 is leftover margin, no cell
-        p.grid_cols = 2;
-        p.grid_rows = 4;
+        let pane = app.pane_mut();
+        pane.view = ViewMode::Compact;
+        pane.area = Rect::new(0, 0, 25, 4);
+        pane.cell_width = 10;
+        pane.cell_height = 1;
+        pane.grid_x = 1; // VIEW_MARGIN: columns start one in from the pane edge
+        pane.column_widths = vec![10, 10]; // 21..24 is leftover margin, no cell
+        pane.grid_cols = 2;
+        pane.grid_rows = 4;
         // More items than the two columns hold, so an out-of-range column
         // still lands inside the listing and the length check waves it
         // through — which is exactly how the bug hid.
-        p.visible = (0..12).collect();
+        pane.visible = (0..12).collect();
 
-        assert_eq!(hit_item(&app, 19, 0), Some((0, 4)));
+        assert_eq!(
+            hit_item(&app, 19, 0),
+            Some(ItemHit {
+                pane_index: 0,
+                visible_index: 4
+            })
+        );
         assert_eq!(hit_item(&app, 0, 0), None); // the left margin
         assert_eq!(hit_item(&app, 22, 0), None);
     }
@@ -520,19 +576,37 @@ mod tests {
     #[test]
     fn compact_columns_may_differ_in_width() {
         let mut app = App::new(std::env::temp_dir());
-        let p = app.pane_mut();
-        p.view = ViewMode::Compact;
-        p.area = Rect::new(0, 0, 25, 4);
-        p.cell_h = 1;
-        p.grid_x = 1; // VIEW_MARGIN
-        p.col_w = vec![12, 8];
-        p.grid_cols = 2;
-        p.grid_rows = 4;
-        p.visible = (0..12).collect();
+        let pane = app.pane_mut();
+        pane.view = ViewMode::Compact;
+        pane.area = Rect::new(0, 0, 25, 4);
+        pane.cell_height = 1;
+        pane.grid_x = 1; // VIEW_MARGIN
+        pane.column_widths = vec![12, 8];
+        pane.grid_cols = 2;
+        pane.grid_rows = 4;
+        pane.visible = (0..12).collect();
 
-        assert_eq!(hit_item(&app, 12, 0), Some((0, 0))); // last cell of col 0
-        assert_eq!(hit_item(&app, 13, 0), Some((0, 4))); // first of col 1
-        assert_eq!(hit_item(&app, 20, 2), Some((0, 6)));
+        assert_eq!(
+            hit_item(&app, 12, 0),
+            Some(ItemHit {
+                pane_index: 0,
+                visible_index: 0
+            })
+        ); // last cell of col 0
+        assert_eq!(
+            hit_item(&app, 13, 0),
+            Some(ItemHit {
+                pane_index: 0,
+                visible_index: 4
+            })
+        ); // first of col 1
+        assert_eq!(
+            hit_item(&app, 20, 2),
+            Some(ItemHit {
+                pane_index: 0,
+                visible_index: 6
+            })
+        );
         assert_eq!(hit_item(&app, 21, 0), None); // past both columns
     }
 }

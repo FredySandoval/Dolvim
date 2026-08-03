@@ -4,7 +4,9 @@ use std::cmp::Ordering;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::mpsc::{channel, Sender};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -53,17 +55,17 @@ impl Entry {
     pub fn ext(&self) -> Option<String> {
         self.path
             .extension()
-            .map(|e| e.to_string_lossy().to_lowercase())
+            .map(|extension| extension.to_string_lossy().to_lowercase())
     }
 
     pub fn is_image(&self) -> bool {
         self.ext()
-            .is_some_and(|e| config::IMAGE_EXTS.contains(&e.as_str()))
+            .is_some_and(|extension| config::IMAGE_EXTS.contains(&extension.as_str()))
     }
 
     pub fn is_archive(&self) -> bool {
         self.ext()
-            .is_some_and(|e| config::ARCHIVE_EXTS.contains(&e.as_str()))
+            .is_some_and(|extension| config::ARCHIVE_EXTS.contains(&extension.as_str()))
     }
 
     /// The "Type" column, Dolphin-style plain-English descriptions.
@@ -79,15 +81,17 @@ impl Entry {
                         "Unknown".into()
                     }
                 }
-                Some(e) if config::IMAGE_EXTS.contains(&e) => format!("{} image", e.to_uppercase()),
-                Some(e) if config::ARCHIVE_EXTS.contains(&e) => "Archive".into(),
+                Some(extension) if config::IMAGE_EXTS.contains(&extension) => {
+                    format!("{} image", extension.to_uppercase())
+                }
+                Some(extension) if config::ARCHIVE_EXTS.contains(&extension) => "Archive".into(),
                 Some("sh" | "bash" | "zsh" | "fish") => "Shell script".into(),
                 Some("rs") => "Rust source".into(),
                 Some("txt" | "md") => "Text document".into(),
                 Some("pdf") => "PDF document".into(),
                 Some("mp3" | "flac" | "ogg" | "wav" | "m4a") => "Audio".into(),
                 Some("mp4" | "mkv" | "webm" | "avi" | "mov") => "Video".into(),
-                Some(e) => format!("{} file", e.to_uppercase()),
+                Some(extension) => format!("{} file", extension.to_uppercase()),
             },
         }
     }
@@ -95,34 +99,37 @@ impl Entry {
     /// `home()` is only touched once a name matches, so the common case is a
     /// string compare against a six-row table.
     fn home_folder_glyph(&self) -> Option<&'static str> {
-        let gl = config::XDG_DIRS.iter().find(|(_, n, _)| *n == self.name)?.2;
-        (self.path.parent()? == crate::places::home()).then_some(gl)
+        let home_glyph = config::XDG_DIRS
+            .iter()
+            .find(|xdg_dir| xdg_dir.name == self.name)?
+            .glyph;
+        (self.path.parent()? == crate::places::home()).then_some(home_glyph)
     }
 
     pub fn glyph(&self) -> &'static str {
-        use config::glyph as g;
+        use config::glyph;
         match self.kind {
-            Kind::Symlink => g::SYMLINK,
+            Kind::Symlink => glyph::SYMLINK,
             Kind::Dir => {
                 if self.is_locked() {
-                    g::FOLDER_LOCKED
+                    glyph::FOLDER_LOCKED
                 } else if self.expanded {
-                    g::FOLDER_OPEN
-                } else if let Some(gl) = self.home_folder_glyph() {
-                    gl
+                    glyph::FOLDER_OPEN
+                } else if let Some(home_glyph) = self.home_folder_glyph() {
+                    home_glyph
                 } else if self.size == 0 {
-                    g::FOLDER_EMPTY
+                    glyph::FOLDER_EMPTY
                 } else {
-                    g::FOLDER
+                    glyph::FOLDER
                 }
             }
             Kind::File => match self.ext().as_deref() {
-                Some(e) if config::IMAGE_EXTS.contains(&e) => g::PICTURE,
-                Some(e) if config::ARCHIVE_EXTS.contains(&e) => g::ARCHIVE,
-                Some("mp3" | "flac" | "ogg" | "wav" | "m4a") => g::MUSIC,
-                Some("mp4" | "mkv" | "webm" | "avi" | "mov") => g::VIDEO,
-                Some("txt" | "md" | "pdf" | "doc" | "docx" | "odt") => g::DOCUMENT,
-                _ => g::FILE,
+                Some(extension) if config::IMAGE_EXTS.contains(&extension) => glyph::PICTURE,
+                Some(extension) if config::ARCHIVE_EXTS.contains(&extension) => glyph::ARCHIVE,
+                Some("mp3" | "flac" | "ogg" | "wav" | "m4a") => glyph::MUSIC,
+                Some("mp4" | "mkv" | "webm" | "avi" | "mov") => glyph::VIDEO,
+                Some("txt" | "md" | "pdf" | "doc" | "docx" | "odt") => glyph::DOCUMENT,
+                _ => glyph::FILE,
             },
         }
     }
@@ -167,28 +174,29 @@ impl Default for Sort {
 /// Dolphin's natural sort: digit runs compare numerically, so `file10` follows
 /// `file9`. Case-insensitive, like every other file manager worth using.
 pub fn natural_cmp(a: &str, b: &str) -> Ordering {
-    let (mut x, mut y) = (a.chars().peekable(), b.chars().peekable());
+    let (mut left_chars, mut right_chars) = (a.chars().peekable(), b.chars().peekable());
     loop {
-        match (x.peek().copied(), y.peek().copied()) {
+        match (left_chars.peek().copied(), right_chars.peek().copied()) {
             (None, None) => return a.cmp(b),
             (None, Some(_)) => return Ordering::Less,
             (Some(_), None) => return Ordering::Greater,
-            (Some(ca), Some(cb)) => {
-                if ca.is_ascii_digit() && cb.is_ascii_digit() {
-                    let na = take_number(&mut x);
-                    let nb = take_number(&mut y);
-                    match na.cmp(&nb) {
+            (Some(left_char), Some(right_char)) => {
+                if left_char.is_ascii_digit() && right_char.is_ascii_digit() {
+                    let left_number = take_number(&mut left_chars);
+                    let right_number = take_number(&mut right_chars);
+                    match left_number.cmp(&right_number) {
                         Ordering::Equal => {}
-                        o => return o,
+                        order => return order,
                     }
                 } else {
-                    let (la, lb) = (lower(ca), lower(cb));
-                    match la.cmp(&lb) {
+                    let (left_lower, right_lower) =
+                        (lowercase_char(left_char), lowercase_char(right_char));
+                    match left_lower.cmp(&right_lower) {
                         Ordering::Equal => {
-                            x.next();
-                            y.next();
+                            left_chars.next();
+                            right_chars.next();
                         }
-                        o => return o,
+                        order => return order,
                     }
                 }
             }
@@ -196,33 +204,35 @@ pub fn natural_cmp(a: &str, b: &str) -> Ordering {
     }
 }
 
-fn lower(c: char) -> char {
+fn lowercase_char(c: char) -> char {
     c.to_lowercase().next().unwrap_or(c)
 }
 
-fn take_number(it: &mut std::iter::Peekable<std::str::Chars>) -> u128 {
-    let mut n: u128 = 0;
-    while let Some(c) = it.peek().copied() {
-        if !c.is_ascii_digit() {
+fn take_number(digit_chars: &mut std::iter::Peekable<std::str::Chars>) -> u128 {
+    let mut number: u128 = 0;
+    while let Some(digit) = digit_chars.peek().copied() {
+        if !digit.is_ascii_digit() {
             break;
         }
         // Saturate rather than wrap: a 40-digit filename is not a number.
-        n = n.saturating_mul(10).saturating_add(c as u128 - '0' as u128);
-        it.next();
+        number = number
+            .saturating_mul(10)
+            .saturating_add(digit as u128 - '0' as u128);
+        digit_chars.next();
     }
-    n
+    number
 }
 
-pub fn sort_entries(v: &mut [Entry], s: Sort) {
-    v.sort_by(|a, b| {
-        if s.dirs_first {
+pub fn sort_entries(entries: &mut [Entry], sort: Sort) {
+    entries.sort_by(|a, b| {
+        if sort.dirs_first {
             match (a.is_dir(), b.is_dir()) {
                 (true, false) => return Ordering::Less,
                 (false, true) => return Ordering::Greater,
                 _ => {}
             }
         }
-        let o = match s.key {
+        let order = match sort.key {
             SortKey::Name => natural_cmp(&a.name, &b.name),
             SortKey::Size => a
                 .size
@@ -237,10 +247,10 @@ pub fn sort_entries(v: &mut [Entry], s: Sort) {
                 .cmp(&b.type_name())
                 .then_with(|| natural_cmp(&a.name, &b.name)),
         };
-        if s.reverse {
-            o.reverse()
+        if sort.reverse {
+            order.reverse()
         } else {
-            o
+            order
         }
     });
 }
@@ -248,22 +258,22 @@ pub fn sort_entries(v: &mut [Entry], s: Sort) {
 /// Read one directory. Unreadable entries are skipped, not fatal — Dolphin
 /// shows what it can and complains in the status bar.
 pub fn read_dir(path: &Path, depth: u16) -> std::io::Result<Vec<Entry>> {
-    let mut out = Vec::new();
-    for de in fs::read_dir(path)? {
-        let Ok(de) = de else { continue };
-        let name = de.file_name().to_string_lossy().into_owned();
-        let p = de.path();
-        let Ok(lmeta) = fs::symlink_metadata(&p) else {
+    let mut entries = Vec::new();
+    for dir_entry in fs::read_dir(path)? {
+        let Ok(dir_entry) = dir_entry else { continue };
+        let name = dir_entry.file_name().to_string_lossy().into_owned();
+        let entry_path = dir_entry.path();
+        let Ok(link_metadata) = fs::symlink_metadata(&entry_path) else {
             continue;
         };
-        let is_link = lmeta.file_type().is_symlink();
+        let is_link = link_metadata.file_type().is_symlink();
         // Dolphin follows links for the type shown, but keeps the link marker.
-        let meta = if is_link {
-            fs::metadata(&p).unwrap_or(lmeta)
+        let metadata = if is_link {
+            fs::metadata(&entry_path).unwrap_or(link_metadata)
         } else {
-            lmeta
+            link_metadata
         };
-        let kind = if meta.is_dir() {
+        let kind = if metadata.is_dir() {
             Kind::Dir
         } else if is_link {
             Kind::Symlink
@@ -272,29 +282,31 @@ pub fn read_dir(path: &Path, depth: u16) -> std::io::Result<Vec<Entry>> {
         };
         // One `read_dir` answers both "how many children" and "can we get in",
         // so the lock state costs no extra syscall.
-        let children = (kind == Kind::Dir).then(|| dir_child_count(&p));
-        out.push(Entry {
+        let child_count = (kind == Kind::Dir).then(|| dir_child_count(&entry_path));
+        entries.push(Entry {
             hidden: name.starts_with('.'),
             name,
-            path: p,
+            path: entry_path,
             kind,
-            size: match children {
-                Some(c) => c.unwrap_or(0),
-                None => meta.len(),
+            size: match child_count {
+                Some(count) => count.unwrap_or(0),
+                None => metadata.len(),
             },
-            mtime: meta.mtime(),
-            mode: meta.permissions().mode(),
-            readable: children.map(|c| c.is_some()).unwrap_or(true),
+            mtime: metadata.mtime(),
+            mode: metadata.permissions().mode(),
+            readable: child_count.map(|count| count.is_some()).unwrap_or(true),
             depth,
             expanded: false,
         });
     }
-    Ok(out)
+    Ok(entries)
 }
 
 /// `None` when the directory cannot be opened at all.
-fn dir_child_count(p: &Path) -> Option<u64> {
-    fs::read_dir(p).map(|d| d.count() as u64).ok()
+fn dir_child_count(dir: &Path) -> Option<u64> {
+    fs::read_dir(dir)
+        .map(|read_dir| read_dir.count() as u64)
+        .ok()
 }
 
 /// Base 1000, KDE's "Metric" file size setting. The binary units it also offers
@@ -307,32 +319,91 @@ pub fn format_size(bytes: u64) -> String {
         return format!("{bytes}  B");
     }
     const UNITS: [&str; 5] = ["KB", "MB", "GB", "TB", "PB"];
-    let mut v = bytes as f64 / 1000.0;
-    let mut i = 0;
-    while v >= 1000.0 && i + 1 < UNITS.len() {
-        v /= 1000.0;
-        i += 1;
+    let mut scaled = bytes as f64 / 1000.0;
+    let mut unit_index = 0;
+    while scaled >= 1000.0 && unit_index + 1 < UNITS.len() {
+        scaled /= 1000.0;
+        unit_index += 1;
     }
-    format!("{:.1} {}", v, UNITS[i])
+    format!("{:.1} {}", scaled, UNITS[unit_index])
 }
 
-/// Dolphin renders folder sizes as a child count, not bytes.
-pub fn format_entry_size(e: &Entry) -> String {
-    if e.is_dir() {
-        match e.size {
+/// Dolphin renders folder sizes as a child count, not bytes. `item` carries a
+/// trailing pad for the same reason a bare `B` carries a leading one: the
+/// column right-aligns the whole string, and an unpadded singular would push
+/// its digit one place right of the `items` rows above it.
+pub fn format_entry_size(entry: &Entry) -> String {
+    if entry.is_dir() {
+        match entry.size {
             0 => "0 items".into(),
-            1 => "1 item".into(),
-            n => format!("{n} items"),
+            1 => "1  item".into(),
+            count => format!("{count} items"),
         }
     } else {
-        format_size(e.size)
+        format_size(entry.size)
     }
 }
 
-/// `YYYY-MM-DD HH:MM`, computed from the epoch by hand. Pulling `chrono` to
-/// print sixteen characters would be the exact bloat the manifesto forbids.
-pub fn format_time(epoch: i64) -> String {
-    let (mut days, secs) = (epoch.div_euclid(86400), epoch.rem_euclid(86400));
+/// How the Details `Modified` column and the information panel spell a time.
+/// Month names are English on purpose: reading them out of `LC_TIME` means
+/// calling the C library, and this crate forbids `unsafe`.
+// Whichever variant `config::TIME_STYLE` does not name is unconstructed by
+// definition. That is what a compiled-in setting looks like, not dead code.
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq)]
+pub enum TimeStyle {
+    /// `2026-08-02 20:22`. Sorts as it reads and never needs a year rule.
+    Iso,
+    /// `Aug 2, 8:22pm`, and `Aug 2 2025, 8:22pm` outside the current year.
+    /// Dolphin's default.
+    Short,
+}
+
+/// Seconds east of UTC. Asked of `date` once, because `std` cannot read the
+/// zone and parsing `/etc/localtime` is more code than this column is worth.
+/// A file manager that prints UTC mtimes is simply wrong about what it shows.
+fn utc_offset() -> i64 {
+    static UTC_OFFSET_SECS: OnceLock<i64> = OnceLock::new();
+    *UTC_OFFSET_SECS.get_or_init(|| {
+        let date_output = Command::new("date").arg("+%z").output().ok();
+        let offset_text = date_output.map(|process_output| {
+            String::from_utf8_lossy(&process_output.stdout)
+                .trim()
+                .to_string()
+        });
+        // `+HHMM`, or nothing usable — in which case UTC is the honest fallback.
+        let Some(offset_text) = offset_text.filter(|text| text.len() == 5) else {
+            return 0;
+        };
+        let (offset_hours, offset_minutes) = (
+            offset_text[1..3].parse::<i64>(),
+            offset_text[3..5].parse::<i64>(),
+        );
+        let (Ok(offset_hours), Ok(offset_minutes)) = (offset_hours, offset_minutes) else {
+            return 0;
+        };
+        let secs = offset_hours * 3600 + offset_minutes * 60;
+        if offset_text.starts_with('-') {
+            -secs
+        } else {
+            secs
+        }
+    })
+}
+
+/// Broken-down local civil time.
+pub struct CivilTime {
+    pub year: i64,
+    /// 1-12.
+    pub month: i64,
+    pub day: i64,
+    pub hour: i64,
+    pub minute: i64,
+}
+
+fn civil(epoch: i64) -> CivilTime {
+    let local = epoch + utc_offset();
+    let (mut days, secs) = (local.div_euclid(86400), local.rem_euclid(86400));
     let (h, m) = (secs / 3600, (secs % 3600) / 60);
     // Civil-from-days, Howard Hinnant's algorithm.
     days += 719468;
@@ -345,7 +416,59 @@ pub fn format_time(epoch: i64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let mo = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if mo <= 2 { y + 1 } else { y };
-    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}")
+    CivilTime {
+        year: y,
+        month: mo,
+        day: d,
+        hour: h,
+        minute: m,
+    }
+}
+
+/// The local calendar year `epoch` falls in.
+pub fn year_of(epoch: i64) -> i64 {
+    civil(epoch).year
+}
+
+/// A 24-hour hour as a 12-hour one and its marker. Midnight and noon are the
+/// cases worth naming: both read 12, and `h % 12` gives 0 for each.
+fn hour12(h: i64) -> (i64, &'static str) {
+    let suffix = if h < 12 { "am" } else { "pm" };
+    match h % 12 {
+        0 => (12, suffix),
+        n => (n, suffix),
+    }
+}
+
+/// A timestamp in whichever style `config::TIME_STYLE` selects.
+pub fn format_time(epoch: i64) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let CivilTime {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+    } = civil(epoch);
+    match config::TIME_STYLE {
+        TimeStyle::Iso => format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}"),
+        TimeStyle::Short => {
+            let (clock_hour, suffix) = hour12(hour);
+            let year_part = match civil(now_epoch()).year {
+                this_year if this_year == year => String::new(),
+                _ => format!(" {year}"),
+            };
+            // The hour is padded to two so everything after the comma is one
+            // fixed width. Right-aligning the whole string then lands the comma
+            // in the same cell whether the day is one digit or two.
+            format!(
+                "{} {day}{year_part}, {clock_hour:>2}:{minute:02}{suffix}",
+                MONTHS[month as usize - 1]
+            )
+        }
+    }
 }
 
 pub fn now_epoch() -> i64 {
@@ -368,13 +491,19 @@ pub struct Device {
     pub removable: bool,
 }
 
+/// The `lsblk -o` columns below, by position. Keep the two in step: adding a
+/// column to the `-o` string shifts every index after it.
+const COL_SIZE: usize = 0;
+const COL_FSTYPE: usize = 1;
+const COL_LABEL: usize = 2;
+const COL_MOUNTPOINT: usize = 3;
+const COL_HOTPLUG: usize = 4;
+const COL_PARTTYPENAME: usize = 5;
+const LSBLK_COLUMNS: &str = "SIZE,FSTYPE,LABEL,MOUNTPOINT,HOTPLUG,PARTTYPENAME";
+
 pub fn devices() -> Vec<Device> {
     let Ok(out) = std::process::Command::new("lsblk")
-        .args([
-            "-rnb",
-            "-o",
-            "SIZE,FSTYPE,LABEL,MOUNTPOINT,HOTPLUG,PARTTYPENAME",
-        ])
+        .args(["-rnb", "-o", LSBLK_COLUMNS])
         .output()
     else {
         return Vec::new();
@@ -388,20 +517,24 @@ pub fn devices() -> Vec<Device> {
 fn parse_device(line: &str) -> Option<Device> {
     // Raw mode separates with single spaces and escapes real ones as \x20, so
     // empty columns must survive the split. `split_whitespace` eats them.
-    let f: Vec<&str> = line.split(' ').collect();
-    if f.len() < 6 {
+    let fields: Vec<&str> = line.split(' ').collect();
+    if fields.len() < 6 {
         return None;
     }
     // No filesystem, swap, or the EFI system partition: Dolphin shows none of
     // these, and none of them is a place a user navigates to.
-    if f[1].is_empty() || f[1] == "swap" || unescape_lsblk(f[5]) == "EFI System" {
+    if fields[COL_FSTYPE].is_empty()
+        || fields[COL_FSTYPE] == "swap"
+        || unescape_lsblk(fields[COL_PARTTYPENAME]) == "EFI System"
+    {
         return None;
     }
     Some(Device {
-        label: unescape_lsblk(f[2]),
-        size: f[0].parse().unwrap_or(0),
-        mount: (!f[3].is_empty()).then(|| PathBuf::from(unescape_lsblk(f[3]))),
-        removable: f[4] == "1",
+        label: unescape_lsblk(fields[COL_LABEL]),
+        size: fields[COL_SIZE].parse().unwrap_or(0),
+        mount: (!fields[COL_MOUNTPOINT].is_empty())
+            .then(|| PathBuf::from(unescape_lsblk(fields[COL_MOUNTPOINT]))),
+        removable: fields[COL_HOTPLUG] == "1",
     })
 }
 
@@ -415,25 +548,34 @@ fn unescape_lsblk(s: &str) -> String {
 /// `df` rather than `statfs(2)`: the syscall needs `unsafe` and hardcoded
 /// offsets into a libc struct we do not otherwise depend on, to answer a
 /// question a coreutils binary already answers exactly. See docs/DECISIONS.md.
-pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
-    let out = std::process::Command::new("df")
+#[derive(Clone, Copy)]
+pub struct DiskSpace {
+    pub available_bytes: u64,
+    pub total_bytes: u64,
+}
+
+pub fn disk_space(path: &Path) -> Option<DiskSpace> {
+    let df_output = std::process::Command::new("df")
         .args(["-B1", "--output=avail,size"])
         .arg(path)
         .output()
         .ok()?;
-    let txt = String::from_utf8_lossy(&out.stdout);
-    let line = txt.lines().nth(1)?;
-    let mut it = line.split_whitespace();
-    let avail = it.next()?.parse().ok()?;
-    let total = it.next()?.parse().ok()?;
-    Some((avail, total))
+    let df_output_text = String::from_utf8_lossy(&df_output.stdout);
+    let line = df_output_text.lines().nth(1)?;
+    let mut fields = line.split_whitespace();
+    let available_bytes = fields.next()?.parse().ok()?;
+    let total_bytes = fields.next()?.parse().ok()?;
+    Some(DiskSpace {
+        available_bytes,
+        total_bytes,
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Listing worker
 // ---------------------------------------------------------------------------
 
-/// A listing request carries a generation counter so stale results from a
+/// A listing request carries a `seq` sequence number so stale results from a
 /// directory the user has already navigated away from are dropped, not shown.
 pub struct Listing {
     pub path: PathBuf,
@@ -442,71 +584,92 @@ pub struct Listing {
     pub error: Option<String>,
 }
 
-pub enum Msg {
+pub enum ListingMsg {
     Listed(Listing),
     /// Partial batch for huge directories, so 100k entries do not block.
-    Batch(PathBuf, u64, Vec<Entry>),
-    Done(PathBuf, u64),
+    Batch {
+        path: PathBuf,
+        seq: u64,
+        entries: Vec<Entry>,
+    },
+    Done {
+        path: PathBuf,
+        seq: u64,
+    },
+}
+
+/// One directory listing asked of the worker thread.
+pub struct ListingRequest {
+    pub path: PathBuf,
+    pub seq: u64,
 }
 
 /// Spawns the listing thread and returns a handle you push requests into.
 pub struct Lister {
-    jobs: Sender<(PathBuf, u64)>,
+    jobs: Sender<ListingRequest>,
 }
 
 impl Lister {
-    pub fn new(tx: Sender<Msg>) -> Lister {
-        let (jobs, rx) = channel::<(PathBuf, u64)>();
+    pub fn new(tx: Sender<ListingMsg>) -> Lister {
+        let (jobs, rx) = channel::<ListingRequest>();
         thread::spawn(move || {
             // Held across iterations: a request that arrives mid-listing has to
             // outlive the job it interrupts. The single-slot mutex this
             // replaced could drop such a request outright, leaving the pane
             // that asked for it `loading` with nothing ever to arrive.
-            let mut pending: Option<(PathBuf, u64)> = None;
+            let mut pending: Option<ListingRequest> = None;
             loop {
                 // Blocks between requests instead of waking a hundred times a
                 // second to look at an empty slot.
-                let mut job = match pending.take() {
-                    Some(j) => j,
+                let mut request = match pending.take() {
+                    Some(pending_request) => pending_request,
                     None => match rx.recv() {
-                        Ok(j) => j,
+                        Ok(received_request) => received_request,
                         // The App is gone; so is any reason to keep listing.
                         Err(_) => return,
                     },
                 };
                 // Whatever piled up behind this one is already newer than it.
-                while let Ok(j) = rx.try_recv() {
-                    job = j;
+                while let Ok(newer_request) = rx.try_recv() {
+                    request = newer_request;
                 }
-                let (path, seq) = job;
+                let ListingRequest { path, seq } = request;
                 match read_dir(&path, 0) {
-                    Err(e) => {
-                        let _ = tx.send(Msg::Listed(Listing {
+                    Err(read_error) => {
+                        let _ = tx.send(ListingMsg::Listed(Listing {
                             path,
                             seq,
                             entries: Vec::new(),
-                            error: Some(e.to_string()),
+                            error: Some(read_error.to_string()),
                         }));
                     }
-                    Ok(all) => {
+                    Ok(all_entries) => {
                         // Stream in batches so the first screenful appears at once.
                         let mut sent = false;
-                        for chunk in all.chunks(2000) {
+                        for chunk in all_entries.chunks(2000) {
                             // A newer request supersedes this one; abandon it,
                             // keeping the request for the next turn.
-                            while let Ok(j) = rx.try_recv() {
-                                pending = Some(j);
+                            while let Ok(newer_request) = rx.try_recv() {
+                                pending = Some(newer_request);
                             }
                             if pending.is_some() {
                                 break;
                             }
-                            let _ = tx.send(Msg::Batch(path.clone(), seq, chunk.to_vec()));
+                            let _ = tx.send(ListingMsg::Batch {
+                                path: path.clone(),
+                                seq,
+                                entries: chunk.to_vec(),
+                            });
                             sent = true;
                         }
                         if !sent {
-                            let _ = tx.send(Msg::Batch(path.clone(), seq, Vec::new()));
+                            let _ = tx.send(ListingMsg::Batch {
+                                path: path.clone(),
+                                seq,
+                                entries: Vec::new(),
+                            });
                         }
-                        let _ = tx.send(Msg::Done(path, seq));
+                        let _ = tx.send(ListingMsg::Done { path, seq });
                     }
                 }
             }
@@ -515,7 +678,7 @@ impl Lister {
     }
 
     pub fn request(&self, path: PathBuf, seq: u64) {
-        let _ = self.jobs.send((path, seq));
+        let _ = self.jobs.send(ListingRequest { path, seq });
     }
 }
 
@@ -525,9 +688,9 @@ mod tests {
 
     #[test]
     fn natural_sort_orders_digit_runs_numerically() {
-        let mut v = vec!["file10", "file9", "File2", "a"];
-        v.sort_by(|a, b| natural_cmp(a, b));
-        assert_eq!(v, vec!["a", "File2", "file9", "file10"]);
+        let mut names = vec!["file10", "file9", "File2", "a"];
+        names.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(names, vec!["a", "File2", "file9", "file10"]);
     }
 
     #[test]
@@ -544,18 +707,41 @@ mod tests {
         assert_eq!(format_size(499_289_948_160), "499.3 GB");
     }
 
+    /// The zone is the machine's, so assert the parts the epoch fixes rather
+    /// than a rendered string that moves with the tester's `date +%z`.
     #[test]
     fn epoch_converts_to_civil_time() {
-        assert_eq!(format_time(0), "1970-01-01 00:00");
-        assert_eq!(format_time(1_753_776_000), "2025-07-29 08:00");
+        let utc = |epoch| {
+            let c = civil(epoch - utc_offset());
+            (c.year, c.month, c.day, c.hour, c.minute)
+        };
+        assert_eq!(utc(0), (1970, 1, 1, 0, 0));
+        assert_eq!(utc(1_753_776_000), (2025, 7, 29, 8, 0));
+        // A leap day is where a hand-rolled calendar goes wrong.
+        assert_eq!(utc(1_709_164_800), (2024, 2, 29, 0, 0));
+    }
+
+    #[test]
+    fn the_twelve_hour_clock_has_no_zero_oclock() {
+        let want = [
+            (0, (12, "am")),
+            (1, (1, "am")),
+            (11, (11, "am")),
+            (12, (12, "pm")),
+            (13, (1, "pm")),
+            (23, (11, "pm")),
+        ];
+        for (h, expect) in want {
+            assert_eq!(hour12(h), expect, "hour {h}");
+        }
     }
 
     #[test]
     fn dirs_sort_before_files_when_asked() {
-        let mk = |n: &str, k: Kind| Entry {
-            name: n.into(),
-            path: PathBuf::from(n),
-            kind: k,
+        let make_entry = |name: &str, kind: Kind| Entry {
+            name: name.into(),
+            path: PathBuf::from(name),
+            kind,
             size: 0,
             mtime: 0,
             mode: 0,
@@ -564,9 +750,9 @@ mod tests {
             depth: 0,
             expanded: false,
         };
-        let mut v = vec![mk("z", Kind::Dir), mk("a", Kind::File)];
-        sort_entries(&mut v, Sort::default());
-        assert_eq!(v[0].name, "z");
+        let mut entries = vec![make_entry("z", Kind::Dir), make_entry("a", Kind::File)];
+        sort_entries(&mut entries, Sort::default());
+        assert_eq!(entries[0].name, "z");
     }
 
     /// Real `lsblk -rnb` output. The empty columns are the trap: a partition
