@@ -129,8 +129,14 @@ fn finish_progress(app: &mut App) {
     if !done {
         return;
     }
-    let Some(p) = app.progress.take() else { return };
-    let outcome = p.outcome.lock().ok().and_then(|mut g| g.take());
+    let Some(active_transfer) = app.progress.take() else {
+        return;
+    };
+    let outcome = active_transfer
+        .outcome
+        .lock()
+        .ok()
+        .and_then(|mut g| g.take());
     match outcome {
         Some(Ok(op)) => {
             // A pure copy journals nothing — there is nothing to put back.
@@ -139,7 +145,7 @@ fn finish_progress(app: &mut App) {
                     app.undo.push(op.clone());
                 }
             }
-            app.info(format!("{} — done", p.label));
+            app.info(format!("{} — done", active_transfer.label));
         }
         Some(Err(e)) => app.error(e),
         None => {}
