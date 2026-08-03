@@ -18,7 +18,7 @@ pub fn key(app: &mut App, k: KeyEvent) {
     // `app.progress` and orphan the first thread with no way to see or stop it.
     if let Some(p) = &app.progress {
         if k.code == KeyCode::Esc {
-            p.cancel.store(true, Ordering::Relaxed);
+            p.cancel_requested.store(true, Ordering::Relaxed);
         }
         return;
     }

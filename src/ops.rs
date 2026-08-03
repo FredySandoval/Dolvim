@@ -450,7 +450,7 @@ pub struct Progress {
     pub total: Arc<AtomicU64>,
     pub done: Arc<AtomicU64>,
     pub current: Arc<Mutex<String>>,
-    pub cancel: Arc<AtomicBool>,
+    pub cancel_requested: Arc<AtomicBool>,
     pub finished: Arc<AtomicBool>,
     pub outcome: Arc<Mutex<Option<Result<UndoOp, String>>>>,
 }
@@ -477,15 +477,15 @@ pub fn start_transfer(sources: Vec<PathBuf>, dest: PathBuf, move_it: bool) -> Pr
         total: Arc::new(AtomicU64::new(0)),
         done: Arc::new(AtomicU64::new(0)),
         current: Arc::new(Mutex::new(String::new())),
-        cancel: Arc::new(AtomicBool::new(false)),
+        cancel_requested: Arc::new(AtomicBool::new(false)),
         finished: Arc::new(AtomicBool::new(false)),
         outcome: Arc::new(Mutex::new(None)),
     };
-    let (total, done, current, cancel, finished, outcome) = (
+    let (total, done, current, cancel_requested, finished, outcome) = (
         Arc::clone(&p.total),
         Arc::clone(&p.done),
         Arc::clone(&p.current),
-        Arc::clone(&p.cancel),
+        Arc::clone(&p.cancel_requested),
         Arc::clone(&p.finished),
         Arc::clone(&p.outcome),
     );
@@ -498,7 +498,7 @@ pub fn start_transfer(sources: Vec<PathBuf>, dest: PathBuf, move_it: bool) -> Pr
         let mut pairs = Vec::new();
         let mut err = None;
         for src in &sources {
-            if cancel.load(Ordering::Relaxed) {
+            if cancel_requested.load(Ordering::Relaxed) {
                 break;
             }
             let target = unique_target(&dest.join(name(src)));
@@ -508,11 +508,11 @@ pub fn start_transfer(sources: Vec<PathBuf>, dest: PathBuf, move_it: bool) -> Pr
                 pairs.push((src.clone(), target));
                 continue;
             }
-            if let Err(e) = copy_tree(src, &target, &done, &current, &cancel) {
+            if let Err(e) = copy_tree(src, &target, &done, &current, &cancel_requested) {
                 err = Some(format!("{}: {e}", name(src)));
                 break;
             }
-            if move_it && !cancel.load(Ordering::Relaxed) {
+            if move_it && !cancel_requested.load(Ordering::Relaxed) {
                 if let Err(e) = remove_tree(src) {
                     err = Some(format!("{}: {e}", name(src)));
                     break;
@@ -522,7 +522,7 @@ pub fn start_transfer(sources: Vec<PathBuf>, dest: PathBuf, move_it: bool) -> Pr
         }
         let result = match err {
             Some(e) => Err(e),
-            None if cancel.load(Ordering::Relaxed) => Err("Cancelled".into()),
+            None if cancel_requested.load(Ordering::Relaxed) => Err("Cancelled".into()),
             None if move_it => Ok(UndoOp::Move { pairs }),
             // A copy leaves nothing to undo, so report it as a no-op journal
             // entry the caller drops.
@@ -577,9 +577,9 @@ fn copy_tree(
     dst: &Path,
     done: &Arc<AtomicU64>,
     current: &Arc<Mutex<String>>,
-    cancel: &Arc<AtomicBool>,
+    cancel_requested: &Arc<AtomicBool>,
 ) -> io::Result<()> {
-    if cancel.load(Ordering::Relaxed) {
+    if cancel_requested.load(Ordering::Relaxed) {
         return Ok(());
     }
     let meta = fs::symlink_metadata(src)?;
@@ -592,8 +592,14 @@ fn copy_tree(
         fs::create_dir_all(dst)?;
         for e in fs::read_dir(src)? {
             let e = e?;
-            copy_tree(&e.path(), &dst.join(e.file_name()), done, current, cancel)?;
-            if cancel.load(Ordering::Relaxed) {
+            copy_tree(
+                &e.path(),
+                &dst.join(e.file_name()),
+                done,
+                current,
+                cancel_requested,
+            )?;
+            if cancel_requested.load(Ordering::Relaxed) {
                 return Ok(());
             }
         }
@@ -602,7 +608,7 @@ fn copy_tree(
     if let Ok(mut g) = current.lock() {
         *g = name(src);
     }
-    copy_file_streaming(src, dst, done, cancel)
+    copy_file_streaming(src, dst, done, cancel_requested)
 }
 
 /// Copy in chunks so the progress bar moves during a 4 GiB file and cancel is
@@ -611,14 +617,14 @@ fn copy_file_streaming(
     src: &Path,
     dst: &Path,
     done: &Arc<AtomicU64>,
-    cancel: &Arc<AtomicBool>,
+    cancel_requested: &Arc<AtomicBool>,
 ) -> io::Result<()> {
     use io::{Read, Write};
     let mut r = fs::File::open(src)?;
     let mut w = fs::File::create(dst)?;
     let mut buf = vec![0u8; 256 * 1024];
     loop {
-        if cancel.load(Ordering::Relaxed) {
+        if cancel_requested.load(Ordering::Relaxed) {
             // A half-written file is worse than none; take it back out.
             drop(w);
             let _ = fs::remove_file(dst);
@@ -797,8 +803,15 @@ mod tests {
         fs::write(d.join("src/sub/f"), b"hello").unwrap();
         let done = Arc::new(AtomicU64::new(0));
         let cur = Arc::new(Mutex::new(String::new()));
-        let cancel = Arc::new(AtomicBool::new(false));
-        copy_tree(&d.join("src"), &d.join("dst"), &done, &cur, &cancel).unwrap();
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        copy_tree(
+            &d.join("src"),
+            &d.join("dst"),
+            &done,
+            &cur,
+            &cancel_requested,
+        )
+        .unwrap();
         assert_eq!(fs::read(d.join("dst/sub/f")).unwrap(), b"hello");
         assert_eq!(done.load(Ordering::Relaxed), 5);
         fs::remove_dir_all(&d).unwrap();
@@ -809,8 +822,8 @@ mod tests {
         let d = tmpdir("cancel");
         fs::write(d.join("big"), vec![0u8; 1024]).unwrap();
         let done = Arc::new(AtomicU64::new(0));
-        let cancel = Arc::new(AtomicBool::new(true));
-        copy_file_streaming(&d.join("big"), &d.join("out"), &done, &cancel).unwrap();
+        let cancel_requested = Arc::new(AtomicBool::new(true));
+        copy_file_streaming(&d.join("big"), &d.join("out"), &done, &cancel_requested).unwrap();
         assert!(!d.join("out").exists());
         fs::remove_dir_all(&d).unwrap();
     }
