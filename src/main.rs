@@ -19,9 +19,13 @@ mod watch;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -55,15 +59,51 @@ fn main() {
     }
 }
 
-fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
+/// Whether the keyboard enhancement flags are currently pushed, so the pop on
+/// the way out matches the push and nothing else. A terminal that never got the
+/// push must not be sent the pop.
+static ENHANCED_KEYS: AtomicBool = AtomicBool::new(false);
+
+/// Raw mode, alternate screen, mouse — and the kitty keyboard protocol where
+/// the terminal speaks it.
+///
+/// The legacy encoding transmits Ctrl+letter as a bare control byte: 0x01 for
+/// Ctrl+A, with no room in it for case or shift. Ctrl+Shift+A is therefore the
+/// same byte as Ctrl+A, and Ctrl+I the same as Tab. `DISAMBIGUATE_ESCAPE_CODES`
+/// asks for the real event instead, which is what makes `Ctrl+Shift+A` reach
+/// `InvertSelect` rather than `SelectAll`. Terminals that do not speak it are
+/// left exactly as they were — the keymap works there, minus those keys.
+///
+/// Pushed without asking first. `supports_keyboard_enhancement` asks by writing
+/// a query and waiting for an answer, and a terminal that does not implement the
+/// protocol never sends one — the wait is crossterm's full two-second timeout,
+/// paid at startup and again after every shell hand-over. The request itself is
+/// a private CSI sequence, which a terminal that does not know it discards; an
+/// ignored push costs nothing and leaves us with exactly the legacy encoding we
+/// would have had anyway. If some terminal ever prints it instead of dropping
+/// it, this is the line to guard.
+fn enter_raw_screen() -> io::Result<()> {
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    Terminal::new(CrosstermBackend::new(stdout))
+    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    let pushed = execute!(
+        io::stdout(),
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
+    ENHANCED_KEYS.store(pushed.is_ok(), Ordering::Relaxed);
+    Ok(())
 }
 
-/// Idempotent: safe from the panic hook and again on the way out.
+fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
+    enter_raw_screen()?;
+    Terminal::new(CrosstermBackend::new(io::stdout()))
+}
+
+/// Idempotent: safe from the panic hook and again on the way out. The keyboard
+/// flags are popped first, while the screen we pushed them on is still up.
 fn restore_terminal() {
+    if ENHANCED_KEYS.swap(false, Ordering::Relaxed) {
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+    }
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
     let _ = io::stdout().flush();
@@ -165,8 +205,9 @@ fn hand_over(
 ) -> io::Result<()> {
     restore_terminal();
     run_child();
-    enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    // Back through the same door we came in by: the child ran with the terminal
+    // as it found it, and the enhancement flags have to be pushed again for us.
+    enter_raw_screen()?;
     terminal.clear()?;
     Ok(())
 }

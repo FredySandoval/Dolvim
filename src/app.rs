@@ -69,7 +69,7 @@ pub enum Mode {
     Help,
     /// A dropdown of sibling directories hanging off a breadcrumb segment.
     CrumbMenu(usize),
-    /// Focus is on a toolbar button: an index into `config::TOOLBAR_BUTTONS`.
+    /// Focus is on a toolbar button: an index into `config::toolbar_buttons`.
     Buttons(usize),
     Menu(MenuKind),
 }
@@ -913,7 +913,7 @@ impl App {
         let now = Instant::now();
         let stale = self
             .typeahead_at
-            .map(|t| now.duration_since(t).as_millis() > config::TYPEAHEAD_TIMEOUT_MS)
+            .map(|t| now.duration_since(t).as_millis() > config::TYPEAHEAD_TIMEOUT_MS as u128)
             .unwrap_or(true);
         if stale {
             self.typeahead.clear();

@@ -31,7 +31,7 @@ pub mod color {
     pub const SYMLINK   :Color = Color::Rgb( 26, 138, 190); /* symbolic links                  */
     pub const EXEC      :Color = Color::Rgb( 58, 156,  74); /* executables                     */
     pub const CUT       :Color = Color::Rgb(160, 165, 170); /* cut items, ghosted as in Dolphin*/
-    pub const ERROR     :Color = Color::Rgb(218,  68 , 83); /* status bar errors               */
+    pub const ERROR     :Color = Color::Rgb(218,  68,  83); /* status bar errors               */
     pub const GAUGE_FULL:Color = Color::Rgb(200, 205, 210); /* used part of a device capacity  */
     pub const OFFLINE   :Color = Color::Rgb(246, 116,   0); /* unreachable: unmounted device   */
                                                             /* or locked folder. Breeze carrot */
@@ -84,7 +84,7 @@ pub mod glyph {
 /* Panel geometry and tunables. */
 pub const PLACES_WIDTH        :  u16 =   22; /* Places panel columns, the screenshot's 150 px   */
 pub const INFO_WIDTH          :  u16 =   30; /* Information panel columns (F11)                 */
-pub const TYPEAHEAD_TIMEOUT_MS: u128 = 1000; /* type-ahead buffer life without a keystroke      */
+pub const TYPEAHEAD_TIMEOUT_MS:  u64 = 1000; /* type-ahead buffer life without a keystroke      */
 /* Double-click window. Dolphin selects on the first click and opens on the
  * second — verified on a stock install with no `SingleClick` key set in
  * kdeglobals. We do the same. */
@@ -106,14 +106,19 @@ pub const RECENT_MAX_ITEMS    :usize = 2000; /* results a Recent search stops at
  * `Aug 2, 8:22pm`, dropping the year while it is the current one; `Iso` is
  * `2026-08-02 20:22`, which sorts as it reads. Month names are English: the
  * locale's are the C library's to know, and this crate forbids `unsafe`.
- * Widen TIME_WIDTH to match if you change the style. */
+ * The column width follows the style rather than being restated beside it. */
 pub const TIME_STYLE          :TimeStyle = TimeStyle::Short;
-pub const TIME_WIDTH          :  u16 =   20; /* `Modified` width at its widest, with a year     */
+/* `Modified` at its widest: `Sep 30 2025, 12:22pm` / `2026-08-02 20:22`. */
+pub const TIME_WIDTH          :  u16 = match TIME_STYLE {
+    TimeStyle::Short => 20,
+    TimeStyle::Iso   => 16,
+};
 pub const SIZE_WIDTH          :  u16 =   12; /* Details `Size` column                           */
 pub const TYPE_WIDTH          :  u16 =   14; /* Details `Type` column                           */
 pub const PROGRESS_POPUP_W    :  u16 =   60; /* transfer popup, columns                         */
 pub const PROGRESS_POPUP_H    :  u16 =    6; /* transfer popup, rows                            */
-pub const PROGRESS_BAR_WIDTH  :usize =   56; /* the meter inside it: popup width less borders   */
+/* The meter inside the popup: its width less the borders and their padding. */
+pub const PROGRESS_BAR_WIDTH  :usize = PROGRESS_POPUP_W as usize - 4;
 /* Columns the toolbar keeps clear on the right for its own controls: the
  * hamburger, Search and the Split button, with the blanks between them.
  * Widen it if you add a button, or the breadcrumb will run underneath. */
@@ -152,7 +157,9 @@ pub const XDG_DIRS: &[XdgDir] = &[
     xdg("XDG_VIDEOS_DIR"   , "Videos"   , glyph::VIDEO   ),
 ];
 
-/* File classification by extension. */
+/* File classification by extension. No `svg`: thumbnails come from the `image`
+ * crate, which decodes rasters only, so an svg would badge as an image and then
+ * never produce one. */
 pub const IMAGE_EXTS   : &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp", "ico", "tif", "tiff"];
 pub const ARCHIVE_EXTS : &[&str] = &["tar", "gz" , "tgz" , "bz2", "xz" , "zst" , "zip", "7z" , "rar"];
 
@@ -167,7 +174,19 @@ use crate::vim::{bind, Action, Bind};
 
 /* Modifier names for the tables below. A const context has no `|` operator —
  * that is a trait call — so a combination spells itself with `.union()`. Naming
- * the combinations here keeps that spelling out of every row. */
+ * the combinations here keeps that spelling out of every row.
+ *
+ * SHIFT on a `Char` row is documentation: `vim::normalize` strips it from the
+ * event and from the row alike, because terminals disagree about reporting it
+ * and the character's own case says it anyway. Spell the character shifted —
+ * `G`, `N` — or the row says one thing and matches another.
+ *
+ * CTRL is the same disagreement one step further on. The legacy encoding sends
+ * Ctrl+letter as a bare control byte — 0x01 for Ctrl+A — which has no room for
+ * case, so Ctrl+Shift+A arrives indistinguishable from Ctrl+A and Ctrl+I from
+ * Tab. `main::enter_raw_screen` asks for the kitty keyboard protocol, which
+ * reports the real event; the two CTRL_SHIFT rows below need it, and on a
+ * terminal without it they simply never fire. Everything else is unaffected. */
 const NONE      : KeyModifiers = KeyModifiers::NONE;
 const ALT       : KeyModifiers = KeyModifiers::ALT;
 const CTRL      : KeyModifiers = KeyModifiers::CONTROL;
@@ -194,6 +213,8 @@ pub const DOLPHIN_KEYS: &[Bind] = &[
     bind(PageUp    , NONE      , Action::PageUp         ),
     bind(Char(' ') , NONE      , Action::ToggleSelect   ),
     bind(Char('a') , CTRL      , Action::SelectAll      ),
+    /* Needs the kitty keyboard protocol; without it this key is Ctrl+A and
+       selects all. See the modifier note above. */
     bind(Char('A') , CTRL_SHIFT, Action::InvertSelect   ),
     bind(Char('c') , CTRL      , Action::Copy           ),
     bind(Char('x') , CTRL      , Action::Cut            ),
@@ -202,7 +223,8 @@ pub const DOLPHIN_KEYS: &[Bind] = &[
     bind(Delete    , SHIFT     , Action::DeletePerm     ),
     bind(F(2)      , NONE      , Action::Rename         ),
     bind(F(10)     , NONE      , Action::NewFolder      ),
-    bind(Char('n') , CTRL_SHIFT, Action::NewFolder      ),
+    /* Likewise; F10 is the one that works everywhere. */
+    bind(Char('N') , CTRL_SHIFT, Action::NewFolder      ),
     bind(Enter     , ALT       , Action::Properties     ),
     bind(Char('1') , CTRL      , Action::ViewIcons      ),
     bind(Char('2') , CTRL      , Action::ViewCompact    ),
@@ -215,8 +237,15 @@ pub const DOLPHIN_KEYS: &[Bind] = &[
     bind(Char('t') , CTRL      , Action::NewTab         ),
     bind(Char('w') , CTRL      , Action::CloseTab       ),
     bind(Tab       , CTRL      , Action::NextTab        ),
-    bind(BackTab   , CTRL_SHIFT, Action::PrevTab        ),
-    bind(Char('f') , CTRL      , Action::EnterSearch    ),
+    /* The shift that produced BackTab is spent on it; what reaches us is
+       Ctrl+BackTab, so that is what the row says. The legacy encoding has no
+       room for the Ctrl either and sends a bare BackTab, hence the second row —
+       Shift+Tab means nothing else here, so it can mean this everywhere. */
+    bind(BackTab   , CTRL      , Action::PrevTab        ),
+    bind(BackTab   , NONE      , Action::PrevTab        ),
+    /* Dolphin's Ctrl+F is Find, but the vim table is consulted first and there
+       Ctrl+F is a page down, which wins in a program called Dolvim. Search is
+       `/`, the toolbar button, or Ctrl+I for the filter bar. */
     bind(F(6)      , NONE      , Action::EnterPathEdit  ),
     bind(F(4)      , NONE      , Action::TerminalPanel  ),
     bind(F(4)      , SHIFT     , Action::TerminalHere   ),
@@ -265,16 +294,16 @@ pub const VIM_KEYS: &[Bind] = &[
     bind(Char('?') , SHIFT, Action::Help           ),
 ];
 
-/* The toolbar buttons, left to right, with the breadcrumb between the nav
-   group and the rest. Ctrl+h / Ctrl+l step across the three groups; h and l
-   walk the buttons inside one. */
-pub const NAV_BUTTON_COUNT: usize = 3;
-pub const TOOLBAR_BUTTONS: &[Action] = &[
-    /* nav group, left of the breadcrumb */
+/* The toolbar buttons, left to right, with the breadcrumb between the two
+   groups. Ctrl+h / Ctrl+l step across the three panes of the row; h and l walk
+   the buttons inside one. The group boundary is `NAV_BUTTONS.len()` — a button
+   moved between the tables moves the boundary with it. */
+pub const NAV_BUTTONS: &[Action] = &[
     Action::Back,
     Action::Forward,
     Action::OpenViewMenu,
-    /* right group */
+];
+pub const RIGHT_BUTTONS: &[Action] = &[
     Action::ToggleSplit,
     Action::EnterSearch,
     Action::OpenMenu,
@@ -303,5 +332,97 @@ pub const CHORDS: &[Chord] = &[
     chord('c'  , 'w'     , Action::Rename      ),
 ];
 
-/* Leaders that must wait for a second key rather than acting immediately. */
-pub const CHORD_LEADERS: &[char] = &['g', 'z', 'c'];
+/// The tables above are data, and data drifts: a row added twice, a leader that
+/// is also a binding, a menu whose owning button moved. None of that is a
+/// compile error, so it is a test — the price of configuration being source.
+#[cfg(test)]
+mod sanity {
+    use super::*;
+    use crossterm::event::KeyCode;
+    use crate::vim::{menu_owner, normalize_mods, toolbar_buttons, MENU_BUTTONS};
+
+    /// Bindings the vim table knowingly takes over from Dolphin's. An entry
+    /// here is a decision someone made; anything else is a collision.
+    const SHADOWS: &[(KeyCode, KeyModifiers)] = &[];
+
+    /// Every row as the lookup will actually see it.
+    fn normalized(table: &[Bind]) -> Vec<(KeyCode, KeyModifiers)> {
+        table
+            .iter()
+            .map(|b| (b.code, normalize_mods(b.code, b.mods)))
+            .collect()
+    }
+
+    #[test]
+    fn no_key_is_bound_twice() {
+        let mut seen: Vec<(KeyCode, KeyModifiers)> = Vec::new();
+        for key in normalized(VIM_KEYS).into_iter().chain(normalized(DOLPHIN_KEYS)) {
+            assert!(
+                !seen.contains(&key) || SHADOWS.contains(&key),
+                "{key:?} is bound twice; only the first row can ever fire"
+            );
+            seen.push(key);
+        }
+    }
+
+    /// A `Char` row whose modifiers still name SHIFT after normalization is a
+    /// row that cannot match: the shift went into the character. Spell it
+    /// shifted — `N`, not `n` — or drop the modifier.
+    #[test]
+    fn shift_rows_spell_the_shifted_character() {
+        for b in VIM_KEYS.iter().chain(DOLPHIN_KEYS) {
+            if let KeyCode::Char(c) = b.code {
+                assert!(
+                    !(b.mods.contains(SHIFT) && c.is_lowercase()),
+                    "{c:?} is bound with SHIFT but spelled lowercase"
+                );
+            }
+        }
+    }
+
+    /// A leader that is also a binding acts on the first press, so its chords
+    /// can never start.
+    #[test]
+    fn chord_leaders_are_not_bindings() {
+        for chord in CHORDS {
+            let bound = VIM_KEYS
+                .iter()
+                .chain(DOLPHIN_KEYS)
+                .any(|b| b.code == KeyCode::Char(chord.leader) && b.mods == NONE);
+            assert!(!bound, "chord leader {:?} is also a binding", chord.leader);
+        }
+    }
+
+    #[test]
+    fn no_chord_is_written_twice() {
+        let mut seen: Vec<(char, char)> = Vec::new();
+        for chord in CHORDS {
+            let pair = (chord.leader, chord.follower);
+            assert!(!seen.contains(&pair), "chord {pair:?} is written twice");
+            seen.push(pair);
+        }
+    }
+
+    /// `vim::menu_owner` finds a button by its action, so an action that names
+    /// a menu has to sit at exactly one place in the row — there once, and no
+    /// more than once. The menus are read from `vim::MENU_BUTTONS`, the one
+    /// place that says which they are, so a third menu cannot pass untested.
+    #[test]
+    fn each_menu_hangs_from_exactly_one_button() {
+        for (kind, menu_action) in MENU_BUTTONS {
+            let n = toolbar_buttons().filter(|a| a == menu_action).count();
+            assert_eq!(n, 1, "{menu_action:?} appears {n} times in the toolbar");
+            assert!(
+                menu_owner(kind).is_some(),
+                "{kind:?} names a button that is not in the row"
+            );
+        }
+    }
+
+    /// Both groups have to be inhabited: crossing the breadcrumb lands on the
+    /// first or last button of the group opposite, and an empty one has none.
+    #[test]
+    fn both_toolbar_groups_are_inhabited() {
+        assert!(!NAV_BUTTONS.is_empty() && !RIGHT_BUTTONS.is_empty());
+    }
+}

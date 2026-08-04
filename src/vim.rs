@@ -12,7 +12,35 @@ use crate::fs::SortKey;
 use crate::places::{self, Target};
 use crate::app::{App, Confirm, Focus, MenuKind, Mode, ViewMode};
 
+/// Modifiers as the keymap has to compare them.
+///
+/// Terminals disagree about whether a shifted printable also reports SHIFT: `G`
+/// may arrive as `Char('G')` with the modifier or without it, depending on the
+/// terminal and on which keyboard protocol is in force. The character's own
+/// case already carries the shift, so it is dropped and the character alone
+/// decides. `BackTab` is the same story from the other side — the shift that
+/// produced it is spent on making it `BackTab`.
+///
+/// Every event and every table row passes through here, so the two can never
+/// disagree about what a row means.
+pub fn normalize_mods(code: KeyCode, mods: KeyModifiers) -> KeyModifiers {
+    match code {
+        KeyCode::Char(_) | KeyCode::BackTab => mods.difference(KeyModifiers::SHIFT),
+        _ => mods,
+    }
+}
+
+/// The one door in. Normalizing here rather than at each comparison is what
+/// lets the rest of this file test `modifiers.is_empty()` and mean "bare key".
+fn normalize(key_event: KeyEvent) -> KeyEvent {
+    KeyEvent {
+        modifiers: normalize_mods(key_event.code, key_event.modifiers),
+        ..key_event
+    }
+}
+
 pub fn handle_key_event(app: &mut App, key_event: KeyEvent) {
+    let key_event = normalize(key_event);
     // The transfer popup is modal, as Dolphin's is. Letting keys through means
     // you can navigate away from a live copy, or start a second one on top of
     // `app.transfer_progress` and orphan the first thread with no way to see or stop it.
@@ -78,9 +106,13 @@ fn handle_normal_key(app: &mut App, key_event: KeyEvent) {
     }
 
     // A `d` owns the next motion. After the count block, so `d5j` can collect
-    // its 5 the same way `5j` does.
-    if let Some(pre) = app.pending_delete {
-        return delete_motion(app, key_event, pre);
+    // its 5 the same way `5j` does. A key the operator cannot use cancels it
+    // and then means what it usually means, so `d` then Ctrl+d scrolls rather
+    // than being swallowed.
+    if let Some(count_before_operator) = app.pending_delete.take() {
+        if delete_motion(app, key_event, count_before_operator) == MotionResult::Handled {
+            return;
+        }
     }
 
     if app.focus == Focus::Places && places_key(app, key_event) {
@@ -88,7 +120,7 @@ fn handle_normal_key(app: &mut App, key_event: KeyEvent) {
     }
 
     if let KeyCode::Char(c) = key_event.code {
-        if key_event.modifiers.is_empty() && config::CHORD_LEADERS.contains(&c) {
+        if key_event.modifiers.is_empty() && is_chord_leader(c) {
             // `c` is only a leader when a follower can complete it; `cw` is the
             // one chord it starts, so a lone `c` simply waits.
             app.pending_chord_leader = Some(c);
@@ -104,45 +136,82 @@ fn handle_normal_key(app: &mut App, key_event: KeyEvent) {
 
     // Anything printable and unbound is Dolphin's type-ahead.
     if let KeyCode::Char(c) = key_event.code {
-        if key_event
-            .modifiers
-            .difference(KeyModifiers::SHIFT)
-            .is_empty()
-        {
+        if key_event.modifiers.is_empty() {
             app.typeahead(c);
         }
     }
 }
 
-/// Resolve `d{motion}` into a linewise range and trash it.
+/// A leader is a key some chord starts with — read off `config::CHORDS` rather
+/// than listed beside it, so a new leader cannot be half-added. Eight rows: the
+/// scan costs nothing, and a second spelling costs a chord that never fires.
+fn is_chord_leader(c: char) -> bool {
+    config::CHORDS.iter().any(|chord| chord.leader == c)
+}
+
+/// Whether an operator's second key was a motion it could use. A cancelled
+/// motion has to reach the normal-mode dispatch instead of being dropped.
+#[derive(PartialEq, Eq, Debug)]
+#[must_use]
+enum MotionResult {
+    Handled,
+    Cancelled,
+}
+
+/// The rows `d{motion}` covers, or `None` when the key is not a motion the
+/// operator can use. Pure, because the fencepost is the whole of it.
 ///
-/// `pre` is the count typed before the `d`; vim multiplies it by the one typed
-/// after, so `2d3j` is six lines. Anything that is not a motion cancels, which
-/// is what vim does with a key the operator cannot use.
-fn delete_motion(app: &mut App, key_event: KeyEvent, count_before_operator: usize) {
-    app.pending_delete = None;
-    // Ctrl+d is half-page down, not `dd`. Only a bare motion counts.
-    if !key_event
-        .modifiers
-        .difference(KeyModifiers::SHIFT)
-        .is_empty()
-    {
-        return;
-    }
-    let total_count = count_before_operator * take_count(app);
-    let cursor = app.pane().cursor;
-    let last = app.pane().len().saturating_sub(1);
-    let (range_start, range_end) = match key_event.code {
+/// `count` is the product of the counts either side of the `d`. Everything
+/// saturates and both ends clamp: a count is whatever the user typed, and
+/// `9999999999d` must be a long delete, not a panic.
+fn delete_range(
+    code: KeyCode,
+    cursor: usize,
+    last: usize,
+    count: usize,
+) -> Option<(usize, usize)> {
+    let below = |n: usize| cursor.saturating_add(n).min(last);
+    Some(match code {
         // `dd` is this line and the n-1 below it; `dj` is this line *and* the
         // n below, one more, exactly as in vim.
-        KeyCode::Char('d') => (cursor, cursor + total_count - 1),
-        KeyCode::Char('j') | KeyCode::Down => (cursor, cursor + total_count),
-        KeyCode::Char('k') | KeyCode::Up => (cursor.saturating_sub(total_count), cursor),
+        KeyCode::Char('d') => (cursor, below(count.saturating_sub(1))),
+        KeyCode::Char('j') | KeyCode::Down => (cursor, below(count)),
+        KeyCode::Char('k') | KeyCode::Up => (cursor.saturating_sub(count), cursor.min(last)),
+        // `dG` is to the end whatever the count. In vim a count there names a
+        // line number, and a pane has no line numbers to name.
         KeyCode::Char('G') => (cursor, last),
-        _ => return,
+        _ => return None,
+    })
+}
+
+/// Resolve `d{motion}` into a linewise range and trash it.
+///
+/// `count_before_operator` is the count typed before the `d`; vim multiplies it
+/// by the one typed after, so `2d3j` is six lines. Anything that is not a
+/// motion cancels, which is what vim does with a key an operator cannot use —
+/// and the count survives the cancel, since it was never spent.
+fn delete_motion(
+    app: &mut App,
+    key_event: KeyEvent,
+    count_before_operator: usize,
+) -> MotionResult {
+    // Ctrl+d is half-page down, not `dd`; only a bare motion completes the
+    // operator. Modifiers arrive normalized, so bare is literally none.
+    if !key_event.modifiers.is_empty() {
+        return MotionResult::Cancelled;
+    }
+    let total_count = count_before_operator.saturating_mul(peek_count(app));
+    let cursor = app.pane().cursor;
+    let last = app.pane().len().saturating_sub(1);
+    let Some((range_start, range_end)) =
+        delete_range(key_event.code, cursor, last, total_count)
+    else {
+        return MotionResult::Cancelled;
     };
+    app.count.clear();
     let range_paths = app.pane().paths_in(range_start, range_end);
     move_to_trash(app, range_paths);
+    MotionResult::Handled
 }
 
 /// What an operation acts on: the selection when there is one, otherwise
@@ -203,18 +272,29 @@ fn enter_visual(app: &mut App, target_mode: Mode) {
     app.move_cursor(0, true);
 }
 
+/// The vim table first, so `h`/`j`/`k`/`l` are motions. Rows are normalized as
+/// the event was, so the SHIFT column cannot make a row unreachable.
 fn lookup_binding(key_event: KeyEvent) -> Option<Action> {
     config::VIM_KEYS
         .iter()
         .chain(config::DOLPHIN_KEYS.iter())
-        .find(|bind| bind.code == key_event.code && bind.mods == key_event.modifiers)
+        .find(|bind| {
+            bind.code == key_event.code
+                && normalize_mods(bind.code, bind.mods) == key_event.modifiers
+        })
         .map(|bind| bind.action)
 }
 
+/// The count typed so far, without spending it. A count is only spent by the
+/// thing that acts on it, so a key that turns out not to act leaves it standing.
+fn peek_count(app: &App) -> usize {
+    app.count.parse().unwrap_or(1).max(1)
+}
+
 fn take_count(app: &mut App) -> usize {
-    let n = app.count.parse().unwrap_or(1);
+    let n = peek_count(app);
     app.count.clear();
-    n.max(1)
+    n
 }
 
 /// Keys the Places panel consumes while it has focus. Returns true when handled.
@@ -593,7 +673,7 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
             if app.focus == Focus::Places {
                 focus_button(app, 0);
             } else {
-                enter_crumbs(app, config::NAV_BUTTON_COUNT - 1);
+                enter_crumbs(app, config::NAV_BUTTONS.len() - 1);
             }
         }
         Action::SwapPane => app.other_pane(),
@@ -1240,27 +1320,52 @@ fn handle_buttons_key(app: &mut App, key_event: KeyEvent, button_index: usize) {
     }
 }
 
+/// The toolbar row as one index space: nav group first, then the right group.
+/// Focus, hit-testing and the drawing order all count buttons this way. The
+/// group boundary is `config::NAV_BUTTONS.len()`, so a button moved between the
+/// two tables moves the boundary with it.
+pub fn toolbar_buttons() -> impl Iterator<Item = Action> {
+    config::NAV_BUTTONS
+        .iter()
+        .chain(config::RIGHT_BUTTONS)
+        .copied()
+}
+
+pub fn toolbar_button(index: usize) -> Option<Action> {
+    toolbar_buttons().nth(index)
+}
+
+pub fn toolbar_button_count() -> usize {
+    config::NAV_BUTTONS.len() + config::RIGHT_BUTTONS.len()
+}
+
+/// Which menus hang off a toolbar button, and which button drops each. Both
+/// directions are read from this one table: a menu's owning button and a
+/// button's menu are the same fact asked from opposite ends. `MenuKind::Sort`
+/// is absent because no button drops it — it opens from inside the hamburger.
+pub const MENU_BUTTONS: &[(MenuKind, Action)] = &[
+    (MenuKind::ViewMode, Action::OpenViewMenu),
+    (MenuKind::Hamburger, Action::OpenMenu),
+];
+
 /// The menu a toolbar button drops, if it drops one.
 fn button_menu(button_index: usize) -> Option<MenuKind> {
-    match config::TOOLBAR_BUTTONS.get(button_index) {
-        Some(Action::OpenViewMenu) => Some(MenuKind::ViewMode),
-        Some(Action::OpenMenu) => Some(MenuKind::Hamburger),
-        _ => None,
-    }
+    let button_action = toolbar_button(button_index)?;
+    MENU_BUTTONS
+        .iter()
+        .find(|(_, owning_action)| *owning_action == button_action)
+        .map(|(kind, _)| kind.clone())
 }
 
 /// The button a menu hangs from. `Mode::Menu` carries no index because the same
 /// menu opens from `m` and from the right button too, so the owner is derived
 /// rather than stored — there is nothing to keep in step.
 pub fn menu_owner(kind: &MenuKind) -> Option<usize> {
-    let owning_action = match kind {
-        MenuKind::ViewMode => Action::OpenViewMenu,
-        MenuKind::Hamburger => Action::OpenMenu,
-        MenuKind::Sort => return None,
-    };
-    config::TOOLBAR_BUTTONS
+    let owning_action = MENU_BUTTONS
         .iter()
-        .position(|toolbar_action| *toolbar_action == owning_action)
+        .find(|(menu_kind, _)| menu_kind == kind)
+        .map(|(_, owning_action)| *owning_action)?;
+    toolbar_buttons().position(|toolbar_action| toolbar_action == owning_action)
 }
 
 /// Put focus on toolbar button `i`. A button that drops a menu shows it on
@@ -1282,11 +1387,11 @@ fn focus_button(app: &mut App, button_index: usize) {
 /// the same position in the row. True when the key was consumed.
 fn toolbar_nav(app: &mut App, key_event: KeyEvent, button_index: usize) -> bool {
     let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
-    let in_nav_group = button_index < config::NAV_BUTTON_COUNT;
+    let in_nav_group = button_index < config::NAV_BUTTONS.len();
     let (first_button, last_button) = if in_nav_group {
-        (0, config::NAV_BUTTON_COUNT - 1)
+        (0, config::NAV_BUTTONS.len() - 1)
     } else {
-        (config::NAV_BUTTON_COUNT, config::TOOLBAR_BUTTONS.len() - 1)
+        (config::NAV_BUTTONS.len(), toolbar_button_count() - 1)
     };
     match key_event.code {
         KeyCode::Char('j') if ctrl => app.mode = Mode::Normal,
@@ -1295,12 +1400,12 @@ fn toolbar_nav(app: &mut App, key_event: KeyEvent, button_index: usize) -> bool 
         // group when the place has no trail to open.
         KeyCode::Char('h') if ctrl => {
             if !in_nav_group {
-                enter_crumbs(app, config::NAV_BUTTON_COUNT - 1)
+                enter_crumbs(app, config::NAV_BUTTONS.len() - 1)
             }
         }
         KeyCode::Char('l') if ctrl => {
             if in_nav_group {
-                enter_crumbs(app, config::NAV_BUTTON_COUNT)
+                enter_crumbs(app, config::NAV_BUTTONS.len())
             }
         }
         KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Normal,
@@ -1327,11 +1432,11 @@ pub fn leave_toolbar(app: &mut App) {
 /// Leave the toolbar first: a button whose action opens a menu has to be able
 /// to set the mode after us, not have it overwritten.
 fn press_button(app: &mut App, button_index: usize) {
-    let Some(a) = config::TOOLBAR_BUTTONS.get(button_index) else {
+    let Some(a) = toolbar_button(button_index) else {
         return;
     };
     leave_toolbar(app);
-    run_action(app, *a, 1);
+    run_action(app, a, 1);
 }
 
 /// The breadcrumb, driven from the keyboard. `Mode::CrumbMenu(segment_index)` is both
@@ -1355,8 +1460,8 @@ fn handle_crumb_menu_key(app: &mut App, key_event: KeyEvent, segment_index: usiz
         // on the button nearest the trail.
         KeyCode::Char('j') if ctrl => app.mode = Mode::Normal,
         KeyCode::Char('k') if ctrl => {}
-        KeyCode::Char('h') if ctrl => focus_button(app, config::NAV_BUTTON_COUNT - 1),
-        KeyCode::Char('l') if ctrl => focus_button(app, config::NAV_BUTTON_COUNT),
+        KeyCode::Char('h') if ctrl => focus_button(app, config::NAV_BUTTONS.len() - 1),
+        KeyCode::Char('l') if ctrl => focus_button(app, config::NAV_BUTTONS.len()),
         KeyCode::Char('n') if ctrl => app.menu_cursor = (app.menu_cursor + 1) % items.len(),
         KeyCode::Char('p') if ctrl => {
             app.menu_cursor = (app.menu_cursor + items.len() - 1) % items.len()
@@ -1462,6 +1567,94 @@ mod tests {
     fn tilde_expands_to_home() {
         assert_eq!(expand_tilde("~"), places::home());
         assert_eq!(expand_tilde("~/x"), places::home().join("x"));
+    }
+
+    /// `dd` is n lines counting this one; `dj` is n *more* than this one.
+    #[test]
+    fn dd_and_dj_differ_by_one_line() {
+        let (cursor, last) = (0, 99);
+        assert_eq!(delete_range(KeyCode::Char('d'), cursor, last, 3), Some((0, 2)));
+        assert_eq!(delete_range(KeyCode::Char('j'), cursor, last, 3), Some((0, 3)));
+    }
+
+    #[test]
+    fn ranges_stop_at_the_ends_of_the_pane() {
+        assert_eq!(delete_range(KeyCode::Char('d'), 8, 9, 50), Some((8, 9)));
+        assert_eq!(delete_range(KeyCode::Char('j'), 8, 9, 50), Some((8, 9)));
+        assert_eq!(delete_range(KeyCode::Char('k'), 2, 9, 50), Some((0, 2)));
+        assert_eq!(delete_range(KeyCode::Char('G'), 4, 9, 1), Some((4, 9)));
+    }
+
+    /// A count is whatever was typed at it, so the arithmetic has to survive
+    /// numbers no pane could hold.
+    #[test]
+    fn an_absurd_count_does_not_overflow() {
+        let huge = usize::MAX;
+        assert_eq!(delete_range(KeyCode::Char('d'), 5, 9, huge), Some((5, 9)));
+        assert_eq!(delete_range(KeyCode::Char('k'), 5, 9, huge), Some((0, 5)));
+    }
+
+    #[test]
+    fn a_key_that_is_not_a_motion_cancels_the_operator() {
+        assert_eq!(delete_range(KeyCode::Char('w'), 0, 9, 1), None);
+    }
+
+    /// `d` then Ctrl+d is a half page down, not a delete — and not swallowed
+    /// either: the operator cancels and the key goes on being itself.
+    #[test]
+    fn ctrl_d_after_d_cancels_and_is_re_dispatched() {
+        let mut app = test_app();
+        press_char(&mut app, 'd');
+        assert_eq!(app.pending_delete, Some(1));
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.pending_delete, None);
+    }
+
+    /// A cancelled operator has spent nothing, so the count typed after the
+    /// `d` is still standing for whatever the key turns out to mean.
+    #[test]
+    fn a_cancelled_operator_leaves_the_count_alone() {
+        let mut app = test_app();
+        press_char(&mut app, 'd');
+        press_char(&mut app, '3');
+        // `w` is not a motion `d` can use, and nothing else claims it either.
+        press_char(&mut app, 'w');
+        assert_eq!(app.pending_delete, None);
+        assert_eq!(app.count, "3");
+    }
+
+    /// The shift is in the character, so a terminal that reports it as well
+    /// and one that does not must reach the same binding.
+    #[test]
+    fn shifted_printables_match_with_or_without_the_modifier() {
+        let with = KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT);
+        let without = KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE);
+        assert_eq!(lookup_binding(normalize(with)), Some(Action::Bottom));
+        assert_eq!(lookup_binding(normalize(without)), Some(Action::Bottom));
+    }
+
+    /// Ctrl+Shift+Tab under the kitty protocol, and the bare `CSI Z` a legacy
+    /// terminal sends for the same chord: both are the previous tab.
+    #[test]
+    fn shift_tab_reaches_prev_tab_under_either_encoding() {
+        for mods in [
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            KeyModifiers::SHIFT,
+        ] {
+            let ev = KeyEvent::new(KeyCode::BackTab, mods);
+            assert_eq!(lookup_binding(normalize(ev)), Some(Action::PrevTab));
+        }
+    }
+
+    /// Shift+Delete is not a printable: its modifier is the whole difference
+    /// between trashing and deleting, so normalization must leave it alone.
+    #[test]
+    fn shift_still_counts_on_a_named_key() {
+        let ev = KeyEvent::new(KeyCode::Delete, KeyModifiers::SHIFT);
+        assert_eq!(lookup_binding(normalize(ev)), Some(Action::DeletePerm));
     }
 
     #[test]
