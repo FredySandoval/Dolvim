@@ -6,11 +6,11 @@ use std::sync::atomic::Ordering;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::app::{App, Confirm, Focus, MenuKind, Mode, ViewMode};
+use crate::ops;
 use crate::config;
 use crate::fs::SortKey;
-use crate::ops;
 use crate::places::{self, Target};
+use crate::app::{App, Confirm, Focus, MenuKind, Mode, ViewMode};
 
 pub fn handle_key_event(app: &mut App, key_event: KeyEvent) {
     // The transfer popup is modal, as Dolphin's is. Letting keys through means
@@ -1072,35 +1072,35 @@ const fn menu_item(label: &'static str, action: Action) -> MenuItem {
 pub fn menu_items(kind: &MenuKind) -> Vec<MenuItem> {
     match kind {
         MenuKind::Hamburger => vec![
-            menu_item("New Folder…            F10", Action::NewFolder),
-            menu_item("New File…                o", Action::NewFile),
-            menu_item("Rename…                 F2", Action::Rename),
-            menu_item("Move to Trash        x/Del", Action::Trash),
-            menu_item("Delete            Shift+Del", Action::DeletePerm),
-            menu_item("Cut                   Ctrl+X", Action::Cut),
-            menu_item("Copy                  Ctrl+C", Action::Copy),
-            menu_item("Paste                 Ctrl+V", Action::Paste),
-            menu_item("Compress                  ", Action::Compress),
-            menu_item("Restore from Trash        ", Action::Restore),
-            menu_item("Empty Trash               ", Action::EmptyTrash),
-            menu_item("Extract here              ", Action::Extract),
-            menu_item("Select All            Ctrl+A", Action::SelectAll),
-            menu_item("Show Hidden Files          H", Action::ToggleHidden),
-            menu_item("Filter                Ctrl+I", Action::ToggleFilterBar),
-            menu_item("Sort by…                   ", Action::OpenSortMenu),
-            menu_item("View mode…                 ", Action::OpenViewMenu),
-            menu_item("Split View                F3", Action::ToggleSplit),
-            menu_item("Places Panel              F9", Action::TogglePlaces),
-            menu_item("Information Panel        F11", Action::ToggleInfo),
-            menu_item("Open Terminal Here        F4", Action::TerminalHere),
+            menu_item("New Folder…               F10", Action::NewFolder),
+            menu_item("New File…                   o", Action::NewFile),
+            menu_item("Rename…                    F2", Action::Rename),
+            menu_item("Move to Trash           x/Del", Action::Trash),
+            menu_item("Delete              Shift+Del", Action::DeletePerm),
+            menu_item("Cut                    Ctrl+X", Action::Cut),
+            menu_item("Copy                   Ctrl+C", Action::Copy),
+            menu_item("Paste                  Ctrl+V", Action::Paste),
+            menu_item("Compress                     ", Action::Compress),
+            menu_item("Restore from Trash           ", Action::Restore),
+            menu_item("Empty Trash                  ", Action::EmptyTrash),
+            menu_item("Extract here                 ", Action::Extract),
+            menu_item("Select All             Ctrl+A", Action::SelectAll),
+            menu_item("Show Hidden Files           H", Action::ToggleHidden),
+            menu_item("Filter                 Ctrl+I", Action::ToggleFilterBar),
+            menu_item("Sort by…                     ", Action::OpenSortMenu),
+            menu_item("View mode…                   ", Action::OpenViewMenu),
+            menu_item("Split View                 F3", Action::ToggleSplit),
+            menu_item("Places Panel               F9", Action::TogglePlaces),
+            menu_item("Information Panel         F11", Action::ToggleInfo),
+            menu_item("Open Terminal Here         F4", Action::TerminalHere),
             menu_item("Properties          Alt+Enter", Action::Properties),
-            menu_item("Help                      F1", Action::Help),
-            menu_item("Quit                  Ctrl+Q", Action::QuitAll),
+            menu_item("Help                       F1", Action::Help),
+            menu_item("Quit                   Ctrl+Q", Action::QuitAll),
         ],
         MenuKind::ViewMode => vec![
-            menu_item("Icons                 Ctrl+1", Action::ViewIcons),
-            menu_item("Compact               Ctrl+2", Action::ViewCompact),
-            menu_item("Details               Ctrl+3", Action::ViewDetails),
+            menu_item("Icons                  Ctrl+1", Action::ViewIcons),
+            menu_item("Compact                Ctrl+2", Action::ViewCompact),
+            menu_item("Details                Ctrl+3", Action::ViewDetails),
         ],
         MenuKind::Sort => vec![
             menu_item("Name", Action::SortName),
@@ -1132,15 +1132,15 @@ fn handle_menu_key(app: &mut App, key_event: KeyEvent, kind: MenuKind) {
         run_action(app, action, 1);
     };
     match key_event.code {
-        KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Normal,
-        KeyCode::Char('n') if ctrl => app.menu_cursor = (app.menu_cursor + 1) % n,
-        KeyCode::Char('p') if ctrl => app.menu_cursor = (app.menu_cursor + n - 1) % n,
-        KeyCode::Char('y') if ctrl => accept_menu_item(app),
-        KeyCode::Down | KeyCode::Char('j') => app.menu_cursor = (app.menu_cursor + 1) % n,
-        KeyCode::Up | KeyCode::Char('k') => app.menu_cursor = (app.menu_cursor + n - 1) % n,
-        KeyCode::Home | KeyCode::Char('g') => app.menu_cursor = 0,
-        KeyCode::End | KeyCode::Char('G') => app.menu_cursor = n - 1,
-        KeyCode::Enter | KeyCode::Tab => accept_menu_item(app),
+        KeyCode::Esc   | KeyCode::Char('q') => app.mode = Mode::Normal,
+        KeyCode::Char('n') if ctrl          => app.menu_cursor = (app.menu_cursor + 1) % n,
+        KeyCode::Char('p') if ctrl          => app.menu_cursor = (app.menu_cursor + n - 1) % n,
+        KeyCode::Char('y') if ctrl          => accept_menu_item(app),
+        KeyCode::Down  | KeyCode::Char('j') => app.menu_cursor = (app.menu_cursor + 1) % n,
+        KeyCode::Up    | KeyCode::Char('k') => app.menu_cursor = (app.menu_cursor + n - 1) % n,
+        KeyCode::Home  | KeyCode::Char('g') => app.menu_cursor = 0,
+        KeyCode::End   | KeyCode::Char('G') => app.menu_cursor = n - 1,
+        KeyCode::Enter | KeyCode::Tab       => accept_menu_item(app),
         _ => {}
     }
 }
