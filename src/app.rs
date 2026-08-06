@@ -111,6 +111,14 @@ pub enum MenuKind {
     Sort,
 }
 
+/// Which half of a mark is waiting for its letter: `m` writing one, or `'`
+/// reading one. The letter itself is whatever key comes next.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MarkPending {
+    Set,
+    Jump,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Confirm {
     DeletePermanently(Vec<PathBuf>),
@@ -478,6 +486,12 @@ pub struct App {
     /// A `d` waiting for its motion, holding the count typed before it (`3dd`).
     /// One operator exists, so this is that count and not an enum of operators.
     pub pending_delete: Option<usize>,
+    /// An `m` or `'` waiting for the letter that names the mark.
+    pub pending_mark: Option<MarkPending>,
+    /// Vim's marks, at the granularity a file manager has: `ma` remembers where
+    /// you are, `'a` goes back. Kept for the session only, as vim's lowercase
+    /// marks are kept for the file.
+    pub marks: HashMap<char, Target>,
     pub search_last: String,
     pub drag: Option<Drag>,
     pub hits: Hitboxes,
@@ -524,6 +538,8 @@ impl App {
             count: String::new(),
             pending_chord_leader: None,
             pending_delete: None,
+            pending_mark: None,
+            marks: HashMap::new(),
             search_last: String::new(),
             drag: None,
             hits: Hitboxes::default(),

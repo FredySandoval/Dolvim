@@ -211,7 +211,8 @@ pub const DOLPHIN_KEYS: &[Bind] = &[
     bind(End       , NONE      , Action::Bottom         ),
     bind(PageDown  , NONE      , Action::PageDown       ),
     bind(PageUp    , NONE      , Action::PageUp         ),
-    bind(Char(' ') , NONE      , Action::ToggleSelect   ),
+    /* Space was ToggleSelect; it is the leader now (see CHORDS) and a leader
+       cannot also be a binding. Toggling a row is `v`, or the mouse. */
     bind(Char('a') , CTRL      , Action::SelectAll      ),
     /* Needs the kitty keyboard protocol; without it this key is Ctrl+A and
        selects all. See the modifier note above. */
@@ -263,7 +264,10 @@ pub const VIM_KEYS: &[Bind] = &[
     bind(Char('k') , NONE , Action::MoveUp         ),
     bind(Char('l') , NONE , Action::MoveRight      ),
     bind(Char('G') , SHIFT, Action::Bottom         ),
-    bind(Char('H') , SHIFT, Action::ToggleHidden   ),
+    /* Vimium's back/forward pair, pointed at the folder tree. `H` used to be
+       ToggleHidden, which is `<Space>h` now. */
+    bind(Char('H') , SHIFT, Action::NavigateUp     ),
+    bind(Char('L') , SHIFT, Action::NavigateInto   ),
     bind(Char('d') , CTRL , Action::HalfPageDown   ),
     bind(Char('u') , CTRL , Action::HalfPageUp     ),
     bind(Char('f') , CTRL , Action::PageDown       ),
@@ -272,26 +276,34 @@ pub const VIM_KEYS: &[Bind] = &[
     bind(Char('$') , NONE , Action::RowEnd         ),
     bind(Char('v') , NONE , Action::EnterVisual    ),
     bind(Char('V') , SHIFT, Action::EnterVisualLine),
-    bind(Char('y') , NONE , Action::Copy           ),
+    /* `y` is unbound: in vim it is an operator, and here it was not, which made
+       it the odd key out beside `d`. Copy is Ctrl+C until `y{motion}` exists. */
     bind(Char('d') , NONE , Action::DeleteOp       ),
     bind(Char('p') , NONE , Action::Paste          ),
-    bind(Char('P') , SHIFT, Action::DropIn         ),
+    /* `P` is unbound: it held DropIn, which is not a paste, and in vim `p`/`P`
+       differ only in where the same paste lands. */
     bind(Char('x') , NONE , Action::Trash          ),
-    bind(Char('r') , NONE , Action::Rename         ),
+    /* `r` is unbound: vim's `r` replaces a character and waits for one. Rename
+       is `cw`, which is what vim calls it anyway, or F2. */
     bind(Char('o') , NONE , Action::NewFile        ),
     bind(Char('O') , SHIFT, Action::NewFolder      ),
     bind(Char('u') , NONE , Action::Undo           ),
-    bind(Char('D') , SHIFT, Action::DragOut        ),
+    /* `D` is unbound: vim's `D` is `d$`, not a drag. */
     bind(Char('/') , NONE , Action::EnterSearch    ),
     bind(Char('n') , NONE , Action::SearchNext     ),
     bind(Char('N') , SHIFT, Action::SearchPrev     ),
     bind(Char(':') , NONE , Action::EnterCommand   ),
     bind(Enter     , CTRL , Action::OpenInNewTab   ),
-    bind(Char('m') , NONE , Action::OpenMenu       ),
+    /* Vim's marks. A file manager's "line" is its folder, so `ma` remembers a
+       folder and `'a` returns to it. The menu `m` used to open is still the
+       hamburger button — Ctrl+k into the toolbar row, or the mouse. */
+    bind(Char('m') , NONE , Action::SetMark        ),
+    bind(Char('\''), NONE , Action::JumpMark       ),
     bind(Char('h') , CTRL , Action::FocusLeft      ),
     bind(Char('l') , CTRL , Action::FocusRight     ),
     bind(Char('k') , CTRL , Action::EnterCrumbs    ),
-    bind(Char('?') , SHIFT, Action::Help           ),
+    /* `?` is unbound: it is search-backward in vim, and this program has no
+       backward search yet. Help is F1. */
 ];
 
 /* The toolbar buttons, left to right, with the breadcrumb between the two
@@ -330,6 +342,9 @@ pub const CHORDS: &[Chord] = &[
     chord('z'  , 'a'     , Action::ToggleExpand),
     chord('z'  , 'v'     , Action::CycleView   ),
     chord('c'  , 'w'     , Action::Rename      ),
+    /* Space is the leader. It starts sequences and so can bind nothing on its
+       own — the row it used to toggle is `v`'s job now. */
+    chord(' '  , 'h'     , Action::ToggleHidden),
 ];
 
 /// The tables above are data, and data drifts: a row added twice, a leader that

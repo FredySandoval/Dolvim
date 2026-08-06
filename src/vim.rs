@@ -10,7 +10,7 @@ use crate::ops;
 use crate::config;
 use crate::fs::SortKey;
 use crate::places::{self, Target};
-use crate::app::{App, Confirm, Focus, MenuKind, Mode, ViewMode};
+use crate::app::{App, Confirm, Focus, MarkPending, MenuKind, Mode, ViewMode};
 
 /// Modifiers as the keymap has to compare them.
 ///
@@ -74,9 +74,10 @@ fn handle_normal_key(app: &mut App, key_event: KeyEvent) {
         app.count.clear();
         app.pending_chord_leader = None;
         app.pending_delete = None;
+        app.pending_mark = None;
         // Esc ends the visual and takes the range with it: the selection
         // belonged to the drag, not to the pane. Outside a visual it is the
-        // same key that clears a selection built with Space.
+        // key that clears whatever selection stands.
         app.mode = Mode::Normal;
         app.pane_mut().selected.clear();
         return;
@@ -92,6 +93,20 @@ fn handle_normal_key(app: &mut App, key_event: KeyEvent) {
                 let n = take_count(app);
                 run_action(app, chord.action, n);
                 return;
+            }
+        }
+        return;
+    }
+
+    // A pending mark owns the next key too, and for the same reason: the letter
+    // names the mark and can be any letter, so nothing else may read it.
+    if let Some(pending_mark) = app.pending_mark.take() {
+        if let KeyCode::Char(c) = key_event.code {
+            if !key_event
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                mark_key(app, pending_mark, c);
             }
         }
         return;
@@ -139,6 +154,24 @@ fn handle_normal_key(app: &mut App, key_event: KeyEvent) {
         if key_event.modifiers.is_empty() {
             app.typeahead(c);
         }
+    }
+}
+
+/// Write or read one mark. A mark remembers a pane's target rather than its
+/// path, so `'t` returns to the Trash or to a saved search as readily as to a
+/// folder — and a jump to a letter never written says so rather than doing
+/// nothing, since a silent no-op is indistinguishable from a mistyped letter.
+fn mark_key(app: &mut App, pending_mark: MarkPending, letter: char) {
+    match pending_mark {
+        MarkPending::Set => {
+            let target = app.pane().target.clone();
+            app.marks.insert(letter, target);
+            app.info(format!("Marked '{letter}"));
+        }
+        MarkPending::Jump => match app.marks.get(&letter).cloned() {
+            Some(target) => app.goto(target, true),
+            None => app.error(format!("No mark '{letter}")),
+        },
     }
 }
 
@@ -362,6 +395,11 @@ pub enum Action {
     GoUp,
     GoHome,
     Open,
+    /// `H`/`L`: out of the folder and into the one under the cursor, the pair
+    /// Vimium spells the same way. Only the list views have them — Icons uses
+    /// its horizontal axis for the grid.
+    NavigateUp,
+    NavigateInto,
     OpenInNewTab,
     Refresh,
     /* cursor */
@@ -378,6 +416,8 @@ pub enum Action {
     RowStart,
     RowEnd,
     /* selection */
+    /// Unbound for now: Space, the key that used to say this, is the leader.
+    #[allow(dead_code)]
     ToggleSelect,
     SelectAll,
     InvertSelect,
@@ -434,10 +474,19 @@ pub enum Action {
     SearchNext,
     SearchPrev,
     EnterPathEdit,
+    /* marks */
+    /// `m`: the next key names a mark to write.
+    SetMark,
+    /// `'`: the next key names a mark to jump to.
+    JumpMark,
     /* misc */
     TerminalPanel,
     TerminalHere,
+    /// Unbound for now: `D` and `P` were the keys, and both mean something
+    /// else in vim. The drag itself still works from the mouse.
+    #[allow(dead_code)]
     DragOut,
+    #[allow(dead_code)]
     DropIn,
     OpenMenu,
     OpenViewMenu,
@@ -469,6 +518,18 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
         Action::GoUp => app.go_up(),
         Action::GoHome => app.goto(Target::Dir(places::home()), true),
         Action::Open => app.activate(),
+        // `H`/`L` walk the tree in the two list views. Icons spends its
+        // horizontal axis on the grid, so there they mean nothing rather than
+        // meaning something the row beside them contradicts.
+        Action::NavigateUp | Action::NavigateInto => {
+            if app.pane().view != ViewMode::Icons {
+                if action == Action::NavigateUp {
+                    app.go_up();
+                } else {
+                    app.activate();
+                }
+            }
+        }
         Action::OpenInNewTab => {
             if let Some(e) = app.pane().current().cloned() {
                 if e.is_dir() {
@@ -505,9 +566,9 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
                 count as isize
             };
             match app.pane().view {
-                // `l` opens in Details, `h` goes up. There is nothing sideways.
-                ViewMode::Details if left => app.go_up(),
-                ViewMode::Details => app.activate(),
+                // Details is one column wide, so there is nowhere sideways to
+                // go. Walking the tree is `H`/`L`, the same keys as in Compact.
+                ViewMode::Details => {}
                 ViewMode::Compact => app.step_across(cursor_delta, extend),
                 ViewMode::Icons => app.step_along(cursor_delta, extend),
             }
@@ -730,6 +791,13 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
             let p = app.pane().cwd.to_string_lossy().into_owned();
             enter_text(app, Mode::PathEdit, p);
         }
+
+        // marks
+        //
+        // Both keys only arm themselves; `handle_normal_key` owns the letter
+        // that follows, the way it owns a chord's follower.
+        Action::SetMark => app.pending_mark = Some(MarkPending::Set),
+        Action::JumpMark => app.pending_mark = Some(MarkPending::Jump),
 
         // misc
         Action::TerminalPanel | Action::TerminalHere => {
@@ -1165,7 +1233,7 @@ pub fn menu_items(kind: &MenuKind) -> Vec<MenuItem> {
             menu_item("Empty Trash                  ", Action::EmptyTrash),
             menu_item("Extract here                 ", Action::Extract),
             menu_item("Select All             Ctrl+A", Action::SelectAll),
-            menu_item("Show Hidden Files           H", Action::ToggleHidden),
+            menu_item("Show Hidden Files     <Space>h", Action::ToggleHidden),
             menu_item("Filter                 Ctrl+I", Action::ToggleFilterBar),
             menu_item("Sort by…                     ", Action::OpenSortMenu),
             menu_item("View mode…                   ", Action::OpenViewMenu),
@@ -1521,6 +1589,36 @@ mod tests {
         press_char(&mut app, '1');
         press_char(&mut app, '2');
         assert_eq!(app.count, "12");
+    }
+
+    /// `ma` then `'a` is the whole of marks: the letter is read by the pending
+    /// state rather than by the keymap, so any letter works — including one the
+    /// keymap binds, as `'d` here proves by not deleting anything.
+    #[test]
+    fn a_mark_is_written_and_read_by_its_letter() {
+        let mut app = test_app();
+        let here = app.pane().target.clone();
+        press_char(&mut app, 'm');
+        assert_eq!(app.pending_mark, Some(MarkPending::Set));
+        press_char(&mut app, 'd');
+        assert_eq!(app.pending_mark, None);
+        assert_eq!(app.marks.get(&'d'), Some(&here));
+        assert_eq!(app.pending_delete, None);
+
+        app.goto(Target::Dir(std::path::PathBuf::from("/")), true);
+        press_char(&mut app, '\'');
+        press_char(&mut app, 'd');
+        assert_eq!(app.pane().target, here);
+    }
+
+    /// A letter no mark was written to reports rather than silently doing
+    /// nothing, or a mistyped letter looks like a broken program.
+    #[test]
+    fn jumping_to_an_unwritten_mark_reports() {
+        let mut app = test_app();
+        press_char(&mut app, '\'');
+        press_char(&mut app, 'z');
+        assert!(app.status_is_error);
     }
 
     #[test]
