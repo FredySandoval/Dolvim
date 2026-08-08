@@ -1,20 +1,11 @@
-//! Configuration is source code. Edit, recompile, done.
-//!
-//! Every table below is data: a row is one decision. Colors are the Breeze
-//! light values measured off `Dolphin_screenshot.png`; see `docs/UI_SPEC.md`
-//! for the sample points.
-//!
-//! The tables are hand-aligned, and `rustfmt.toml` ignores this file so they
-//! stay that way — but `ignore` is a nightly option, so format with
-//! `cargo +nightly fmt`. Stable `cargo fmt` warns and reformats anyway.
-//! Keep the columns lined up when you add a row; that is the whole point.
+//! User configuration. Edit and recompile.
+//! Format with `cargo +nightly fmt`; table alignment requires nightly rustfmt.
 
 use ratatui::style::Color;
 
 use crate::fs::TimeStyle;
 
-/* Breeze palette. Truecolor: terminals that cannot do 24-bit will degrade,
- * which is their business, not ours. */
+/* colors: Breeze Light 24-bit samples; see docs/UI_SPEC.md */
 pub mod color {
     use super::Color;
     /*        name                           r    g    b       used for                        */
@@ -33,14 +24,10 @@ pub mod color {
     pub const CUT       :Color = Color::Rgb(160, 165, 170); /* cut items, ghosted as in Dolphin*/
     pub const ERROR     :Color = Color::Rgb(218,  68,  83); /* status bar errors               */
     pub const GAUGE_FULL:Color = Color::Rgb(200, 205, 210); /* used part of a device capacity  */
-    pub const OFFLINE   :Color = Color::Rgb(246, 116,   0); /* unreachable: unmounted device   */
-                                                            /* or locked folder. Breeze carrot */
+    pub const OFFLINE   :Color = Color::Rgb(246, 116,   0); /* unmounted device, locked folder */
 }
 
-/* Icon stand-ins. A terminal cell is not 48x48 px; these are the closest
- * unambiguous glyphs available. The Private Use Area ones need a Nerd Font
- * patched terminal font; without one they render as tofu — swap them for a
- * plain Unicode glyph and recompile, that is the whole fallback story. */
+/* icons / glyphs; private-use glyphs require a Nerd Font */
 pub mod glyph {
     /*        name          escape                 glyph  where it appears      */
     pub const FOLDER       :&str = "\u{ea83}" ; /*   directory entry            */
@@ -81,68 +68,65 @@ pub mod glyph {
     pub const EXPAND_OPEN  :&str = "\u{25be}" ; /* ▾  expanded folder           */
 }
 
-/* Panel geometry and tunables. */
-pub const PLACES_WIDTH        :  u16 =   22; /* Places panel columns, the screenshot's 150 px   */
+/* layout, panels, and input */
+pub const PLACES_WIDTH        :  u16 =   22; /* Places panel width in terminal columns          */
 pub const INFO_WIDTH          :  u16 =   30; /* Information panel columns (F11)                 */
 pub const TYPEAHEAD_TIMEOUT_MS:  u64 = 1000; /* type-ahead buffer life without a keystroke      */
-/* Double-click window. Dolphin selects on the first click and opens on the
- * second — verified on a stock install with no `SingleClick` key set in
- * kdeglobals. We do the same. */
+
+/* mouse */
 pub const DOUBLE_CLICK_MS     :  u64 =  400; /* second click inside this counts as a double     */
-pub const WATCH_DEBOUNCE_MS   :  u64 =  120; /* coalescing window for inotify storms            */
+
+/* filesystem and event loop */
+pub const WATCH_DEBOUNCE_MS   :  u64 =  120; /* refresh delay after changes                     */
 pub const TICK_MS             :  u64 =   40; /* event loop tick; listing/thumbnail poll rate    */
 pub const DRAG_THRESHOLD      :  u16 =    1; /* cells of movement before a drag begins          */
+
+/* thumbnails and file view */
 pub const THUMB_CACHE_CAP     :usize =  512; /* decoded thumbnails held in memory               */
 pub const THUMB_MAX_INFLIGHT  :usize =   32; /* decodes queued at once; the rest wait           */
 pub const CELL_GAP            :  u16 =    2; /* blank columns between icon-view tiles           */
 pub const VIEW_MARGIN         :  u16 =    1; /* blank columns left of Compact and Details rows  */
 pub const NAME_LINES          :  u16 =    3; /* rows a name may wrap over in the icon view      */
-pub const DISK_POLL_MS        :  u64 = 2000; /* how often the status bar re-measures free space */
-pub const COPY_CHUNK_BYTES    :usize = 256 * 1024; /* streaming copy buffer; cancel granularity  */
-pub const RECENT_MAX_DEPTH    :  u32 =    3; /* how deep a Recent search walks                  */
-pub const RECENT_MAX_ITEMS    :usize = 2000; /* results a Recent search stops at                */
 
-/* How the Details `Modified` column spells a timestamp. `Short` is Dolphin's
- * `Aug 2, 8:22pm`, dropping the year while it is the current one; `Iso` is
- * `2026-08-02 20:22`, which sorts as it reads. Month names are English: the
- * locale's are the C library's to know, and this crate forbids `unsafe`.
- * The column width follows the style rather than being restated beside it. */
-pub const TIME_STYLE          :TimeStyle = TimeStyle::Short;
-/* `Modified` at its widest: `Sep 30 2025, 12:22pm` / `2026-08-02 20:22`. */
-pub const TIME_WIDTH          :  u16 = match TIME_STYLE {
+/* status, transfers, and Recent files */
+pub const DISK_POLL_MS        :  u64 =   2000; /* how often the status bar re-measures free space */
+pub const COPY_CHUNK_BYTES    :usize = 262144; /* streaming copy buffer; cancel granularity       */
+pub const RECENT_MAX_DEPTH    :  u32 =      3; /* how deep a Recent search walks                  */
+pub const RECENT_MAX_ITEMS    :usize =   2000; /* results a Recent search stops at                */
+
+/* Details timestamp*/
+pub const TIME_STYLE          :TimeStyle = TimeStyle::Short; /* options: Short | Iso*/
+
+/* Details columns */
+pub const TIME_WIDTH : u16 = match TIME_STYLE {
     TimeStyle::Short => 20,
     TimeStyle::Iso   => 16,
 };
 pub const SIZE_WIDTH          :  u16 =   12; /* Details `Size` column                           */
 pub const TYPE_WIDTH          :  u16 =   14; /* Details `Type` column                           */
+
+/* copy/move progress popup, centered on screen */
 pub const PROGRESS_POPUP_W    :  u16 =   60; /* transfer popup, columns                         */
 pub const PROGRESS_POPUP_H    :  u16 =    6; /* transfer popup, rows                            */
-/* The meter inside the popup: its width less the borders and their padding. */
+
+/* transfer progress bar: popup width minus borders and padding */
 pub const PROGRESS_BAR_WIDTH  :usize = PROGRESS_POPUP_W as usize - 4;
-/* Columns the toolbar keeps clear on the right for its own controls: the
- * hamburger, Search and the Split button, with the blanks between them.
- * Widen it if you add a button, or the breadcrumb will run underneath. */
+
+/* toolbar: space reserved right of the breadcrumb */
 pub const TOOLBAR_RIGHT_WIDTH :  u16 =   22; /* right-hand toolbar controls, columns            */
 
-/* Icon cell *pitch*: each cell keeps a blank row on top and CELL_GAP blank
- * columns, which is where the cursor frame is drawn. Content is therefore
- * (CELL_WIDTH - CELL_GAP) by (CELL_HEIGHT - 1) — one icon row and three of name, the
- * 13x4 the layout was designed around. Compact sizes its own columns. */
+/* icon view cell pitch; includes cursor-frame gaps */
 pub const CELL_WIDTH          :  u16 =   15; /* icon-view cell pitch, columns                   */
 pub const CELL_HEIGHT         :  u16 =    5; /* icon-view cell pitch, rows                      */
 
-/* The XDG user directories, as xdg-user-dirs defaults them. Places lists these
- * rows and the view badges the same folders, so both read this one table — a
- * second spelling of "Downloads" is how the Places row went missing once.
- * The glyph is also the view's badge, painted only on a folder directly under
- * $HOME, so a Downloads you made elsewhere stays a plain folder. */
+/* Places / XDG directories and home-folder badges */
 pub struct XdgDir {
     pub env_key: &'static str,
     pub name   : &'static str,
     pub glyph  : &'static str,
 }
 
-/* One row per directory; `xdg_dir` reads the key, Places shows the name. */
+/* XDG key, display name, glyph */
 const fn xdg(env_key: &'static str, name: &'static str, glyph: &'static str) -> XdgDir {
     XdgDir { env_key, name, glyph }
 }
@@ -157,43 +141,28 @@ pub const XDG_DIRS: &[XdgDir] = &[
     xdg("XDG_VIDEOS_DIR"   , "Videos"   , glyph::VIDEO   ),
 ];
 
-/* File classification by extension. No `svg`: thumbnails come from the `image`
- * crate, which decodes rasters only, so an svg would badge as an image and then
- * never produce one. */
+/* file types; SVG omitted because thumbnails are raster-only */
 pub const IMAGE_EXTS   : &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp", "ico", "tif", "tiff"];
 pub const ARCHIVE_EXTS : &[&str] = &["tar", "gz" , "tgz" , "bz2", "xz" , "zst" , "zip", "7z" , "rar"];
 
-// ---------------------------------------------------------------------------
-// Keymap
-// ---------------------------------------------------------------------------
+/* keybindings */
 
 use crossterm::event::KeyCode::*;
 use crossterm::event::KeyModifiers;
 
 use crate::vim::{bind, Action, Bind};
 
-/* Modifier names for the tables below. A const context has no `|` operator —
- * that is a trait call — so a combination spells itself with `.union()`. Naming
- * the combinations here keeps that spelling out of every row.
- *
- * SHIFT on a `Char` row is documentation: `vim::normalize` strips it from the
- * event and from the row alike, because terminals disagree about reporting it
- * and the character's own case says it anyway. Spell the character shifted —
- * `G`, `N` — or the row says one thing and matches another.
- *
- * CTRL is the same disagreement one step further on. The legacy encoding sends
- * Ctrl+letter as a bare control byte — 0x01 for Ctrl+A — which has no room for
- * case, so Ctrl+Shift+A arrives indistinguishable from Ctrl+A and Ctrl+I from
- * Tab. `main::enter_raw_screen` asks for the kitty keyboard protocol, which
- * reports the real event; the two CTRL_SHIFT rows below need it, and on a
- * terminal without it they simply never fire. Everything else is unaffected. */
+/* key modifiers
+ * SHIFT characters use their shifted spelling (`G`, not `g`).
+ * CTRL_SHIFT characters require the kitty keyboard protocol.
+ */
 const NONE      : KeyModifiers = KeyModifiers::NONE;
 const ALT       : KeyModifiers = KeyModifiers::ALT;
 const CTRL      : KeyModifiers = KeyModifiers::CONTROL;
 const SHIFT     : KeyModifiers = KeyModifiers::SHIFT;
 const CTRL_SHIFT: KeyModifiers = KeyModifiers::CONTROL.union(KeyModifiers::SHIFT);
 
-/* Dolphin's native shortcuts. Active in every non-text mode, alongside vim. */
+/* Dolphin keybindings */
 pub const DOLPHIN_KEYS: &[Bind] = &[
 /*  key              mods        action                  */
     bind(Left      , ALT       , Action::Back           ),
@@ -211,11 +180,9 @@ pub const DOLPHIN_KEYS: &[Bind] = &[
     bind(End       , NONE      , Action::Bottom         ),
     bind(PageDown  , NONE      , Action::PageDown       ),
     bind(PageUp    , NONE      , Action::PageUp         ),
-    /* Space was ToggleSelect; it is the leader now (see CHORDS) and a leader
-       cannot also be a binding. Toggling a row is `v`, or the mouse. */
+    /* selection: Space is the chord leader; use `v` or the mouse */
     bind(Char('a') , CTRL      , Action::SelectAll      ),
-    /* Needs the kitty keyboard protocol; without it this key is Ctrl+A and
-       selects all. See the modifier note above. */
+    /* kitty keyboard protocol */
     bind(Char('A') , CTRL_SHIFT, Action::InvertSelect   ),
     bind(Char('c') , CTRL      , Action::Copy           ),
     bind(Char('x') , CTRL      , Action::Cut            ),
@@ -224,7 +191,7 @@ pub const DOLPHIN_KEYS: &[Bind] = &[
     bind(Delete    , SHIFT     , Action::DeletePerm     ),
     bind(F(2)      , NONE      , Action::Rename         ),
     bind(F(10)     , NONE      , Action::NewFolder      ),
-    /* Likewise; F10 is the one that works everywhere. */
+    /* kitty keyboard protocol; F10 is the fallback */
     bind(Char('N') , CTRL_SHIFT, Action::NewFolder      ),
     bind(Enter     , ALT       , Action::Properties     ),
     bind(Char('1') , CTRL      , Action::ViewIcons      ),
@@ -238,15 +205,10 @@ pub const DOLPHIN_KEYS: &[Bind] = &[
     bind(Char('t') , CTRL      , Action::NewTab         ),
     bind(Char('w') , CTRL      , Action::CloseTab       ),
     bind(Tab       , CTRL      , Action::NextTab        ),
-    /* The shift that produced BackTab is spent on it; what reaches us is
-       Ctrl+BackTab, so that is what the row says. The legacy encoding has no
-       room for the Ctrl either and sends a bare BackTab, hence the second row —
-       Shift+Tab means nothing else here, so it can mean this everywhere. */
+    /* previous tab: modern and legacy terminal encodings */
     bind(BackTab   , CTRL      , Action::PrevTab        ),
     bind(BackTab   , NONE      , Action::PrevTab        ),
-    /* Dolphin's Ctrl+F is Find, but the vim table is consulted first and there
-       Ctrl+F is a page down, which wins in a program called Dolvim. Search is
-       `/`, the toolbar button, or Ctrl+I for the filter bar. */
+    /* search: `/` or toolbar; Ctrl+F remains Vim page-down */
     bind(F(6)      , NONE      , Action::EnterPathEdit  ),
     bind(F(4)      , NONE      , Action::TerminalPanel  ),
     bind(F(4)      , SHIFT     , Action::TerminalHere   ),
@@ -254,9 +216,7 @@ pub const DOLPHIN_KEYS: &[Bind] = &[
     bind(Char('q') , CTRL      , Action::QuitAll        ),
 ];
 
-/* The vim layer. Consulted first, so `h`/`j`/`k`/`l` are motions; any
- * printable key that lands in neither table falls through to Dolphin's
- * type-ahead jump-to-name. */
+/* Vim keybindings; checked before Dolphin, then type-ahead search */
 pub const VIM_KEYS: &[Bind] = &[
     /*    key         mods    action                  */
     bind(Char('h') , NONE , Action::MoveLeft       ),
@@ -264,8 +224,7 @@ pub const VIM_KEYS: &[Bind] = &[
     bind(Char('k') , NONE , Action::MoveUp         ),
     bind(Char('l') , NONE , Action::MoveRight      ),
     bind(Char('G') , SHIFT, Action::Bottom         ),
-    /* Vimium's back/forward pair, pointed at the folder tree. `H` used to be
-       ToggleHidden, which is `<Space>h` now. */
+    /* folder navigation; hidden files use `<Space>h` */
     bind(Char('H') , SHIFT, Action::NavigateUp     ),
     bind(Char('L') , SHIFT, Action::NavigateInto   ),
     bind(Char('d') , CTRL , Action::HalfPageDown   ),
@@ -276,40 +235,31 @@ pub const VIM_KEYS: &[Bind] = &[
     bind(Char('$') , NONE , Action::RowEnd         ),
     bind(Char('v') , NONE , Action::EnterVisual    ),
     bind(Char('V') , SHIFT, Action::EnterVisualLine),
-    /* `y` is unbound: in vim it is an operator, and here it was not, which made
-       it the odd key out beside `d`. Copy is Ctrl+C until `y{motion}` exists. */
+    /* unbound: `y` reserved for a future Vim operator; copy is Ctrl+C */
     bind(Char('d') , NONE , Action::DeleteOp       ),
     bind(Char('p') , NONE , Action::Paste          ),
-    /* `P` is unbound: it held DropIn, which is not a paste, and in vim `p`/`P`
-       differ only in where the same paste lands. */
+    /* unbound: `P` reserved for Vim paste-before */
     bind(Char('x') , NONE , Action::Trash          ),
-    /* `r` is unbound: vim's `r` replaces a character and waits for one. Rename
-       is `cw`, which is what vim calls it anyway, or F2. */
+    /* unbound: `r` reserved for Vim replace; rename is `cw` or F2 */
     bind(Char('o') , NONE , Action::NewFile        ),
     bind(Char('O') , SHIFT, Action::NewFolder      ),
     bind(Char('u') , NONE , Action::Undo           ),
-    /* `D` is unbound: vim's `D` is `d$`, not a drag. */
+    /* unbound: `D` reserved for Vim `d$` */
     bind(Char('/') , NONE , Action::EnterSearch    ),
     bind(Char('n') , NONE , Action::SearchNext     ),
     bind(Char('N') , SHIFT, Action::SearchPrev     ),
     bind(Char(':') , NONE , Action::EnterCommand   ),
     bind(Enter     , CTRL , Action::OpenInNewTab   ),
-    /* Vim's marks. A file manager's "line" is its folder, so `ma` remembers a
-       folder and `'a` returns to it. The menu `m` used to open is still the
-       hamburger button — Ctrl+k into the toolbar row, or the mouse. */
+    /* marks: `ma` saves a folder; `'a` returns to it */
     bind(Char('m') , NONE , Action::SetMark        ),
     bind(Char('\''), NONE , Action::JumpMark       ),
     bind(Char('h') , CTRL , Action::FocusLeft      ),
     bind(Char('l') , CTRL , Action::FocusRight     ),
     bind(Char('k') , CTRL , Action::EnterCrumbs    ),
-    /* `?` is unbound: it is search-backward in vim, and this program has no
-       backward search yet. Help is F1. */
+    /* unbound: `?` reserved for backward search; help is F1 */
 ];
 
-/* The toolbar buttons, left to right, with the breadcrumb between the two
-   groups. Ctrl+h / Ctrl+l step across the three panes of the row; h and l walk
-   the buttons inside one. The group boundary is `NAV_BUTTONS.len()` — a button
-   moved between the tables moves the boundary with it. */
+/* toolbar buttons: navigation, breadcrumb, right controls */
 pub const NAV_BUTTONS: &[Action] = &[
     Action::Back,
     Action::Forward,
@@ -321,7 +271,7 @@ pub const RIGHT_BUTTONS: &[Action] = &[
     Action::OpenMenu,
 ];
 
-/* Two-key sequences: press the leader, then the follower. */
+/* chord keybindings */
 pub struct Chord {
     pub leader  : char,
     pub follower: char,
@@ -342,25 +292,21 @@ pub const CHORDS: &[Chord] = &[
     chord('z'  , 'a'     , Action::ToggleExpand),
     chord('z'  , 'v'     , Action::CycleView   ),
     chord('c'  , 'w'     , Action::Rename      ),
-    /* Space is the leader. It starts sequences and so can bind nothing on its
-       own — the row it used to toggle is `v`'s job now. */
+    /* Space leader; selection moved to `v` */
     chord(' '  , 'h'     , Action::ToggleHidden),
 ];
 
-/// The tables above are data, and data drifts: a row added twice, a leader that
-/// is also a binding, a menu whose owning button moved. None of that is a
-/// compile error, so it is a test — the price of configuration being source.
+/* sanity tests */
 #[cfg(test)]
 mod sanity {
     use super::*;
     use crossterm::event::KeyCode;
     use crate::vim::{menu_owner, normalize_mods, toolbar_buttons, MENU_BUTTONS};
 
-    /// Bindings the vim table knowingly takes over from Dolphin's. An entry
-    /// here is a decision someone made; anything else is a collision.
+    /* allowlist: Vim/Dolphin keybinding collisions */
     const SHADOWS: &[(KeyCode, KeyModifiers)] = &[];
 
-    /// Every row as the lookup will actually see it.
+    /* normalized keybindings */
     fn normalized(table: &[Bind]) -> Vec<(KeyCode, KeyModifiers)> {
         table
             .iter()
@@ -380,9 +326,7 @@ mod sanity {
         }
     }
 
-    /// A `Char` row whose modifiers still name SHIFT after normalization is a
-    /// row that cannot match: the shift went into the character. Spell it
-    /// shifted — `N`, not `n` — or drop the modifier.
+    /* SHIFT keybindings use uppercase characters. */
     #[test]
     fn shift_rows_spell_the_shifted_character() {
         for b in VIM_KEYS.iter().chain(DOLPHIN_KEYS) {
@@ -395,8 +339,7 @@ mod sanity {
         }
     }
 
-    /// A leader that is also a binding acts on the first press, so its chords
-    /// can never start.
+    /* chord leaders must be unbound. */
     #[test]
     fn chord_leaders_are_not_bindings() {
         for chord in CHORDS {
@@ -418,10 +361,7 @@ mod sanity {
         }
     }
 
-    /// `vim::menu_owner` finds a button by its action, so an action that names
-    /// a menu has to sit at exactly one place in the row — there once, and no
-    /// more than once. The menus are read from `vim::MENU_BUTTONS`, the one
-    /// place that says which they are, so a third menu cannot pass untested.
+    /* each toolbar menu has one owning button. */
     #[test]
     fn each_menu_hangs_from_exactly_one_button() {
         for (kind, menu_action) in MENU_BUTTONS {
@@ -434,8 +374,7 @@ mod sanity {
         }
     }
 
-    /// Both groups have to be inhabited: crossing the breadcrumb lands on the
-    /// first or last button of the group opposite, and an empty one has none.
+    /* toolbar navigation requires both button groups. */
     #[test]
     fn both_toolbar_groups_are_inhabited() {
         assert!(!NAV_BUTTONS.is_empty() && !RIGHT_BUTTONS.is_empty());
