@@ -34,6 +34,7 @@ pub enum ViewMode {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Focus {
     Places,
+    Tabs,
     View,
 }
 
@@ -1021,25 +1022,35 @@ impl App {
         self.reload();
     }
 
-    /// The focusable columns, left to right: Places, pane 0, pane 1. `Ctrl+h`
-    /// and `Ctrl+l` step between them and stop at the ends, like `<C-w>h` and
-    /// `<C-w>l` in vim.
+    /// Horizontal pane focus: Places, left view, right view.
+    /// From Tabs, `Ctrl+h` and `Ctrl+l` enter the left and right views.
     pub fn focus_left(&mut self) {
-        if self.focus == Focus::View && self.tab().active > 0 {
-            self.tab_mut().active = 0;
-        } else if self.focus == Focus::View && self.places_visible {
-            self.focus = Focus::Places;
+        match self.focus {
+            Focus::Tabs => {
+                self.focus = Focus::View;
+                self.tab_mut().active = 0;
+            }
+            Focus::View if self.tab().active > 0 => self.tab_mut().active = 0,
+            Focus::View if self.places_visible => self.focus = Focus::Places,
+            Focus::Places | Focus::View => {}
         }
     }
 
     pub fn focus_right(&mut self) {
-        if self.focus == Focus::Places {
-            // Coming back from Places lands on the left pane, which is the one
-            // immediately to its right — not wherever focus was before.
-            self.focus = Focus::View;
-            self.tab_mut().active = 0;
-        } else if self.split_on() && self.tab().active == 0 {
-            self.tab_mut().active = 1;
+        match self.focus {
+            Focus::Tabs => {
+                let pane = usize::from(self.split_on());
+                self.focus = Focus::View;
+                self.tab_mut().active = pane;
+            }
+            Focus::Places => {
+                self.focus = Focus::View;
+                self.tab_mut().active = 0;
+            }
+            Focus::View if self.split_on() && self.tab().active == 0 => {
+                self.tab_mut().active = 1;
+            }
+            Focus::View => {}
         }
     }
 
@@ -1066,6 +1077,9 @@ impl App {
         }
         self.tabs.remove(self.active_tab);
         self.active_tab = self.active_tab.min(self.tabs.len() - 1);
+        if self.tabs.len() == 1 && self.focus == Focus::Tabs {
+            self.focus = Focus::View;
+        }
     }
 
     pub fn cycle_tab(&mut self, delta: isize) {

@@ -21,28 +21,23 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     paint(frame, area, color::VIEW_BG);
 
-    let tabbar = if app.tabs.len() > 1 { 1 } else { 0 };
     let filter = if app.filter_bar { 1 } else { 0 };
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),      // toolbar + breadcrumb
-            Constraint::Length(tabbar), // tab bar, only with >1 tab
-            Constraint::Min(1),         // body
+            Constraint::Min(1),         // body (including the tab pane)
             Constraint::Length(filter), // filter bar
             Constraint::Length(1),      // status bar
         ])
         .split(area);
 
     toolbar(frame, app, rows[0]);
-    if tabbar == 1 {
-        tab_bar(frame, app, rows[1]);
-    }
-    body(frame, app, rows[2]);
+    body(frame, app, rows[1]);
     if filter == 1 {
-        filter_bar(frame, app, rows[3]);
+        filter_bar(frame, app, rows[2]);
     }
-    status_bar(frame, app, rows[4]);
+    status_bar(frame, app, rows[3]);
 
     overlays(frame, app, area);
 }
@@ -287,7 +282,11 @@ fn tab_bar(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         let st = if i == app.active_tab {
             Style::default()
-                .bg(color::VIEW_BG)
+                .bg(if app.focus == Focus::Tabs {
+                    color::SELECTION
+                } else {
+                    color::VIEW_BG
+                })
                 .fg(color::TEXT)
                 .add_modifier(Modifier::BOLD)
         } else {
@@ -328,24 +327,38 @@ fn body(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     app.hits.places = cols[0];
 
+    // Tabs are a pane above the file views, not a window-wide strip. This keeps
+    // the Places heading in the same row and gives both regions their own column.
+    let tabbar = if app.tabs.len() > 1 { 1 } else { 0 };
+    let view_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(tabbar), Constraint::Min(1)])
+        .split(cols[1]);
+    if tabbar == 1 {
+        tab_bar(frame, app, view_rows[0]);
+    } else {
+        app.hits.tabs.clear();
+    }
+    let view_area = view_rows[1];
+
     let n = app.tab().panes.len();
     if n > 1 {
         let halves = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(cols[1]);
+            .split(view_area);
         for i in 0..n {
             draw_pane(frame, app, halves[i], i);
         }
         // The divider between the two views.
         let x = halves[1].x.saturating_sub(1);
-        for y in cols[1].y..cols[1].bottom() {
+        for y in view_area.y..view_area.bottom() {
             if let Some(c) = frame.buffer_mut().cell_mut((x, y)) {
                 c.set_char('\u{2502}').set_fg(color::SEPARATOR);
             }
         }
     } else {
-        draw_pane(frame, app, cols[1], 0);
+        draw_pane(frame, app, view_area, 0);
     }
 
     if info_width > 0 {
@@ -1416,9 +1429,11 @@ fn help_lines() -> Vec<Line<'static>> {
         key_row("<Space>h", "toggle hidden files"),
         key_row("F3  F9  F11  Ctrl+I", "split, places, info, filter"),
         key_row("Ctrl+h / Ctrl+l", "focus the panel left / right"),
-        section_heading("Toolbar row"),
-        key_row("Ctrl+k / Ctrl+j", "up into the row, back down"),
-        key_row("Ctrl+h  Ctrl+l", "nav buttons / trail / right buttons"),
+        section_heading("Tabs and toolbar rows"),
+        key_row("Ctrl+k / Ctrl+j", "focus the pane above / below"),
+        key_row("h / l in tabs", "previous / next tab"),
+        key_row("Ctrl+h/l in tabs", "focus left/right file view"),
+        key_row("Ctrl+h/l in toolbar", "nav buttons / trail / right buttons"),
         key_row("h  l", "previous / next item; a menu button opens"),
         key_row("j  k / Ctrl+n  Ctrl+p", "down / up an open menu"),
         key_row("Ctrl+y  Enter  Tab", "accept          Esc  cancel"),
@@ -1839,6 +1854,39 @@ mod tests {
             .map(|x| buf.cell((x, 29)).unwrap().symbol().to_string())
             .collect();
         assert!(last.contains("folder"), "status bar was: {last}");
+    }
+
+    #[test]
+    fn tabs_share_the_places_heading_row_and_own_the_view_column() {
+        let mut app = App::new(std::env::temp_dir());
+        app.tabs
+            .push(crate::app::Tab::new(std::env::temp_dir().join("other")));
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        assert_eq!(app.hits.tabs[0].x, config::PLACES_WIDTH);
+        assert_eq!(app.hits.tabs[0].y, 1);
+        assert_eq!(app.pane().area.y, 2);
+        let buf = term.backend().buffer();
+        let places: String = (0..config::PLACES_WIDTH)
+            .map(|x| buf.cell((x, 1)).unwrap().symbol())
+            .collect();
+        assert!(places.contains("Places"));
+    }
+
+    #[test]
+    fn hiding_the_tab_pane_clears_hits_and_returns_the_view_row() {
+        let mut app = App::new(std::env::temp_dir());
+        app.tabs
+            .push(crate::app::Tab::new(std::env::temp_dir().join("other")));
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(!app.hits.tabs.is_empty());
+
+        app.tabs.truncate(1);
+        term.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.hits.tabs.is_empty());
+        assert_eq!(app.pane().area.y, 1);
     }
 
     #[test]

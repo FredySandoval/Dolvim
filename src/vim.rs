@@ -6,11 +6,11 @@ use std::sync::atomic::Ordering;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::ops;
+use crate::app::{App, Confirm, Focus, MarkPending, MenuKind, Mode, ViewMode};
 use crate::config;
 use crate::fs::SortKey;
+use crate::ops;
 use crate::places::{self, Target};
-use crate::app::{App, Confirm, Focus, MarkPending, MenuKind, Mode, ViewMode};
 
 /// Modifiers as the keymap has to compare them.
 ///
@@ -56,8 +56,11 @@ pub fn handle_key_event(app: &mut App, key_event: KeyEvent) {
     match app.mode.clone() {
         Mode::Normal | Mode::Visual | Mode::VisualLine => handle_normal_key(app, key_event),
         Mode::Confirm(c) => handle_confirm_key(app, key_event, c),
-        // Any key dismisses an information overlay.
-        Mode::Properties | Mode::Help => app.mode = Mode::Normal,
+        Mode::Properties | Mode::Help => {
+            if lookup_binding(app, key_event) == Some(Action::Cancel) {
+                app.mode = Mode::Normal;
+            }
+        }
         Mode::Menu(kind) => handle_menu_key(app, key_event, kind),
         Mode::CrumbMenu(i) => handle_crumb_menu_key(app, key_event, i),
         Mode::Buttons(i) => handle_buttons_key(app, key_event, i),
@@ -86,13 +89,16 @@ fn handle_normal_key(app: &mut App, key_event: KeyEvent) {
     // A pending chord leader owns the next key, whatever it is.
     if let Some(pending_leader) = app.pending_chord_leader.take() {
         if let KeyCode::Char(c) = key_event.code {
-            if let Some(chord) = config::CHORDS
-                .iter()
-                .find(|chord| chord.leader == pending_leader && chord.follower == c)
-            {
-                let n = take_count(app);
-                run_action(app, chord.action, n);
-                return;
+            if key_event.modifiers.is_empty() {
+                if let Some(chord) = config::CHORDS.iter().find(|chord| {
+                    chord.leader == pending_leader
+                        && chord.follower == c
+                        && chord.modes.iter().any(|mode| mode.matches(&app.mode))
+                }) {
+                    let n = take_count(app);
+                    run_action(app, chord.action, n);
+                    return;
+                }
             }
         }
         return;
@@ -130,12 +136,8 @@ fn handle_normal_key(app: &mut App, key_event: KeyEvent) {
         }
     }
 
-    if app.focus == Focus::Places && places_key(app, key_event) {
-        return;
-    }
-
     if let KeyCode::Char(c) = key_event.code {
-        if key_event.modifiers.is_empty() && is_chord_leader(c) {
+        if key_event.modifiers.is_empty() && is_chord_leader(&app.mode, c) {
             // `c` is only a leader when a follower can complete it; `cw` is the
             // one chord it starts, so a lone `c` simply waits.
             app.pending_chord_leader = Some(c);
@@ -143,7 +145,7 @@ fn handle_normal_key(app: &mut App, key_event: KeyEvent) {
         }
     }
 
-    if let Some(a) = lookup_binding(key_event) {
+    if let Some(a) = lookup_binding(app, key_event) {
         let n = take_count(app);
         run_action(app, a, n);
         return;
@@ -178,8 +180,10 @@ fn mark_key(app: &mut App, pending_mark: MarkPending, letter: char) {
 /// A leader is a key some chord starts with — read off `config::CHORDS` rather
 /// than listed beside it, so a new leader cannot be half-added. Eight rows: the
 /// scan costs nothing, and a second spelling costs a chord that never fires.
-fn is_chord_leader(c: char) -> bool {
-    config::CHORDS.iter().any(|chord| chord.leader == c)
+fn is_chord_leader(mode: &Mode, c: char) -> bool {
+    config::CHORDS
+        .iter()
+        .any(|chord| chord.leader == c && chord.modes.iter().any(|m| m.matches(mode)))
 }
 
 /// Whether an operator's second key was a motion it could use. A cancelled
@@ -197,12 +201,7 @@ enum MotionResult {
 /// `count` is the product of the counts either side of the `d`. Everything
 /// saturates and both ends clamp: a count is whatever the user typed, and
 /// `9999999999d` must be a long delete, not a panic.
-fn delete_range(
-    code: KeyCode,
-    cursor: usize,
-    last: usize,
-    count: usize,
-) -> Option<(usize, usize)> {
+fn delete_range(code: KeyCode, cursor: usize, last: usize, count: usize) -> Option<(usize, usize)> {
     let below = |n: usize| cursor.saturating_add(n).min(last);
     Some(match code {
         // `dd` is this line and the n-1 below it; `dj` is this line *and* the
@@ -223,11 +222,7 @@ fn delete_range(
 /// by the one typed after, so `2d3j` is six lines. Anything that is not a
 /// motion cancels, which is what vim does with a key an operator cannot use —
 /// and the count survives the cancel, since it was never spent.
-fn delete_motion(
-    app: &mut App,
-    key_event: KeyEvent,
-    count_before_operator: usize,
-) -> MotionResult {
+fn delete_motion(app: &mut App, key_event: KeyEvent, count_before_operator: usize) -> MotionResult {
     // Ctrl+d is half-page down, not `dd`; only a bare motion completes the
     // operator. Modifiers arrive normalized, so bare is literally none.
     if !key_event.modifiers.is_empty() {
@@ -236,8 +231,7 @@ fn delete_motion(
     let total_count = count_before_operator.saturating_mul(peek_count(app));
     let cursor = app.pane().cursor;
     let last = app.pane().len().saturating_sub(1);
-    let Some((range_start, range_end)) =
-        delete_range(key_event.code, cursor, last, total_count)
+    let Some((range_start, range_end)) = delete_range(key_event.code, cursor, last, total_count)
     else {
         return MotionResult::Cancelled;
     };
@@ -305,15 +299,38 @@ fn enter_visual(app: &mut App, target_mode: Mode) {
     app.move_cursor(0, true);
 }
 
-/// The vim table first, so `h`/`j`/`k`/`l` are motions. Rows are normalized as
-/// the event was, so the SHIFT column cannot make a row unreachable.
-fn lookup_binding(key_event: KeyEvent) -> Option<Action> {
-    config::VIM_KEYS
+/// Find the one row that names this key in the current mode. Modifiers match
+/// exactly after normalization, so an unlisted combination never inherits a binding.
+fn lookup_binding(app: &App, key_event: KeyEvent) -> Option<Action> {
+    let find = |mode: BindMode| {
+        config::KEY_BINDINGS.iter().find(|bind| {
+            bind.code == key_event.code
+                && normalize_mods(bind.code, bind.mods) == key_event.modifiers
+                && bind.modes.contains(&mode)
+        })
+    };
+
+    if matches!(app.mode, Mode::Normal | Mode::Visual | Mode::VisualLine) {
+        let focused_mode = match app.focus {
+            Focus::Places => Some(BindMode::Places),
+            Focus::Tabs => Some(BindMode::Tabs),
+            Focus::View => None,
+        };
+        if let Some(action) = focused_mode.and_then(|mode| find(mode).map(|binding| binding.action)) {
+            return Some(action);
+        }
+    }
+
+    lookup_binding_for_mode(&app.mode, key_event)
+}
+
+fn lookup_binding_for_mode(mode: &Mode, key_event: KeyEvent) -> Option<Action> {
+    config::KEY_BINDINGS
         .iter()
-        .chain(config::DOLPHIN_KEYS.iter())
         .find(|bind| {
             bind.code == key_event.code
                 && normalize_mods(bind.code, bind.mods) == key_event.modifiers
+                && bind.modes.iter().any(|binding_mode| binding_mode.matches(mode))
         })
         .map(|bind| bind.action)
 }
@@ -330,55 +347,35 @@ fn take_count(app: &mut App) -> usize {
     n
 }
 
-/// Keys the Places panel consumes while it has focus. Returns true when handled.
-fn places_key(app: &mut App, key_event: KeyEvent) -> bool {
-    // A control chord is never Places navigation: `Ctrl+h` must move focus, not
-    // be read as the bare `h` that leaves the panel.
-    if key_event
-        .modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-    {
-        return false;
+fn move_places_cursor(app: &mut App, direction: isize) {
+    let row_count = app.places.len() as isize;
+    if row_count == 0 {
+        return;
     }
-    let move_places_cursor = |app: &mut App, direction: isize| {
-        let row_count = app.places.len() as isize;
-        let mut row_index = app.places_cursor as isize;
-        for _ in 0..row_count {
-            row_index = (row_index + direction).rem_euclid(row_count);
-            if app.places[row_index as usize].is_selectable() {
-                break;
-            }
+    let mut row_index = app.places_cursor as isize;
+    for _ in 0..row_count {
+        row_index = (row_index + direction).rem_euclid(row_count);
+        if app.places[row_index as usize].is_selectable() {
+            break;
         }
-        app.places_cursor = row_index as usize;
-    };
-    match key_event.code {
-        KeyCode::Char('j') | KeyCode::Down => move_places_cursor(app, 1),
-        KeyCode::Char('k') | KeyCode::Up => move_places_cursor(app, -1),
-        // `l` points the view at the place and stays, so the panel can be walked
-        // while the view follows. `Enter` means "this one, take me there" and so
-        // hands focus over as well. A bare motion never leaves its pane; an
-        // accept key may.
-        KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
-            if let Some(t) = app.places[app.places_cursor].target().cloned() {
-                app.goto(t, true);
-                if key_event.code == KeyCode::Enter {
-                    app.focus = Focus::View;
-                }
-            }
-        }
-        // The panel is one column deep, so there is nothing to the left of a
-        // place. Swallowed rather than ignored, or it would reach the view's
-        // cursor, which the user cannot see moving.
-        KeyCode::Char('h') | KeyCode::Left => {}
-        KeyCode::Tab => app.focus = Focus::View,
-        KeyCode::F(9) => {
-            app.places_visible = false;
+    }
+    app.places_cursor = row_index as usize;
+}
+
+fn open_place(app: &mut App, leave_panel: bool) {
+    let target = app
+        .places
+        .get(app.places_cursor)
+        .and_then(|place| place.target())
+        .cloned();
+    if let Some(target) = target {
+        app.goto(target, true);
+        if leave_panel {
             app.focus = Focus::View;
         }
-        _ => return false,
     }
-    true
 }
+
 
 // ---------------------------------------------------------------------------
 // Actions
@@ -426,8 +423,10 @@ pub enum Action {
     /* file operations */
     Copy,
     Cut,
-    /// `d`: trash a range, once a motion says which.
+    /// `d` in Normal: trash a range once a motion says which.
     DeleteOp,
+    /// `d` in a visual mode: trash the selected range immediately.
+    DeleteSelection,
     Paste,
     Trash,
     DeletePerm,
@@ -450,8 +449,10 @@ pub enum Action {
     SwapPane,
     FocusLeft,
     FocusRight,
-    /// `Ctrl+k`: up into the breadcrumb, with its menu open.
+    /// `Ctrl+k`: up one row, through tabs when that pane is visible.
     EnterCrumbs,
+    TabsLeave,
+    TabsIgnore,
     TogglePlaces,
     ToggleInfo,
     ToggleFilterBar,
@@ -493,18 +494,134 @@ pub enum Action {
     OpenSortMenu,
     Help,
     QuitAll,
+    /* text-entry and interface actions */
+    Cancel,
+    CommitInput,
+    InputBackspace,
+    InputDelete,
+    InputLeft,
+    InputRight,
+    InputHome,
+    InputEnd,
+    InputClear,
+    InputDeleteWord,
+    CompletePath,
+    ConfirmAccept,
+    InterfaceDown,
+    InterfaceUp,
+    InterfaceLeft,
+    InterfaceRight,
+    InterfaceFirst,
+    InterfaceLast,
+    InterfaceAccept,
+    InterfaceFocusDown,
+    InterfaceFocusUp,
+    InterfaceFocusLeft,
+    InterfaceFocusRight,
+    PlacesDown,
+    PlacesUp,
+    PlacesOpen,
+    PlacesAccept,
+    PlacesIgnore,
+    PlacesLeave,
 }
 
-/// One row of a keymap table.
+/// A payload-free input context for the static keymap.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BindMode {
+    Normal,
+    Visual,
+    VisualLine,
+    /// Places panel focus.
+    Places,
+    /// Tab pane focus. Like Places, this refines the normal/visual modes.
+    Tabs,
+    Command,
+    Search,
+    Filter,
+    PathEdit,
+    Rename,
+    BatchRename,
+    NewFolder,
+    NewFile,
+    Confirm,
+    Properties,
+    Help,
+    CrumbMenu,
+    Buttons,
+    Menu,
+}
+
+impl BindMode {
+    /// Whether this configured mode describes the application's current mode.
+    pub fn matches(self, mode: &Mode) -> bool {
+        matches!(
+            (self, mode),
+            (Self::Normal, Mode::Normal)
+                | (Self::Visual, Mode::Visual)
+                | (Self::VisualLine, Mode::VisualLine)
+                | (Self::Command, Mode::Command)
+                | (Self::Search, Mode::Search)
+                | (Self::Filter, Mode::Filter)
+                | (Self::PathEdit, Mode::PathEdit)
+                | (Self::Rename, Mode::Rename(_))
+                | (Self::BatchRename, Mode::BatchRename)
+                | (Self::NewFolder, Mode::NewFolder)
+                | (Self::NewFile, Mode::NewFile)
+                | (Self::Confirm, Mode::Confirm(_))
+                | (Self::Properties, Mode::Properties)
+                | (Self::Help, Mode::Help)
+                | (Self::CrumbMenu, Mode::CrumbMenu(_))
+                | (Self::Buttons, Mode::Buttons(_))
+                | (Self::Menu, Mode::Menu(_))
+        )
+    }
+}
+
+/// One row of the mode-aware keymap table.
 pub struct Bind {
-    pub code: KeyCode,
     pub mods: KeyModifiers,
+    pub code: KeyCode,
+    pub modes: &'static [BindMode],
     pub action: Action,
 }
 
-/// Terse constructor so a table row reads as one line.
-pub const fn bind(code: KeyCode, mods: KeyModifiers, action: Action) -> Bind {
-    Bind { code, mods, action }
+/// Terse constructor so every table row has the same four-column shape.
+pub const fn bind(
+    mods: KeyModifiers,
+    code: KeyCode,
+    modes: &'static [BindMode],
+    action: Action,
+) -> Bind {
+    Bind {
+        mods,
+        code,
+        modes,
+        action,
+    }
+}
+
+/// One row of the chord table.
+pub struct Chord {
+    pub leader: char,
+    pub follower: char,
+    pub modes: &'static [BindMode],
+    pub action: Action,
+}
+
+/// Terse constructor so every chord row has the same four-column shape.
+pub const fn chord(
+    leader: char,
+    follower: char,
+    modes: &'static [BindMode],
+    action: Action,
+) -> Chord {
+    Chord {
+        leader,
+        follower,
+        modes,
+        action,
+    }
 }
 
 pub fn run_action(app: &mut App, action: Action, count: usize) {
@@ -626,13 +743,16 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
             move_to_trash(app, trash_paths);
         }
         Action::DeleteOp => {
-            // A selection already is the range, so there is nothing to wait for.
             if app.pane().selected.is_empty() {
                 app.pending_delete = Some(count);
             } else {
                 let trash_paths = app.pane().selected_paths();
                 move_to_trash(app, trash_paths);
             }
+        }
+        Action::DeleteSelection => {
+            let trash_paths = app.pane().selected_paths();
+            move_to_trash(app, trash_paths);
         }
         Action::DeletePerm => {
             let perm_delete_paths = operand_paths(app, count);
@@ -727,16 +847,22 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
         Action::ToggleSplit => app.toggle_split(),
         Action::FocusLeft => app.focus_left(),
         Action::FocusRight => app.focus_right(),
+        Action::PlacesDown => move_places_cursor(app, 1),
+        Action::PlacesUp => move_places_cursor(app, -1),
+        Action::PlacesOpen => open_place(app, false),
+        Action::PlacesAccept => open_place(app, true),
+        Action::PlacesIgnore => {}
+        Action::PlacesLeave => app.focus = Focus::View,
         // Straight up, into whatever is overhead. The nav group sits over the
         // Places panel and the trail starts where the file view does, so which
         // one that is depends on the pane you left.
-        Action::EnterCrumbs => {
-            if app.focus == Focus::Places {
-                focus_button(app, 0);
-            } else {
-                enter_crumbs(app, config::NAV_BUTTONS.len() - 1);
-            }
-        }
+        Action::EnterCrumbs => match app.focus {
+            Focus::Places => focus_button(app, 0),
+            Focus::View if app.tabs.len() > 1 => app.focus = Focus::Tabs,
+            Focus::View | Focus::Tabs => enter_crumbs(app, config::NAV_BUTTONS.len() - 1),
+        },
+        Action::TabsLeave => app.focus = Focus::View,
+        Action::TabsIgnore => {}
         Action::SwapPane => app.other_pane(),
         Action::TogglePlaces => {
             app.places_visible = !app.places_visible;
@@ -810,6 +936,31 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
         Action::OpenSortMenu => open_menu(app, MenuKind::Sort),
         Action::Help => app.mode = Mode::Help,
         Action::QuitAll => app.quit = true,
+        Action::Cancel
+        | Action::CommitInput
+        | Action::InputBackspace
+        | Action::InputDelete
+        | Action::InputLeft
+        | Action::InputRight
+        | Action::InputHome
+        | Action::InputEnd
+        | Action::InputClear
+        | Action::InputDeleteWord
+        | Action::CompletePath
+        | Action::ConfirmAccept
+        | Action::InterfaceDown
+        | Action::InterfaceUp
+        | Action::InterfaceLeft
+        | Action::InterfaceRight
+        | Action::InterfaceFirst
+        | Action::InterfaceLast
+        | Action::InterfaceAccept
+        | Action::InterfaceFocusDown
+        | Action::InterfaceFocusUp
+        | Action::InterfaceFocusLeft
+        | Action::InterfaceFocusRight => {
+            debug_assert!(false, "mode-local action reached normal dispatcher");
+        }
     }
 }
 
@@ -883,8 +1034,8 @@ fn search_step(app: &mut App, search_direction: isize) {
 // ---------------------------------------------------------------------------
 
 fn handle_text_key(app: &mut App, key_event: KeyEvent) {
-    match key_event.code {
-        KeyCode::Esc => {
+    match lookup_binding(app, key_event) {
+        Some(Action::Cancel) => {
             if app.mode == Mode::Filter {
                 app.pane_mut().filter.clear();
                 app.pane_mut().refilter();
@@ -893,8 +1044,8 @@ fn handle_text_key(app: &mut App, key_event: KeyEvent) {
             app.mode = Mode::Normal;
             app.input.clear();
         }
-        KeyCode::Enter => commit_text_input(app),
-        KeyCode::Backspace => {
+        Some(Action::CommitInput) => commit_text_input(app),
+        Some(Action::InputBackspace) => {
             if app.input_cursor > 0 {
                 let i = byte_at(&app.input, app.input_cursor - 1);
                 app.input.remove(i);
@@ -902,23 +1053,25 @@ fn handle_text_key(app: &mut App, key_event: KeyEvent) {
                 live_update(app);
             }
         }
-        KeyCode::Delete => {
+        Some(Action::InputDelete) => {
             if app.input_cursor < app.input.chars().count() {
                 let i = byte_at(&app.input, app.input_cursor);
                 app.input.remove(i);
                 live_update(app);
             }
         }
-        KeyCode::Left => app.input_cursor = app.input_cursor.saturating_sub(1),
-        KeyCode::Right => app.input_cursor = (app.input_cursor + 1).min(app.input.chars().count()),
-        KeyCode::Home => app.input_cursor = 0,
-        KeyCode::End => app.input_cursor = app.input.chars().count(),
-        KeyCode::Char('u') if key_event.modifiers == KeyModifiers::CONTROL => {
+        Some(Action::InputLeft) => app.input_cursor = app.input_cursor.saturating_sub(1),
+        Some(Action::InputRight) => {
+            app.input_cursor = (app.input_cursor + 1).min(app.input.chars().count());
+        }
+        Some(Action::InputHome) => app.input_cursor = 0,
+        Some(Action::InputEnd) => app.input_cursor = app.input.chars().count(),
+        Some(Action::InputClear) => {
             app.input.clear();
             app.input_cursor = 0;
             live_update(app);
         }
-        KeyCode::Char('w') if key_event.modifiers == KeyModifiers::CONTROL => {
+        Some(Action::InputDeleteWord) => {
             while app.input_cursor > 0 {
                 let i = byte_at(&app.input, app.input_cursor - 1);
                 let c = app.input[i..].chars().next().unwrap_or(' ');
@@ -930,14 +1083,18 @@ fn handle_text_key(app: &mut App, key_event: KeyEvent) {
             }
             live_update(app);
         }
-        KeyCode::Tab if app.mode == Mode::PathEdit => complete_path(app),
-        KeyCode::Char(c) => {
-            let i = byte_at(&app.input, app.input_cursor);
-            app.input.insert(i, c);
-            app.input_cursor += 1;
-            live_update(app);
+        Some(Action::CompletePath) => complete_path(app),
+        None => {
+            if key_event.modifiers.is_empty() {
+                if let KeyCode::Char(c) = key_event.code {
+                    let i = byte_at(&app.input, app.input_cursor);
+                    app.input.insert(i, c);
+                    app.input_cursor += 1;
+                    live_update(app);
+                }
+            }
         }
-        _ => {}
+        Some(_) => debug_assert!(false, "non-text action in a text-entry mode"),
     }
 }
 
@@ -1151,11 +1308,14 @@ fn run_ex_command(app: &mut App, line: &str) {
 // ---------------------------------------------------------------------------
 
 fn handle_confirm_key(app: &mut App, key_event: KeyEvent, pending_confirm: Confirm) {
-    let yes = matches!(key_event.code, KeyCode::Char('y' | 'Y') | KeyCode::Enter);
-    app.mode = Mode::Normal;
-    if !yes {
-        app.info("Cancelled");
-        return;
+    match lookup_binding(app, key_event) {
+        Some(Action::ConfirmAccept) => app.mode = Mode::Normal,
+        Some(Action::Cancel) => {
+            app.mode = Mode::Normal;
+            app.info("Cancelled");
+            return;
+        }
+        _ => return,
     }
     match pending_confirm {
         Confirm::DeletePermanently(paths) => match ops::delete_permanently(&paths) {
@@ -1263,33 +1423,24 @@ pub fn menu_items(kind: &MenuKind) -> Vec<MenuItem> {
 
 fn handle_menu_key(app: &mut App, key_event: KeyEvent, kind: MenuKind) {
     let items = menu_items(&kind);
-    // A menu hanging off the toolbar is also a place in that row, so the row's
-    // own motions work from inside it. That takes `h` and `l`, which is why
-    // accepting is Enter and not `l`: a motion that sometimes acts is the
-    // ambiguity the breadcrumb already refuses.
     if let Some(i) = menu_owner(&kind) {
         if toolbar_nav(app, key_event, i) {
             return;
         }
     }
-    let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
     let n = items.len();
-    let accept_menu_item = |app: &mut App| {
-        let action = items[app.menu_cursor].action;
-        leave_toolbar(app);
-        run_action(app, action, 1);
-    };
-    match key_event.code {
-        KeyCode::Esc   | KeyCode::Char('q') => app.mode = Mode::Normal,
-        KeyCode::Char('n') if ctrl          => app.menu_cursor = (app.menu_cursor + 1) % n,
-        KeyCode::Char('p') if ctrl          => app.menu_cursor = (app.menu_cursor + n - 1) % n,
-        KeyCode::Char('y') if ctrl          => accept_menu_item(app),
-        KeyCode::Down  | KeyCode::Char('j') => app.menu_cursor = (app.menu_cursor + 1) % n,
-        KeyCode::Up    | KeyCode::Char('k') => app.menu_cursor = (app.menu_cursor + n - 1) % n,
-        KeyCode::Home  | KeyCode::Char('g') => app.menu_cursor = 0,
-        KeyCode::End   | KeyCode::Char('G') => app.menu_cursor = n - 1,
-        KeyCode::Enter | KeyCode::Tab       => accept_menu_item(app),
-        _ => {}
+    match lookup_binding(app, key_event) {
+        Some(Action::Cancel) => app.mode = Mode::Normal,
+        Some(Action::InterfaceDown) => app.menu_cursor = (app.menu_cursor + 1) % n,
+        Some(Action::InterfaceUp) => app.menu_cursor = (app.menu_cursor + n - 1) % n,
+        Some(Action::InterfaceFirst) => app.menu_cursor = 0,
+        Some(Action::InterfaceLast) => app.menu_cursor = n - 1,
+        Some(Action::InterfaceAccept) => {
+            let action = items[app.menu_cursor].action;
+            leave_toolbar(app);
+            run_action(app, action, 1);
+        }
+        None | Some(_) => {}
     }
 }
 
@@ -1379,12 +1530,8 @@ fn handle_buttons_key(app: &mut App, key_event: KeyEvent, button_index: usize) {
     if toolbar_nav(app, key_event, button_index) {
         return;
     }
-    match key_event.code {
-        KeyCode::Char('y') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
-            press_button(app, button_index)
-        }
-        KeyCode::Enter | KeyCode::Tab => press_button(app, button_index),
-        _ => {}
+    if lookup_binding(app, key_event) == Some(Action::InterfaceAccept) {
+        press_button(app, button_index);
     }
 }
 
@@ -1454,34 +1601,31 @@ fn focus_button(app: &mut App, button_index: usize) {
 /// button `i`. Shared by a bare button and by a menu hanging off one: they are
 /// the same position in the row. True when the key was consumed.
 fn toolbar_nav(app: &mut App, key_event: KeyEvent, button_index: usize) -> bool {
-    let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
     let in_nav_group = button_index < config::NAV_BUTTONS.len();
     let (first_button, last_button) = if in_nav_group {
         (0, config::NAV_BUTTONS.len() - 1)
     } else {
         (config::NAV_BUTTONS.len(), toolbar_button_count() - 1)
     };
-    match key_event.code {
-        KeyCode::Char('j') if ctrl => app.mode = Mode::Normal,
-        KeyCode::Char('k') if ctrl => {}
-        // Crossing lands on the trail, or steps straight over it to the other
-        // group when the place has no trail to open.
-        KeyCode::Char('h') if ctrl => {
+    match lookup_binding(app, key_event) {
+        Some(Action::InterfaceFocusDown) => app.mode = Mode::Normal,
+        Some(Action::InterfaceFocusUp) => {}
+        Some(Action::InterfaceFocusLeft) => {
             if !in_nav_group {
-                enter_crumbs(app, config::NAV_BUTTONS.len() - 1)
+                enter_crumbs(app, config::NAV_BUTTONS.len() - 1);
             }
         }
-        KeyCode::Char('l') if ctrl => {
+        Some(Action::InterfaceFocusRight) => {
             if in_nav_group {
-                enter_crumbs(app, config::NAV_BUTTONS.len())
+                enter_crumbs(app, config::NAV_BUTTONS.len());
             }
         }
-        KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Normal,
-        KeyCode::Left | KeyCode::Char('h') => {
-            focus_button(app, button_index.saturating_sub(1).max(first_button))
+        Some(Action::Cancel) => app.mode = Mode::Normal,
+        Some(Action::InterfaceLeft) => {
+            focus_button(app, button_index.saturating_sub(1).max(first_button));
         }
-        KeyCode::Right | KeyCode::Char('l') => {
-            focus_button(app, (button_index + 1).min(last_button))
+        Some(Action::InterfaceRight) => {
+            focus_button(app, (button_index + 1).min(last_button));
         }
         _ => return false,
     }
@@ -1517,43 +1661,25 @@ fn handle_crumb_menu_key(app: &mut App, key_event: KeyEvent, segment_index: usiz
         app.mode = Mode::Normal;
         return;
     }
-    let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
     let last_segment_index = crate::ui::crumb_paths(&app.pane().cwd)
         .len()
         .saturating_sub(1);
-    match key_event.code {
-        // Ctrl+j is the way back down, the mirror of the Ctrl+k that came up.
-        // Ctrl+h and Ctrl+l are pane motions and the toolbar row holds three
-        // panes, so they step out to the button group on either side, landing
-        // on the button nearest the trail.
-        KeyCode::Char('j') if ctrl => app.mode = Mode::Normal,
-        KeyCode::Char('k') if ctrl => {}
-        KeyCode::Char('h') if ctrl => focus_button(app, config::NAV_BUTTONS.len() - 1),
-        KeyCode::Char('l') if ctrl => focus_button(app, config::NAV_BUTTONS.len()),
-        KeyCode::Char('n') if ctrl => app.menu_cursor = (app.menu_cursor + 1) % items.len(),
-        KeyCode::Char('p') if ctrl => {
-            app.menu_cursor = (app.menu_cursor + items.len() - 1) % items.len()
+    match lookup_binding(app, key_event) {
+        Some(Action::InterfaceFocusDown) | Some(Action::Cancel) => app.mode = Mode::Normal,
+        Some(Action::InterfaceFocusUp) => {}
+        Some(Action::InterfaceFocusLeft) => focus_button(app, config::NAV_BUTTONS.len() - 1),
+        Some(Action::InterfaceFocusRight) => focus_button(app, config::NAV_BUTTONS.len()),
+        Some(Action::InterfaceDown) => app.menu_cursor = (app.menu_cursor + 1) % items.len(),
+        Some(Action::InterfaceUp) => {
+            app.menu_cursor = (app.menu_cursor + items.len() - 1) % items.len();
         }
-        KeyCode::Char('y') if ctrl => accept_crumb(app, &items),
-        KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Normal,
-        // Inside the pane, bare motions move: h/l along the trail, j/k down the
-        // menu. `l` does not enter a directory — that is what accept is for,
-        // and a motion key that sometimes navigates is the ambiguity to avoid.
-        KeyCode::Left | KeyCode::Char('h') => open_crumb(app, segment_index.saturating_sub(1)),
-        KeyCode::Right | KeyCode::Char('l') => {
-            open_crumb(app, (segment_index + 1).min(last_segment_index))
+        Some(Action::InterfaceLeft) => open_crumb(app, segment_index.saturating_sub(1)),
+        Some(Action::InterfaceRight) => {
+            open_crumb(app, (segment_index + 1).min(last_segment_index));
         }
-        KeyCode::Down | KeyCode::Char('j') => app.menu_cursor = (app.menu_cursor + 1) % items.len(),
-        KeyCode::Up | KeyCode::Char('k') => {
-            app.menu_cursor = (app.menu_cursor + items.len() - 1) % items.len()
-        }
-        KeyCode::Enter | KeyCode::Tab => accept_crumb(app, &items),
-        _ => {}
+        Some(Action::InterfaceAccept) => accept_crumb(app, &items),
+        None | Some(_) => {}
     }
-    // Record where the row ended up, so leaving and coming back lands on it.
-    // Only while this same segment is still the open one: `open_crumb` has already
-    // set the pair for the segment it moved to, and leaving the trail entirely
-    // must not overwrite the pick with a row from a menu that is now shut.
     if app.mode == Mode::CrumbMenu(segment_index) {
         app.pane_mut().crumb_pick = items.get(app.menu_cursor).cloned();
     }
@@ -1671,8 +1797,14 @@ mod tests {
     #[test]
     fn dd_and_dj_differ_by_one_line() {
         let (cursor, last) = (0, 99);
-        assert_eq!(delete_range(KeyCode::Char('d'), cursor, last, 3), Some((0, 2)));
-        assert_eq!(delete_range(KeyCode::Char('j'), cursor, last, 3), Some((0, 3)));
+        assert_eq!(
+            delete_range(KeyCode::Char('d'), cursor, last, 3),
+            Some((0, 2))
+        );
+        assert_eq!(
+            delete_range(KeyCode::Char('j'), cursor, last, 3),
+            Some((0, 3))
+        );
     }
 
     #[test]
@@ -1724,14 +1856,201 @@ mod tests {
         assert_eq!(app.count, "3");
     }
 
+    #[test]
+    fn normal_delete_uses_an_existing_selection() {
+        let mut app = test_app();
+        app.pane_mut()
+            .selected
+            .insert(std::path::PathBuf::from("selected-item"));
+
+        run_action(&mut app, Action::DeleteOp, 1);
+
+        assert_eq!(app.pending_delete, None);
+    }
+
+    #[test]
+    fn configured_overlay_and_confirm_keys_are_authoritative() {
+        let mut app = test_app();
+        app.mode = Mode::Help;
+        press_char(&mut app, 'x');
+        assert_eq!(app.mode, Mode::Help);
+        press_char(&mut app, 'q');
+        assert_eq!(app.mode, Mode::Normal);
+
+        app.mode = Mode::Confirm(Confirm::EmptyTrash);
+        press_char(&mut app, 'n');
+        assert!(matches!(app.mode, Mode::Confirm(Confirm::EmptyTrash)));
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn places_bindings_come_from_the_keymap() {
+        let mut app = test_app();
+        app.focus = Focus::Places;
+        let left = normalize(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(lookup_binding(&app, left), Some(Action::PlacesIgnore));
+
+        let ctrl_h = normalize(KeyEvent::new(
+            KeyCode::Char('h'),
+            KeyModifiers::CONTROL,
+        ));
+        assert_eq!(lookup_binding(&app, ctrl_h), Some(Action::FocusLeft));
+
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        );
+        assert_eq!(app.focus, Focus::View);
+    }
+
+    #[test]
+    fn ctrl_j_and_k_step_through_the_tab_pane() {
+        let mut app = test_app();
+        app.tabs
+            .push(crate::app::Tab::new(std::env::temp_dir().join("other")));
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+
+        handle_key_event(&mut app, ctrl('k'));
+        assert_eq!(app.focus, Focus::Tabs);
+        assert_eq!(app.mode, Mode::Normal);
+
+        handle_key_event(&mut app, ctrl('j'));
+        assert_eq!(app.focus, Focus::View);
+
+        handle_key_event(&mut app, ctrl('k'));
+        handle_key_event(&mut app, ctrl('k'));
+        assert!(matches!(app.mode, Mode::CrumbMenu(_)));
+        handle_key_event(&mut app, ctrl('j'));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.focus, Focus::Tabs);
+        handle_key_event(&mut app, ctrl('j'));
+        assert_eq!(app.focus, Focus::View);
+    }
+
+    #[test]
+    fn ctrl_h_and_l_leave_tabs_for_the_left_and_right_views() {
+        let mut app = test_app();
+        let second = crate::app::Pane::new(std::env::temp_dir().join("right-pane"));
+        app.tab_mut().panes.push(second);
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+
+        app.focus = Focus::Tabs;
+        app.tab_mut().active = 1;
+        handle_key_event(&mut app, ctrl('h'));
+        assert_eq!(app.focus, Focus::View);
+        assert_eq!(app.tab().active, 0);
+
+        app.focus = Focus::Tabs;
+        handle_key_event(&mut app, ctrl('l'));
+        assert_eq!(app.focus, Focus::View);
+        assert_eq!(app.tab().active, 1);
+    }
+
+    #[test]
+    fn tab_pane_h_and_l_select_tabs_without_moving_the_file_cursor() {
+        let mut app = test_app();
+        app.tabs
+            .push(crate::app::Tab::new(std::env::temp_dir().join("other")));
+        app.focus = Focus::Tabs;
+        app.active_tab = 0;
+        let cursor = app.pane().cursor;
+
+        press_char(&mut app, 'l');
+        assert_eq!(app.active_tab, 1);
+        press_char(&mut app, 'h');
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.pane().cursor, cursor);
+    }
+
+    #[test]
+    fn modifiers_match_exactly() {
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let shift_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        assert_eq!(
+            lookup_binding_for_mode(&Mode::Command, enter),
+            Some(Action::CommitInput)
+        );
+        assert_eq!(lookup_binding_for_mode(&Mode::Command, shift_enter), None);
+
+        let mut app = test_app();
+        app.mode = Mode::Command;
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT),
+        );
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn chord_followers_require_exact_modifiers() {
+        let mut app = test_app();
+        press_char(&mut app, '2');
+        press_char(&mut app, 'g');
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.pending_chord_leader, None);
+        assert_eq!(app.count, "2");
+    }
+
+    #[test]
+    fn lookup_uses_the_current_mode() {
+        let d = normalize(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert_eq!(lookup_binding_for_mode(&Mode::Normal, d), Some(Action::DeleteOp));
+        assert_eq!(
+            lookup_binding_for_mode(&Mode::Visual, d),
+            Some(Action::DeleteSelection)
+        );
+        assert_eq!(
+            lookup_binding_for_mode(&Mode::VisualLine, d),
+            Some(Action::DeleteSelection)
+        );
+        assert_eq!(lookup_binding_for_mode(&Mode::Command, d), None);
+    }
+
+    #[test]
+    fn the_same_key_is_discoverable_in_normal_text_and_interface_modes() {
+        let left = normalize(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(lookup_binding_for_mode(&Mode::Normal, left), Some(Action::MoveLeft));
+        assert_eq!(lookup_binding_for_mode(&Mode::Search, left), Some(Action::InputLeft));
+        assert_eq!(
+            lookup_binding_for_mode(&Mode::Buttons(0), left),
+            Some(Action::InterfaceLeft)
+        );
+        assert_eq!(
+            lookup_binding_for_mode(&Mode::CrumbMenu(0), left),
+            Some(Action::InterfaceLeft)
+        );
+    }
+
+    #[test]
+    fn text_mode_printables_do_not_leak_normal_bindings() {
+        let mut app = test_app();
+        app.mode = Mode::Command;
+        press_char(&mut app, 'h');
+        assert_eq!(app.input, "h");
+        assert_eq!(app.mode, Mode::Command);
+    }
+
     /// The shift is in the character, so a terminal that reports it as well
     /// and one that does not must reach the same binding.
     #[test]
     fn shifted_printables_match_with_or_without_the_modifier() {
         let with = KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT);
         let without = KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE);
-        assert_eq!(lookup_binding(normalize(with)), Some(Action::Bottom));
-        assert_eq!(lookup_binding(normalize(without)), Some(Action::Bottom));
+        assert_eq!(
+            lookup_binding_for_mode(&Mode::Normal, normalize(with)),
+            Some(Action::Bottom)
+        );
+        assert_eq!(
+            lookup_binding_for_mode(&Mode::Normal, normalize(without)),
+            Some(Action::Bottom)
+        );
     }
 
     /// Ctrl+Shift+Tab under the kitty protocol, and the bare `CSI Z` a legacy
@@ -1743,7 +2062,10 @@ mod tests {
             KeyModifiers::SHIFT,
         ] {
             let ev = KeyEvent::new(KeyCode::BackTab, mods);
-            assert_eq!(lookup_binding(normalize(ev)), Some(Action::PrevTab));
+            assert_eq!(
+                lookup_binding_for_mode(&Mode::Normal, normalize(ev)),
+                Some(Action::PrevTab)
+            );
         }
     }
 
@@ -1752,7 +2074,10 @@ mod tests {
     #[test]
     fn shift_still_counts_on_a_named_key() {
         let ev = KeyEvent::new(KeyCode::Delete, KeyModifiers::SHIFT);
-        assert_eq!(lookup_binding(normalize(ev)), Some(Action::DeletePerm));
+        assert_eq!(
+            lookup_binding_for_mode(&Mode::Normal, normalize(ev)),
+            Some(Action::DeletePerm)
+        );
     }
 
     #[test]

@@ -187,6 +187,7 @@ fn handle_left_press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
     for (tab_index, rect) in hitboxes.tabs.iter().enumerate() {
         if rect_contains(*rect, x, y) {
             app.active_tab = tab_index;
+            app.focus = Focus::Tabs;
             return;
         }
     }
