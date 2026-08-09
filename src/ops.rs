@@ -62,30 +62,50 @@ fn xdg_mime(args: &[&str]) -> Option<String> {
 // Clipboard
 // ---------------------------------------------------------------------------
 
-#[derive(Default, Clone)]
-pub struct Clipboard {
-    pub paths: Vec<PathBuf>,
-    pub cut: bool,
-    /// The paths name items moved to the system Trash by Vim's `d` operator.
-    /// They are original paths (the portable identity exposed by `trash`), not
-    /// currently readable filesystem paths.
-    pub trashed: bool,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrashRef {
+    /// Backend identity of one specific generation in the Trash.
+    pub id: std::ffi::OsString,
+    pub original_path: PathBuf,
+    pub name: std::ffi::OsString,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Clipboard {
+    #[default]
+    Empty,
+    Live {
+        paths: Vec<PathBuf>,
+        cut: bool,
+    },
+    Deleted {
+        items: Vec<TrashRef>,
+    },
 }
 
 impl Clipboard {
     pub fn set(&mut self, paths: Vec<PathBuf>, cut: bool) {
         export_uris(&paths);
-        self.paths = paths;
-        self.cut = cut;
-        self.trashed = false;
+        *self = if paths.is_empty() {
+            Self::Empty
+        } else {
+            Self::Live { paths, cut }
+        };
     }
 
-    /// Keep a Vim delete in the unnamed register without publishing dead URIs
-    /// to the desktop clipboard.
-    pub fn set_trashed(&mut self, paths: Vec<PathBuf>) {
-        self.paths = paths;
-        self.cut = false;
-        self.trashed = true;
+    pub fn set_deleted(&mut self, items: Vec<TrashRef>) {
+        *self = if items.is_empty() {
+            Self::Empty
+        } else {
+            Self::Deleted { items }
+        };
+    }
+
+    pub fn cut_paths(&self) -> &[PathBuf] {
+        match self {
+            Self::Live { paths, cut: true } => paths,
+            _ => &[],
+        }
     }
 }
 
@@ -252,18 +272,51 @@ pub enum UndoOp {
         moved_pairs: Vec<(PathBuf, PathBuf)>,
     },
     Trash {
-        originals: Vec<PathBuf>,
+        items: Vec<TrashRef>,
+    },
+    /// A paste which consumed deleted-register items by restoring them.
+    Restore {
+        restored_paths: Vec<PathBuf>,
+        previous_items: Vec<TrashRef>,
     },
     Create {
         path: PathBuf,
     },
 }
 
-pub fn undo(op: &UndoOp) -> Result<String, String> {
+#[derive(Clone, Debug)]
+pub struct RegisterChange {
+    pub expected: Clipboard,
+    pub replacement: Clipboard,
+}
+
+#[derive(Clone, Debug)]
+pub struct UndoOutcome {
+    pub message: String,
+    pub register_change: Option<RegisterChange>,
+    /// Rebind older delete history from consumed Trash generations to the new
+    /// generations created while undoing a restore-paste.
+    pub trash_replacements: Vec<(std::ffi::OsString, TrashRef)>,
+}
+
+impl UndoOutcome {
+    fn message(message: String) -> Self {
+        Self {
+            message,
+            register_change: None,
+            trash_replacements: Vec::new(),
+        }
+    }
+}
+
+pub fn undo(op: &UndoOp) -> Result<UndoOutcome, String> {
     match op {
         UndoOp::Rename { from, to } => {
             fs::rename(to, from).map_err(|e| e.to_string())?;
-            Ok(format!("Renamed back to {}", file_name_of(from)))
+            Ok(UndoOutcome::message(format!(
+                "Renamed back to {}",
+                file_name_of(from)
+            )))
         }
         UndoOp::Move { moved_pairs } => {
             for (from, to) in moved_pairs {
@@ -272,11 +325,59 @@ pub fn undo(op: &UndoOp) -> Result<String, String> {
                 }
                 fs::rename(to, from).map_err(|e| e.to_string())?;
             }
-            Ok(format!("Moved {} item(s) back", moved_pairs.len()))
+            Ok(UndoOutcome::message(format!(
+                "Moved {} item(s) back",
+                moved_pairs.len()
+            )))
         }
-        UndoOp::Trash { originals } => {
-            let restored = restore_from_trash(originals)?;
-            Ok(format!("Restored {restored} item(s) from Trash"))
+        UndoOp::Trash { items } => {
+            let restored = restore_trash_refs(items, None)?;
+            let mut outcome =
+                UndoOutcome::message(format!("Restored {} item(s) from Trash", items.len()));
+            outcome.register_change = Some(RegisterChange {
+                expected: Clipboard::Deleted {
+                    items: items.clone(),
+                },
+                replacement: Clipboard::Live {
+                    paths: restored,
+                    cut: false,
+                },
+            });
+            Ok(outcome)
+        }
+        UndoOp::Restore {
+            restored_paths,
+            previous_items,
+        } => {
+            let deleted = trash(restored_paths);
+            if !deleted.is_complete() || deleted.committed.len() != restored_paths.len() {
+                return Err(format!(
+                    "Could not move the restored paste back to Trash: {}",
+                    deleted
+                        .failed
+                        .first()
+                        .map(|failure| failure.message.as_str())
+                        .unwrap_or("incomplete operation")
+                ));
+            }
+            let replacements = previous_items
+                .iter()
+                .zip(&deleted.committed)
+                .map(|(old, new)| (old.id.clone(), new.clone()))
+                .collect();
+            Ok(UndoOutcome {
+                message: format!("Undid paste of {} item(s)", restored_paths.len()),
+                register_change: Some(RegisterChange {
+                    expected: Clipboard::Live {
+                        paths: restored_paths.clone(),
+                        cut: false,
+                    },
+                    replacement: Clipboard::Deleted {
+                        items: deleted.committed,
+                    },
+                }),
+                trash_replacements: replacements,
+            })
         }
         UndoOp::Create { path } => {
             if path.is_dir() {
@@ -284,7 +385,27 @@ pub fn undo(op: &UndoOp) -> Result<String, String> {
             } else {
                 fs::remove_file(path).map_err(|e| e.to_string())?;
             }
-            Ok(format!("Removed {}", file_name_of(path)))
+            Ok(UndoOutcome::message(format!(
+                "Removed {}",
+                file_name_of(path)
+            )))
+        }
+    }
+}
+
+pub fn rebase_trash_history(
+    history: &mut [UndoOp],
+    replacements: &[(std::ffi::OsString, TrashRef)],
+) {
+    for op in history {
+        if let UndoOp::Trash { items } = op {
+            for item in items {
+                if let Some((_, replacement)) =
+                    replacements.iter().find(|(old_id, _)| *old_id == item.id)
+                {
+                    *item = replacement.clone();
+                }
+            }
         }
     }
 }
@@ -299,11 +420,65 @@ pub fn file_name_of(path: &Path) -> String {
 // Trash
 // ---------------------------------------------------------------------------
 
-pub fn trash(paths: &[PathBuf]) -> Result<UndoOp, String> {
-    trash::delete_all(paths).map_err(trash_error)?;
-    Ok(UndoOp::Trash {
-        originals: paths.to_vec(),
-    })
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ItemFailure {
+    pub path: PathBuf,
+    pub message: String,
+}
+
+/// The actual effects of a multi-item operation. `committed` is authoritative:
+/// callers must journal and update the register from it, never from the request.
+#[derive(Clone, Debug, Default)]
+pub struct TrashOutcome {
+    pub committed: Vec<TrashRef>,
+    pub failed: Vec<ItemFailure>,
+}
+
+impl TrashOutcome {
+    pub fn is_complete(&self) -> bool {
+        self.failed.is_empty()
+    }
+}
+
+/// Trash each operand separately and retain the backend identity of every item
+/// that actually moved. This intentionally does not flatten partial completion
+/// into `Err(String)`.
+pub fn trash(paths: &[PathBuf]) -> TrashOutcome {
+    let mut outcome = TrashOutcome::default();
+    for path in paths {
+        let before = trash::os_limited::list()
+            .map(|items| {
+                items
+                    .into_iter()
+                    .map(|item| item.id)
+                    .collect::<std::collections::HashSet<_>>()
+            })
+            .unwrap_or_default();
+        if let Err(error) = trash::delete(path) {
+            outcome.failed.push(ItemFailure {
+                path: path.clone(),
+                message: trash_error(error),
+            });
+            continue;
+        }
+        let found = trash::os_limited::list().ok().and_then(|items| {
+            items.into_iter().find(|item| {
+                !before.contains(&item.id) && item.original_parent.join(&item.name) == *path
+            })
+        });
+        match found {
+            Some(item) => outcome.committed.push(TrashRef {
+                id: item.id,
+                original_path: path.clone(),
+                name: item.name,
+            }),
+            None => outcome.failed.push(ItemFailure {
+                path: path.clone(),
+                message: "Moved to Trash, but its backend identity could not be read".into(),
+            }),
+        }
+    }
+    outcome
 }
 
 /// Trash contents as view entries, so the Trash place browses like a folder.
@@ -372,32 +547,46 @@ fn trash_items(originals: &[PathBuf]) -> Result<Vec<trash::TrashItem>, String> {
     Ok(wanted)
 }
 
+fn restore_trash_refs(
+    items: &[TrashRef],
+    destination: Option<&Path>,
+) -> Result<Vec<PathBuf>, String> {
+    let listed = trash::os_limited::list().map_err(trash_error)?;
+    let by_id: std::collections::HashMap<_, _> = listed
+        .into_iter()
+        .map(|item| (item.id.clone(), item))
+        .collect();
+    let mut wanted = Vec::with_capacity(items.len());
+    let mut restored_paths = Vec::with_capacity(items.len());
+    for item_ref in items {
+        let mut item = by_id.get(&item_ref.id).cloned().ok_or_else(|| {
+            format!(
+                "{} is no longer in Trash",
+                file_name_of(&item_ref.original_path)
+            )
+        })?;
+        let path = if let Some(dir) = destination {
+            item.original_parent = dir.to_path_buf();
+            dir.join(&item.name)
+        } else {
+            item_ref.original_path.clone()
+        };
+        restored_paths.push(path);
+        wanted.push(item);
+    }
+    trash::os_limited::restore_all(wanted).map_err(trash_error)?;
+    Ok(restored_paths)
+}
+
+pub fn restore_deleted_to(items: &[TrashRef], destination: &Path) -> Result<Vec<PathBuf>, String> {
+    restore_trash_refs(items, Some(destination))
+}
+
 pub fn restore_from_trash(originals: &[PathBuf]) -> Result<usize, String> {
     let wanted = trash_items(originals)?;
     let n = wanted.len();
     trash::os_limited::restore_all(wanted).map_err(trash_error)?;
     Ok(n)
-}
-
-/// Paste items saved by Vim's delete register into `destination`.
-///
-/// `TrashItem::original_parent` is the restore destination used by every
-/// backend. Replacing it lets `p` restore beside the cursor's current folder,
-/// rather than forcing the item back to the directory it was deleted from.
-pub fn restore_from_trash_to(
-    originals: &[PathBuf],
-    destination: &Path,
-) -> Result<Vec<PathBuf>, String> {
-    let mut wanted = trash_items(originals)?;
-    let restored_paths = wanted
-        .iter()
-        .map(|item| destination.join(&item.name))
-        .collect();
-    for item in &mut wanted {
-        item.original_parent = destination.to_path_buf();
-    }
-    trash::os_limited::restore_all(wanted).map_err(trash_error)?;
-    Ok(restored_paths)
 }
 
 pub fn purge_from_trash(originals: &[PathBuf]) -> Result<usize, String> {
@@ -502,6 +691,7 @@ pub fn batch_rename(paths: &[PathBuf], pattern: &str) -> Result<UndoOp, String> 
 // ---------------------------------------------------------------------------
 
 pub struct Progress {
+    pub kind: TransferKind,
     pub label: String,
     pub total_bytes: Arc<AtomicU64>,
     pub copied_bytes: Arc<AtomicU64>,
@@ -531,6 +721,7 @@ pub enum TransferKind {
 /// Start a copy or move in the background. Returns immediately.
 pub fn start_transfer(sources: Vec<PathBuf>, dest: PathBuf, kind: TransferKind) -> Progress {
     let transfer_progress = Progress {
+        kind,
         label: format!(
             "{} {} item(s) to {}",
             match kind {
@@ -921,10 +1112,10 @@ mod tests {
         let original = source_dir.join("note.txt");
         fs::write(&original, b"preserved").unwrap();
 
-        trash(std::slice::from_ref(&original)).unwrap();
+        let deleted = trash(std::slice::from_ref(&original));
+        assert!(deleted.failed.is_empty());
         assert!(!original.exists());
-        let restored =
-            restore_from_trash_to(std::slice::from_ref(&original), &destination_dir).unwrap();
+        let restored = restore_deleted_to(&deleted.committed, &destination_dir).unwrap();
 
         let pasted = destination_dir.join("note.txt");
         assert_eq!(restored, vec![pasted.clone()]);
@@ -936,13 +1127,23 @@ mod tests {
     #[test]
     fn clipboard_distinguishes_deleted_items_from_ordinary_copies() {
         let path = PathBuf::from("item");
+        let item = TrashRef {
+            id: "trash-id".into(),
+            original_path: path.clone(),
+            name: "item".into(),
+        };
         let mut clipboard = Clipboard::default();
-        clipboard.set_trashed(vec![path.clone()]);
-        assert!(clipboard.trashed);
-        assert_eq!(clipboard.paths, vec![path.clone()]);
+        clipboard.set_deleted(vec![item.clone()]);
+        assert_eq!(clipboard, Clipboard::Deleted { items: vec![item] });
 
-        clipboard.set(vec![path], false);
-        assert!(!clipboard.trashed);
+        clipboard.set(vec![path.clone()], false);
+        assert_eq!(
+            clipboard,
+            Clipboard::Live {
+                paths: vec![path],
+                cut: false
+            }
+        );
     }
 
     #[test]

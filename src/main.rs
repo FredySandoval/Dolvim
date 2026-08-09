@@ -185,6 +185,9 @@ fn finish_transfer(app: &mut App) {
                     app.undo.push(undo_op.clone());
                 }
             }
+            if active_transfer.kind == ops::TransferKind::Move {
+                app.clipboard = ops::Clipboard::Empty;
+            }
             app.info(format!("{} — done", active_transfer.label));
         }
         Some(Err(transfer_error)) => app.error(transfer_error),

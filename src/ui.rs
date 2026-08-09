@@ -602,8 +602,8 @@ fn draw_icons_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, act
         rows,
         margin_x,
     } = icon_grid(area);
-    let cut = app.clipboard.cut;
-    let cut_set = app.clipboard.paths.clone();
+    let cut_set = app.clipboard.cut_paths().to_vec();
+    let cut = !cut_set.is_empty();
     {
         let p = app.pane_at_mut(idx);
         p.grid_cols = cols;
@@ -704,8 +704,8 @@ fn draw_icons_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, act
 
 fn draw_compact_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool) {
     let rows = area.height.max(1);
-    let cut = app.clipboard.cut;
-    let cut_set = app.clipboard.paths.clone();
+    let cut_set = app.clipboard.cut_paths().to_vec();
+    let cut = !cut_set.is_empty();
     // The margin is the pane's, not each column's: columns are already held
     // apart by the blank `compact_widths` leaves on the right.
     let avail = area.width.saturating_sub(config::VIEW_MARGIN);
@@ -913,8 +913,8 @@ fn draw_details_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, a
     let rows = list.height.max(1);
     let cols = detail_columns(area, time_width(app.pane_at(idx)));
     let sort = app.pane_at(idx).sort;
-    let cut = app.clipboard.cut;
-    let cut_set = app.clipboard.paths.clone();
+    let cut_set = app.clipboard.cut_paths().to_vec();
+    let cut = !cut_set.is_empty();
 
     {
         let p = app.pane_at_mut(idx);

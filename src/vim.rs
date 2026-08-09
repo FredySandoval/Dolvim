@@ -266,43 +266,66 @@ fn operand_paths(app: &App, count: usize) -> Vec<PathBuf> {
 
 /// The one path to the Trash. Every delete key ends here so that the undo
 /// entry, the message and the refresh cannot drift apart.
-fn move_to_trash(app: &mut App, paths: Vec<PathBuf>) -> bool {
+fn move_to_trash(app: &mut App, paths: Vec<PathBuf>) -> Vec<ops::TrashRef> {
     if paths.is_empty() {
-        return false;
+        return Vec::new();
     }
     // In the Trash there is no further "away" to move something to, so `x`
     // means purge, as it does in Dolphin. It goes behind the Shift+Del
     // confirmation: this is the one place the key is not undoable.
     if app.pane().target == Target::Trash {
         app.mode = Mode::Confirm(Confirm::PurgeFromTrash(paths));
-        return false;
+        return Vec::new();
     }
-    let moved = match ops::trash(&paths) {
-        Ok(op) => {
-            app.undo.push(op);
-            app.info(format!("Moved {} item(s) to Trash", paths.len()));
-            app.pane_mut().selected.clear();
-            app.refresh_in_place();
-            true
-        }
-        Err(e) => {
-            app.error(e);
-            false
-        }
-    };
-    // Deleting the visual range ends the visual, as `d` does in vim.
+
+    let outcome = ops::trash(&paths);
+    if outcome.committed.is_empty() {
+        let message = outcome
+            .failed
+            .first()
+            .map(|failure| failure.message.clone())
+            .unwrap_or_else(|| "Nothing moved to Trash".into());
+        app.error(message);
+        return Vec::new();
+    }
+
+    let committed_paths: std::collections::HashSet<_> = outcome
+        .committed
+        .iter()
+        .map(|item| item.original_path.clone())
+        .collect();
+    app.undo.push(ops::UndoOp::Trash {
+        items: outcome.committed.clone(),
+    });
+    app.pane_mut()
+        .selected
+        .retain(|path| !committed_paths.contains(path));
+    app.refresh_in_place();
+    if outcome.is_complete() {
+        app.info(format!(
+            "Moved {} item(s) to Trash",
+            outcome.committed.len()
+        ));
+    } else {
+        app.error(format!(
+            "Moved {} item(s) to Trash; {} failed: {}",
+            outcome.committed.len(),
+            outcome.failed.len(),
+            outcome.failed[0].message
+        ));
+    }
     if app.mode.is_visual() {
         app.mode = Mode::Normal;
     }
-    moved
+    outcome.committed
 }
 
-/// Vim's `d` is both a removal and a write to the unnamed register. Only
-/// replace that register after trashing succeeds, so an I/O error cannot lose
-/// a clipboard the user could still paste.
+/// Vim's `d` is both a removal and a write to the unnamed register. The
+/// register is derived from committed effects, never from requested operands.
 fn delete_to_register(app: &mut App, paths: Vec<PathBuf>) {
-    if move_to_trash(app, paths.clone()) {
-        app.clipboard.set_trashed(paths);
+    let deleted = move_to_trash(app, paths);
+    if !deleted.is_empty() {
+        app.clipboard.set_deleted(deleted);
     }
 }
 
@@ -904,8 +927,14 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
         Action::Undo => match app.undo.pop() {
             None => app.info("Nothing to undo"),
             Some(op) => match ops::undo(&op) {
-                Ok(msg) => {
-                    app.info(msg);
+                Ok(outcome) => {
+                    if let Some(change) = outcome.register_change {
+                        if app.clipboard == change.expected {
+                            app.clipboard = change.replacement;
+                        }
+                    }
+                    ops::rebase_trash_history(&mut app.undo, &outcome.trash_replacements);
+                    app.info(outcome.message);
                     app.refresh_in_place();
                 }
                 Err(e) => {
@@ -1099,17 +1128,18 @@ fn start_rename(app: &mut App) {
 }
 
 fn paste_clipboard(app: &mut App) {
-    // A Vim delete lives in the system Trash, so it must be restored before it
-    // can become an ordinary copy source. After the first paste, retain the
-    // restored paths as a copy register so repeated `p` remains meaningful.
-    if app.clipboard.trashed && !app.clipboard.paths.is_empty() {
+    // Deleted registers use exact backend Trash identities. After restoration,
+    // they become an ordinary live copy register so repeated `p` is meaningful.
+    if let ops::Clipboard::Deleted { items } = app.clipboard.clone() {
         let dest = app.pane().cwd.clone();
-        match ops::restore_from_trash_to(&app.clipboard.paths, &dest) {
+        match ops::restore_deleted_to(&items, &dest) {
             Ok(restored_paths) => {
                 let restored_count = restored_paths.len();
-                app.clipboard.paths = restored_paths;
-                app.clipboard.cut = false;
-                app.clipboard.trashed = false;
+                app.undo.push(ops::UndoOp::Restore {
+                    restored_paths: restored_paths.clone(),
+                    previous_items: items,
+                });
+                app.clipboard.set(restored_paths, false);
                 app.info(format!("Pasted {restored_count} item(s)"));
                 app.refresh_in_place();
             }
@@ -1119,7 +1149,10 @@ fn paste_clipboard(app: &mut App) {
     }
 
     // Prefer our own clipboard: it knows cut-vs-copy, which uri-list cannot say.
-    let (mut paths, cut) = (app.clipboard.paths.clone(), app.clipboard.cut);
+    let (mut paths, cut) = match &app.clipboard {
+        ops::Clipboard::Live { paths, cut } => (paths.clone(), *cut),
+        ops::Clipboard::Empty | ops::Clipboard::Deleted { .. } => (Vec::new(), false),
+    };
     if paths.is_empty() {
         paths = ops::import_uris();
     }
@@ -1134,9 +1167,8 @@ fn paste_clipboard(app: &mut App) {
         ops::TransferKind::Copy
     };
     app.transfer_progress = Some(ops::start_transfer(paths, dest, transfer_kind));
-    if cut {
-        app.clipboard.paths.clear();
-    }
+    // A cut register is consumed only by the completion reducer after a fully
+    // successful move. Keeping it here makes failure and cancellation retryable.
 }
 
 fn search_step(app: &mut App, search_direction: isize) {
@@ -2464,14 +2496,123 @@ mod tests {
             press_char(&mut app, 'v');
             press_char(&mut app, 'd');
             assert!(!deleted.exists());
-            assert!(app.clipboard.trashed);
-            assert_eq!(app.clipboard.paths, vec![deleted.clone()]);
+            match &app.clipboard {
+                ops::Clipboard::Deleted { items } => {
+                    assert_eq!(items.len(), 1);
+                    assert_eq!(items[0].original_path, deleted);
+                }
+                other => panic!("expected deleted register, got {other:?}"),
+            }
 
             press_char(&mut app, 'p');
             assert_eq!(std::fs::read(&deleted).unwrap(), b"keep me");
-            assert!(!app.clipboard.trashed);
+            assert!(matches!(
+                app.clipboard,
+                ops::Clipboard::Live { cut: false, .. }
+            ));
         }
 
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn failed_delete_preserves_register_and_history() {
+        let mut app = test_app();
+        let previous = PathBuf::from("previous-register-item");
+        app.clipboard.set(vec![previous.clone()], false);
+        let undo_len = app.undo.len();
+
+        delete_to_register(
+            &mut app,
+            vec![std::env::temp_dir()
+                .join(format!("dolvim-definitely-missing-{}", std::process::id()))],
+        );
+
+        assert_eq!(
+            app.clipboard,
+            ops::Clipboard::Live {
+                paths: vec![previous],
+                cut: false,
+            }
+        );
+        assert_eq!(app.undo.len(), undo_len);
+    }
+
+    #[test]
+    fn delete_paste_and_undo_rebases_the_older_delete_history() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "dolvim-delete-paste-undo-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("item.txt");
+        std::fs::write(&path, b"payload").unwrap();
+
+        {
+            let mut app = App::new(base.clone());
+            app.pane_mut()
+                .set_entries(crate::fs::read_dir(&base, 0).unwrap());
+            press_char(&mut app, 'v');
+            press_char(&mut app, 'd');
+            press_char(&mut app, 'p');
+            assert!(path.exists());
+
+            press_char(&mut app, 'u');
+            assert!(!path.exists());
+            assert!(matches!(app.clipboard, ops::Clipboard::Deleted { .. }));
+
+            // The older delete entry was rebound to the new Trash generation,
+            // rather than being left stale by undoing paste.
+            press_char(&mut app, 'u');
+            assert_eq!(std::fs::read(&path).unwrap(), b"payload");
+            assert!(matches!(
+                app.clipboard,
+                ops::Clipboard::Live { cut: false, .. }
+            ));
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn delete_undo_then_paste_uses_the_restored_live_register() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "dolvim-delete-undo-paste-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("item.txt");
+        std::fs::write(&path, b"payload").unwrap();
+
+        {
+            let mut app = App::new(base.clone());
+            app.pane_mut()
+                .set_entries(crate::fs::read_dir(&base, 0).unwrap());
+            press_char(&mut app, 'v');
+            press_char(&mut app, 'd');
+            press_char(&mut app, 'u');
+            assert!(matches!(
+                app.clipboard,
+                ops::Clipboard::Live { cut: false, .. }
+            ));
+
+            press_char(&mut app, 'p');
+            let progress = app.transfer_progress.as_ref().unwrap();
+            while !progress.finished.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                std::fs::read(base.join("item (1).txt")).unwrap(),
+                b"payload"
+            );
+        }
         std::fs::remove_dir_all(base).unwrap();
     }
 
