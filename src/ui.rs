@@ -1130,7 +1130,7 @@ fn status_bar(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.set_cursor_position((area.x + 1 + app.input_cursor as u16, area.y));
         return;
     }
-    if let Mode::Rename(_) | Mode::BatchRename | Mode::NewFolder | Mode::NewFile = app.mode {
+    if let Mode::Rename(_) | Mode::BatchRename | Mode::NewFolder | Mode::NewFile(_) = app.mode {
         let label = match app.mode {
             Mode::Rename(_) => "Rename to:",
             Mode::BatchRename => "Rename pattern (# = counter):",

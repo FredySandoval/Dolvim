@@ -38,6 +38,36 @@ pub enum Focus {
     View,
 }
 
+/// Directional intent shared by every focusable region.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// The effective keyboard focus. Unlike `Focus`, this includes the active view
+/// index and the three independently navigable parts of the toolbar row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FocusRegion {
+    Places,
+    Tabs,
+    View(usize),
+    ToolbarNav,
+    Breadcrumb,
+    ToolbarRight,
+}
+
+impl FocusRegion {
+    pub fn is_toolbar(self) -> bool {
+        matches!(
+            self,
+            Self::ToolbarNav | Self::Breadcrumb | Self::ToolbarRight
+        )
+    }
+}
+
 /// What the keyboard is currently feeding. Text-entry modes carry their buffer
 /// in `App::input`; `Mode` only says who owns the next keystroke.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -61,8 +91,8 @@ pub enum Mode {
     BatchRename,
     /// F10 / `O`.
     NewFolder,
-    /// `o`.
-    NewFile,
+    /// `o`; the payload is the directory where the file will be created.
+    NewFile(PathBuf),
     /// A yes/no gate. Carries what to do when the answer is yes.
     Confirm(Confirm),
     /// Modal information overlays.
@@ -94,7 +124,7 @@ impl Mode {
             Mode::PathEdit => "PATH",
             Mode::Rename(_) | Mode::BatchRename => "RENAME",
             Mode::NewFolder => "NEW FOLDER",
-            Mode::NewFile => "NEW FILE",
+            Mode::NewFile(_) => "NEW FILE",
             Mode::Confirm(_) => "CONFIRM",
             Mode::Properties => "PROPERTIES",
             Mode::Help => "HELP",
@@ -471,6 +501,8 @@ pub struct App {
     pub info_visible: bool,
     pub filter_bar: bool,
     pub focus: Focus,
+    /// Region below the toolbar, restored by cancellation or `Ctrl+j`.
+    pub toolbar_return: FocusRegion,
     pub mode: Mode,
     /// Buffer for whichever text-entry mode is active.
     pub input: String,
@@ -527,6 +559,7 @@ impl App {
             info_visible: false,
             filter_bar: false,
             focus: Focus::View,
+            toolbar_return: FocusRegion::View(0),
             mode: Mode::Normal,
             input: String::new(),
             input_cursor: 0,
@@ -1020,38 +1053,31 @@ impl App {
             tab.active = 1;
         }
         self.reload();
+        self.repair_focus();
     }
 
-    /// Horizontal pane focus: Places, left view, right view.
-    /// From Tabs, `Ctrl+h` and `Ctrl+l` enter the left and right views.
-    pub fn focus_left(&mut self) {
-        match self.focus {
-            Focus::Tabs => {
-                self.focus = Focus::View;
-                self.tab_mut().active = 0;
-            }
-            Focus::View if self.tab().active > 0 => self.tab_mut().active = 0,
-            Focus::View if self.places_visible => self.focus = Focus::Places,
-            Focus::Places | Focus::View => {}
+    /// Repair body and toolbar-return focus after a dynamic layout change.
+    pub fn repair_focus(&mut self) {
+        if self.focus == Focus::Places && !self.places_visible {
+            self.focus = Focus::View;
+            self.tab_mut().active = 0;
         }
-    }
-
-    pub fn focus_right(&mut self) {
-        match self.focus {
-            Focus::Tabs => {
-                let pane = usize::from(self.split_on());
-                self.focus = Focus::View;
-                self.tab_mut().active = pane;
-            }
-            Focus::Places => {
-                self.focus = Focus::View;
-                self.tab_mut().active = 0;
-            }
-            Focus::View if self.split_on() && self.tab().active == 0 => {
-                self.tab_mut().active = 1;
-            }
-            Focus::View => {}
+        if self.focus == Focus::Tabs && self.tabs.len() < 2 {
+            self.focus = Focus::View;
         }
+        let split_on = self.split_on();
+        if !split_on && self.tab().active > 0 {
+            self.tab_mut().active = 0;
+        }
+        self.toolbar_return = match self.toolbar_return {
+            FocusRegion::Places if !self.places_visible => FocusRegion::View(0),
+            FocusRegion::Tabs if self.tabs.len() < 2 => {
+                FocusRegion::View(self.tab().active.min(usize::from(split_on)))
+            }
+            FocusRegion::View(1) if !split_on => FocusRegion::View(0),
+            region if region.is_toolbar() => FocusRegion::View(self.tab().active),
+            region => region,
+        };
     }
 
     pub fn other_pane(&mut self) {
@@ -1077,9 +1103,7 @@ impl App {
         }
         self.tabs.remove(self.active_tab);
         self.active_tab = self.active_tab.min(self.tabs.len() - 1);
-        if self.tabs.len() == 1 && self.focus == Focus::Tabs {
-            self.focus = Focus::View;
-        }
+        self.repair_focus();
     }
 
     pub fn cycle_tab(&mut self, delta: isize) {

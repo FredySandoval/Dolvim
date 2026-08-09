@@ -6,7 +6,9 @@ use std::sync::atomic::Ordering;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::app::{App, Confirm, Focus, MarkPending, MenuKind, Mode, ViewMode};
+use crate::app::{
+    App, Confirm, Direction, Focus, FocusRegion, MarkPending, MenuKind, Mode, ViewMode,
+};
 use crate::config;
 use crate::fs::SortKey;
 use crate::ops;
@@ -73,6 +75,15 @@ pub fn handle_key_event(app: &mut App, key_event: KeyEvent) {
 // ---------------------------------------------------------------------------
 
 fn handle_normal_key(app: &mut App, key_event: KeyEvent) {
+    // Places and Tabs are complete local input owners. They never enter the
+    // file view's count/operator/chord/typeahead pipeline.
+    if app.focus != Focus::View {
+        if let Some(action) = lookup_binding(app, key_event) {
+            run_action(app, action, 1);
+        }
+        return;
+    }
+
     if key_event.code == KeyCode::Esc {
         app.count.clear();
         app.pending_chord_leader = None;
@@ -237,7 +248,7 @@ fn delete_motion(app: &mut App, key_event: KeyEvent, count_before_operator: usiz
     };
     app.count.clear();
     let range_paths = app.pane().paths_in(range_start, range_end);
-    move_to_trash(app, range_paths);
+    delete_to_register(app, range_paths);
     MotionResult::Handled
 }
 
@@ -255,29 +266,43 @@ fn operand_paths(app: &App, count: usize) -> Vec<PathBuf> {
 
 /// The one path to the Trash. Every delete key ends here so that the undo
 /// entry, the message and the refresh cannot drift apart.
-fn move_to_trash(app: &mut App, paths: Vec<PathBuf>) {
+fn move_to_trash(app: &mut App, paths: Vec<PathBuf>) -> bool {
     if paths.is_empty() {
-        return;
+        return false;
     }
     // In the Trash there is no further "away" to move something to, so `x`
     // means purge, as it does in Dolphin. It goes behind the Shift+Del
     // confirmation: this is the one place the key is not undoable.
     if app.pane().target == Target::Trash {
         app.mode = Mode::Confirm(Confirm::PurgeFromTrash(paths));
-        return;
+        return false;
     }
-    match ops::trash(&paths) {
+    let moved = match ops::trash(&paths) {
         Ok(op) => {
             app.undo.push(op);
             app.info(format!("Moved {} item(s) to Trash", paths.len()));
             app.pane_mut().selected.clear();
             app.refresh_in_place();
+            true
         }
-        Err(e) => app.error(e),
-    }
+        Err(e) => {
+            app.error(e);
+            false
+        }
+    };
     // Deleting the visual range ends the visual, as `d` does in vim.
     if app.mode.is_visual() {
         app.mode = Mode::Normal;
+    }
+    moved
+}
+
+/// Vim's `d` is both a removal and a write to the unnamed register. Only
+/// replace that register after trashing succeeds, so an I/O error cannot lose
+/// a clipboard the user could still paste.
+fn delete_to_register(app: &mut App, paths: Vec<PathBuf>) {
+    if move_to_trash(app, paths.clone()) {
+        app.clipboard.set_trashed(paths);
     }
 }
 
@@ -299,6 +324,116 @@ fn enter_visual(app: &mut App, target_mode: Mode) {
     app.move_cursor(0, true);
 }
 
+/// Resolve keyboard focus exactly once from body focus plus toolbar mode.
+pub fn current_focus_region(app: &App) -> FocusRegion {
+    match &app.mode {
+        Mode::CrumbMenu(_) => FocusRegion::Breadcrumb,
+        Mode::Buttons(i) => button_region(*i),
+        Mode::Menu(kind) => menu_owner(kind)
+            .map(button_region)
+            .unwrap_or(FocusRegion::ToolbarRight),
+        _ => match app.focus {
+            Focus::Places => FocusRegion::Places,
+            Focus::Tabs => FocusRegion::Tabs,
+            Focus::View => FocusRegion::View(app.tab().active),
+        },
+    }
+}
+
+fn button_region(index: usize) -> FocusRegion {
+    if index < config::NAV_BUTTONS.len() {
+        FocusRegion::ToolbarNav
+    } else {
+        FocusRegion::ToolbarRight
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FocusTransition {
+    Stay,
+    Move(FocusRegion),
+}
+
+impl FocusRegion {
+    /// The complete directional-neighbour policy for this region.
+    pub fn move_focus(self, direction: Direction, app: &App) -> FocusTransition {
+        use Direction::{Down, Left, Right, Up};
+        use FocusRegion::{Breadcrumb, Places, Tabs, ToolbarNav, ToolbarRight, View};
+        let target = match (self, direction) {
+            (Places, Right) => Some(View(0)),
+            (Places, Up) => Some(ToolbarNav),
+            (View(0), Left) if app.places_visible => Some(Places),
+            (View(0), Right) if app.split_on() => Some(View(1)),
+            (View(0 | 1), Up) if app.tabs.len() > 1 => Some(Tabs),
+            (View(0 | 1), Up) => Some(Breadcrumb),
+            (View(1), Left) => Some(View(0)),
+            (Tabs, Left) => Some(View(0)),
+            (Tabs, Right) => Some(View(usize::from(app.split_on()))),
+            (Tabs, Up) => Some(Breadcrumb),
+            (Tabs, Down) => Some(View(app.tab().active)),
+            (ToolbarNav, Right) => Some(Breadcrumb),
+            (ToolbarNav, Down) | (Breadcrumb, Down) | (ToolbarRight, Down) => {
+                Some(app.toolbar_return)
+            }
+            (Breadcrumb, Left) => Some(ToolbarNav),
+            (Breadcrumb, Right) => Some(ToolbarRight),
+            (ToolbarRight, Left) => Some(Breadcrumb),
+            _ => None,
+        };
+        target.map_or(FocusTransition::Stay, FocusTransition::Move)
+    }
+}
+
+/// The only transition application path. Region entry helpers retain menu and
+/// breadcrumb side effects; body entry repairs the active pane explicitly.
+pub fn move_focus(app: &mut App, direction: Direction) {
+    app.repair_focus();
+    let from = current_focus_region(app);
+    match from.move_focus(direction, app) {
+        FocusTransition::Stay => {}
+        FocusTransition::Move(to) => enter_focus_region(app, from, to),
+    }
+}
+
+fn enter_focus_region(app: &mut App, from: FocusRegion, to: FocusRegion) {
+    if to.is_toolbar() {
+        if !from.is_toolbar() {
+            app.toolbar_return = from;
+        }
+        match to {
+            FocusRegion::ToolbarNav => focus_button(app, 0),
+            FocusRegion::Breadcrumb => {
+                let fallback = if from == FocusRegion::ToolbarRight {
+                    config::NAV_BUTTONS.len()
+                } else {
+                    config::NAV_BUTTONS.len() - 1
+                };
+                enter_crumbs(app, fallback);
+            }
+            FocusRegion::ToolbarRight => focus_button(app, config::NAV_BUTTONS.len()),
+            _ => unreachable!(),
+        }
+        return;
+    }
+
+    app.mode = Mode::Normal;
+    match to {
+        FocusRegion::Places => app.focus = Focus::Places,
+        FocusRegion::Tabs => app.focus = Focus::Tabs,
+        FocusRegion::View(index) => {
+            app.focus = Focus::View;
+            app.tab_mut().active = index.min(usize::from(app.split_on()));
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn cancel_toolbar(app: &mut App) {
+    let from = current_focus_region(app);
+    let to = app.toolbar_return;
+    enter_focus_region(app, from, to);
+}
+
 /// Find the one row that names this key in the current mode. Modifiers match
 /// exactly after normalization, so an unlisted combination never inherits a binding.
 fn lookup_binding(app: &App, key_event: KeyEvent) -> Option<Action> {
@@ -311,13 +446,10 @@ fn lookup_binding(app: &App, key_event: KeyEvent) -> Option<Action> {
     };
 
     if matches!(app.mode, Mode::Normal | Mode::Visual | Mode::VisualLine) {
-        let focused_mode = match app.focus {
-            Focus::Places => Some(BindMode::Places),
-            Focus::Tabs => Some(BindMode::Tabs),
-            Focus::View => None,
-        };
-        if let Some(action) = focused_mode.and_then(|mode| find(mode).map(|binding| binding.action)) {
-            return Some(action);
+        match app.focus {
+            Focus::Places => return find(BindMode::Places).map(|binding| binding.action),
+            Focus::Tabs => return find(BindMode::Tabs).map(|binding| binding.action),
+            Focus::View => {}
         }
     }
 
@@ -330,7 +462,10 @@ fn lookup_binding_for_mode(mode: &Mode, key_event: KeyEvent) -> Option<Action> {
         .find(|bind| {
             bind.code == key_event.code
                 && normalize_mods(bind.code, bind.mods) == key_event.modifiers
-                && bind.modes.iter().any(|binding_mode| binding_mode.matches(mode))
+                && bind
+                    .modes
+                    .iter()
+                    .any(|binding_mode| binding_mode.matches(mode))
         })
         .map(|bind| bind.action)
 }
@@ -375,7 +510,6 @@ fn open_place(app: &mut App, leave_panel: bool) {
         }
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Actions
@@ -447,12 +581,11 @@ pub enum Action {
     ToggleHidden,
     ToggleSplit,
     SwapPane,
-    FocusLeft,
-    FocusRight,
-    /// `Ctrl+k`: up one row, through tabs when that pane is visible.
-    EnterCrumbs,
-    TabsLeave,
-    TabsIgnore,
+    /// Move keyboard focus between UI regions. Local movement uses the
+    /// `Move*` and `Interface*` actions instead.
+    Focus(Direction),
+    /// Deliberately consume a binding in a focused keymap.
+    NoOp,
     TogglePlaces,
     ToggleInfo,
     ToggleFilterBar,
@@ -514,16 +647,10 @@ pub enum Action {
     InterfaceFirst,
     InterfaceLast,
     InterfaceAccept,
-    InterfaceFocusDown,
-    InterfaceFocusUp,
-    InterfaceFocusLeft,
-    InterfaceFocusRight,
     PlacesDown,
     PlacesUp,
     PlacesOpen,
     PlacesAccept,
-    PlacesIgnore,
-    PlacesLeave,
 }
 
 /// A payload-free input context for the static keymap.
@@ -567,7 +694,7 @@ impl BindMode {
                 | (Self::Rename, Mode::Rename(_))
                 | (Self::BatchRename, Mode::BatchRename)
                 | (Self::NewFolder, Mode::NewFolder)
-                | (Self::NewFile, Mode::NewFile)
+                | (Self::NewFile, Mode::NewFile(_))
                 | (Self::Confirm, Mode::Confirm(_))
                 | (Self::Properties, Mode::Properties)
                 | (Self::Help, Mode::Help)
@@ -747,12 +874,12 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
                 app.pending_delete = Some(count);
             } else {
                 let trash_paths = app.pane().selected_paths();
-                move_to_trash(app, trash_paths);
+                delete_to_register(app, trash_paths);
             }
         }
         Action::DeleteSelection => {
             let trash_paths = app.pane().selected_paths();
-            move_to_trash(app, trash_paths);
+            delete_to_register(app, trash_paths);
         }
         Action::DeletePerm => {
             let perm_delete_paths = operand_paths(app, count);
@@ -766,7 +893,14 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
         }
         Action::Rename => start_rename(app),
         Action::NewFolder => enter_text(app, Mode::NewFolder, String::new()),
-        Action::NewFile => enter_text(app, Mode::NewFile, String::new()),
+        Action::NewFile => {
+            let parent = app
+                .pane()
+                .current()
+                .filter(|entry| entry.is_dir())
+                .map_or_else(|| app.pane().cwd.clone(), |entry| entry.path.clone());
+            enter_text(app, Mode::NewFile(parent), String::new());
+        }
         Action::Undo => match app.undo.pop() {
             None => app.info("Nothing to undo"),
             Some(op) => match ops::undo(&op) {
@@ -845,30 +979,16 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
         }
         Action::ToggleHidden => app.toggle_hidden(),
         Action::ToggleSplit => app.toggle_split(),
-        Action::FocusLeft => app.focus_left(),
-        Action::FocusRight => app.focus_right(),
+        Action::Focus(direction) => move_focus(app, direction),
+        Action::NoOp => {}
         Action::PlacesDown => move_places_cursor(app, 1),
         Action::PlacesUp => move_places_cursor(app, -1),
         Action::PlacesOpen => open_place(app, false),
         Action::PlacesAccept => open_place(app, true),
-        Action::PlacesIgnore => {}
-        Action::PlacesLeave => app.focus = Focus::View,
-        // Straight up, into whatever is overhead. The nav group sits over the
-        // Places panel and the trail starts where the file view does, so which
-        // one that is depends on the pane you left.
-        Action::EnterCrumbs => match app.focus {
-            Focus::Places => focus_button(app, 0),
-            Focus::View if app.tabs.len() > 1 => app.focus = Focus::Tabs,
-            Focus::View | Focus::Tabs => enter_crumbs(app, config::NAV_BUTTONS.len() - 1),
-        },
-        Action::TabsLeave => app.focus = Focus::View,
-        Action::TabsIgnore => {}
         Action::SwapPane => app.other_pane(),
         Action::TogglePlaces => {
             app.places_visible = !app.places_visible;
-            if !app.places_visible {
-                app.focus = Focus::View;
-            }
+            app.repair_focus();
         }
         Action::ToggleInfo => app.info_visible = !app.info_visible,
         Action::ToggleFilterBar => {
@@ -954,11 +1074,7 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
         | Action::InterfaceRight
         | Action::InterfaceFirst
         | Action::InterfaceLast
-        | Action::InterfaceAccept
-        | Action::InterfaceFocusDown
-        | Action::InterfaceFocusUp
-        | Action::InterfaceFocusLeft
-        | Action::InterfaceFocusRight => {
+        | Action::InterfaceAccept => {
             debug_assert!(false, "mode-local action reached normal dispatcher");
         }
     }
@@ -983,6 +1099,25 @@ fn start_rename(app: &mut App) {
 }
 
 fn paste_clipboard(app: &mut App) {
+    // A Vim delete lives in the system Trash, so it must be restored before it
+    // can become an ordinary copy source. After the first paste, retain the
+    // restored paths as a copy register so repeated `p` remains meaningful.
+    if app.clipboard.trashed && !app.clipboard.paths.is_empty() {
+        let dest = app.pane().cwd.clone();
+        match ops::restore_from_trash_to(&app.clipboard.paths, &dest) {
+            Ok(restored_paths) => {
+                let restored_count = restored_paths.len();
+                app.clipboard.paths = restored_paths;
+                app.clipboard.cut = false;
+                app.clipboard.trashed = false;
+                app.info(format!("Pasted {restored_count} item(s)"));
+                app.refresh_in_place();
+            }
+            Err(e) => app.error(e),
+        }
+        return;
+    }
+
     // Prefer our own clipboard: it knows cut-vs-copy, which uri-list cannot say.
     let (mut paths, cut) = (app.clipboard.paths.clone(), app.clipboard.cut);
     if paths.is_empty() {
@@ -1224,17 +1359,14 @@ fn commit_text_input(app: &mut App) {
                 Err(e) => app.error(e),
             }
         }
-        Mode::NewFile => {
-            let cwd = app.pane().cwd.clone();
-            match ops::new_file(&cwd, &input) {
-                Ok(op) => {
-                    app.undo.push(op);
-                    app.refresh_in_place();
-                    app.info(format!("Created {input}"));
-                }
-                Err(e) => app.error(e),
+        Mode::NewFile(parent) => match ops::new_file(&parent, &input) {
+            Ok(op) => {
+                app.undo.push(op);
+                app.refresh_in_place();
+                app.info(format!("Created {input}"));
             }
-        }
+            Err(e) => app.error(e),
+        },
         _ => {}
     }
 }
@@ -1348,6 +1480,10 @@ fn handle_confirm_key(app: &mut App, key_event: KeyEvent, pending_confirm: Confi
 /// opened on its first item read as "Icons" being the mode whatever the pane
 /// was actually showing, since the highlight is the only mark a row carries.
 pub fn open_menu(app: &mut App, kind: MenuKind) {
+    let current = current_focus_region(app);
+    if !current.is_toolbar() {
+        app.toolbar_return = current;
+    }
     app.menu_cursor = match kind {
         MenuKind::ViewMode => match app.pane().view {
             ViewMode::Icons => 0,
@@ -1380,7 +1516,7 @@ const fn menu_item(label: &'static str, action: Action) -> MenuItem {
 pub fn menu_items(kind: &MenuKind) -> Vec<MenuItem> {
     match kind {
         MenuKind::Hamburger => vec![
-            menu_item("New Folder…               F10", Action::NewFolder),
+            menu_item("New Folder…                 O", Action::NewFolder),
             menu_item("New File…                   o", Action::NewFile),
             menu_item("Rename…                    F2", Action::Rename),
             menu_item("Move to Trash           x/Del", Action::Trash),
@@ -1430,7 +1566,8 @@ fn handle_menu_key(app: &mut App, key_event: KeyEvent, kind: MenuKind) {
     }
     let n = items.len();
     match lookup_binding(app, key_event) {
-        Some(Action::Cancel) => app.mode = Mode::Normal,
+        Some(Action::Focus(direction)) => move_focus(app, direction),
+        Some(Action::Cancel) => cancel_toolbar(app),
         Some(Action::InterfaceDown) => app.menu_cursor = (app.menu_cursor + 1) % n,
         Some(Action::InterfaceUp) => app.menu_cursor = (app.menu_cursor + n - 1) % n,
         Some(Action::InterfaceFirst) => app.menu_cursor = 0,
@@ -1486,6 +1623,10 @@ fn openable_crumb(app: &App) -> Option<usize> {
 /// Failing that — a first visit, or a pick that is no longer there — it is the
 /// child you are standing in, the one row already in force, as in `open_menu`.
 pub fn open_crumb(app: &mut App, segment_index: usize) {
+    let current = current_focus_region(app);
+    if !current.is_toolbar() {
+        app.toolbar_return = current;
+    }
     let trail = crate::ui::crumb_paths(&app.pane().cwd);
     let sibling_dirs = crumb_siblings(app, segment_index);
     let returning = app.pane().crumb_focus == trail.get(segment_index).cloned();
@@ -1608,19 +1749,8 @@ fn toolbar_nav(app: &mut App, key_event: KeyEvent, button_index: usize) -> bool 
         (config::NAV_BUTTONS.len(), toolbar_button_count() - 1)
     };
     match lookup_binding(app, key_event) {
-        Some(Action::InterfaceFocusDown) => app.mode = Mode::Normal,
-        Some(Action::InterfaceFocusUp) => {}
-        Some(Action::InterfaceFocusLeft) => {
-            if !in_nav_group {
-                enter_crumbs(app, config::NAV_BUTTONS.len() - 1);
-            }
-        }
-        Some(Action::InterfaceFocusRight) => {
-            if in_nav_group {
-                enter_crumbs(app, config::NAV_BUTTONS.len());
-            }
-        }
-        Some(Action::Cancel) => app.mode = Mode::Normal,
+        Some(Action::Focus(direction)) => move_focus(app, direction),
+        Some(Action::Cancel) => cancel_toolbar(app),
         Some(Action::InterfaceLeft) => {
             focus_button(app, button_index.saturating_sub(1).max(first_button));
         }
@@ -1658,17 +1788,15 @@ fn press_button(app: &mut App, button_index: usize) {
 fn handle_crumb_menu_key(app: &mut App, key_event: KeyEvent, segment_index: usize) {
     let items = crumb_siblings(app, segment_index);
     if items.is_empty() {
-        app.mode = Mode::Normal;
+        cancel_toolbar(app);
         return;
     }
     let last_segment_index = crate::ui::crumb_paths(&app.pane().cwd)
         .len()
         .saturating_sub(1);
     match lookup_binding(app, key_event) {
-        Some(Action::InterfaceFocusDown) | Some(Action::Cancel) => app.mode = Mode::Normal,
-        Some(Action::InterfaceFocusUp) => {}
-        Some(Action::InterfaceFocusLeft) => focus_button(app, config::NAV_BUTTONS.len() - 1),
-        Some(Action::InterfaceFocusRight) => focus_button(app, config::NAV_BUTTONS.len()),
+        Some(Action::Focus(direction)) => move_focus(app, direction),
+        Some(Action::Cancel) => cancel_toolbar(app),
         Some(Action::InterfaceDown) => app.menu_cursor = (app.menu_cursor + 1) % items.len(),
         Some(Action::InterfaceUp) => {
             app.menu_cursor = (app.menu_cursor + items.len() - 1) % items.len();
@@ -1880,10 +2008,7 @@ mod tests {
         app.mode = Mode::Confirm(Confirm::EmptyTrash);
         press_char(&mut app, 'n');
         assert!(matches!(app.mode, Mode::Confirm(Confirm::EmptyTrash)));
-        handle_key_event(
-            &mut app,
-            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-        );
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.mode, Mode::Normal);
     }
 
@@ -1892,18 +2017,15 @@ mod tests {
         let mut app = test_app();
         app.focus = Focus::Places;
         let left = normalize(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
-        assert_eq!(lookup_binding(&app, left), Some(Action::PlacesIgnore));
+        assert_eq!(lookup_binding(&app, left), Some(Action::NoOp));
 
-        let ctrl_h = normalize(KeyEvent::new(
-            KeyCode::Char('h'),
-            KeyModifiers::CONTROL,
-        ));
-        assert_eq!(lookup_binding(&app, ctrl_h), Some(Action::FocusLeft));
-
-        handle_key_event(
-            &mut app,
-            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        let ctrl_h = normalize(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert_eq!(
+            lookup_binding(&app, ctrl_h),
+            Some(Action::Focus(Direction::Left))
         );
+
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.focus, Focus::View);
     }
 
@@ -2001,7 +2123,10 @@ mod tests {
     #[test]
     fn lookup_uses_the_current_mode() {
         let d = normalize(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
-        assert_eq!(lookup_binding_for_mode(&Mode::Normal, d), Some(Action::DeleteOp));
+        assert_eq!(
+            lookup_binding_for_mode(&Mode::Normal, d),
+            Some(Action::DeleteOp)
+        );
         assert_eq!(
             lookup_binding_for_mode(&Mode::Visual, d),
             Some(Action::DeleteSelection)
@@ -2016,8 +2141,14 @@ mod tests {
     #[test]
     fn the_same_key_is_discoverable_in_normal_text_and_interface_modes() {
         let left = normalize(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
-        assert_eq!(lookup_binding_for_mode(&Mode::Normal, left), Some(Action::MoveLeft));
-        assert_eq!(lookup_binding_for_mode(&Mode::Search, left), Some(Action::InputLeft));
+        assert_eq!(
+            lookup_binding_for_mode(&Mode::Normal, left),
+            Some(Action::MoveLeft)
+        );
+        assert_eq!(
+            lookup_binding_for_mode(&Mode::Search, left),
+            Some(Action::InputLeft)
+        );
         assert_eq!(
             lookup_binding_for_mode(&Mode::Buttons(0), left),
             Some(Action::InterfaceLeft)
@@ -2085,5 +2216,276 @@ mod tests {
         let mut app = test_app();
         press_char(&mut app, 'q');
         assert_eq!(app.typeahead, "q");
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn directional_focus_table_is_complete() {
+        use Direction::{Down, Left, Right, Up};
+        use FocusRegion::{Breadcrumb, Places, Tabs, ToolbarNav, ToolbarRight, View};
+        let mut app = test_app();
+        app.tabs.push(crate::app::Tab::new(std::env::temp_dir()));
+        app.tab_mut()
+            .panes
+            .push(crate::app::Pane::new(std::env::temp_dir()));
+        app.toolbar_return = Tabs;
+        let stay = FocusTransition::Stay;
+        let mv = |r| FocusTransition::Move(r);
+        let cases = [
+            (Places, Left, stay),
+            (Places, Right, mv(View(0))),
+            (Places, Up, mv(ToolbarNav)),
+            (Places, Down, stay),
+            (View(0), Left, mv(Places)),
+            (View(0), Right, mv(View(1))),
+            (View(0), Up, mv(Tabs)),
+            (View(0), Down, stay),
+            (View(1), Left, mv(View(0))),
+            (View(1), Right, stay),
+            (View(1), Up, mv(Tabs)),
+            (View(1), Down, stay),
+            (Tabs, Left, mv(View(0))),
+            (Tabs, Right, mv(View(1))),
+            (Tabs, Up, mv(Breadcrumb)),
+            (Tabs, Down, mv(View(0))),
+            (ToolbarNav, Left, stay),
+            (ToolbarNav, Right, mv(Breadcrumb)),
+            (ToolbarNav, Up, stay),
+            (ToolbarNav, Down, mv(Tabs)),
+            (Breadcrumb, Left, mv(ToolbarNav)),
+            (Breadcrumb, Right, mv(ToolbarRight)),
+            (Breadcrumb, Up, stay),
+            (Breadcrumb, Down, mv(Tabs)),
+            (ToolbarRight, Left, mv(Breadcrumb)),
+            (ToolbarRight, Right, stay),
+            (ToolbarRight, Up, stay),
+            (ToolbarRight, Down, mv(Tabs)),
+        ];
+        for (region, direction, expected) in cases {
+            assert_eq!(
+                region.move_focus(direction, &app),
+                expected,
+                "{region:?} {direction:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn directional_neighbours_follow_dynamic_layout() {
+        use Direction::{Left, Right, Up};
+        use FocusRegion::{Breadcrumb, View};
+        let mut app = test_app();
+        app.places_visible = false;
+        assert_eq!(View(0).move_focus(Left, &app), FocusTransition::Stay);
+        assert_eq!(View(0).move_focus(Right, &app), FocusTransition::Stay);
+        assert_eq!(
+            View(0).move_focus(Up, &app),
+            FocusTransition::Move(Breadcrumb)
+        );
+        app.tab_mut()
+            .panes
+            .push(crate::app::Pane::new(std::env::temp_dir()));
+        assert_eq!(
+            View(0).move_focus(Right, &app),
+            FocusTransition::Move(View(1))
+        );
+    }
+
+    #[test]
+    fn toolbar_down_and_cancel_restore_each_body_region() {
+        for origin in [
+            FocusRegion::Places,
+            FocusRegion::Tabs,
+            FocusRegion::View(0),
+            FocusRegion::View(1),
+        ] {
+            let mut app = test_app();
+            app.tab_mut()
+                .panes
+                .push(crate::app::Pane::new(std::env::temp_dir()));
+            if origin == FocusRegion::Tabs {
+                app.tabs.push(crate::app::Tab::new(std::env::temp_dir()));
+            }
+            let current = current_focus_region(&app);
+            enter_focus_region(&mut app, current, origin);
+            move_focus(&mut app, Direction::Up);
+            assert!(current_focus_region(&app).is_toolbar());
+            move_focus(&mut app, Direction::Down);
+            assert_eq!(current_focus_region(&app), origin);
+
+            move_focus(&mut app, Direction::Up);
+            cancel_toolbar(&mut app);
+            assert_eq!(current_focus_region(&app), origin);
+        }
+    }
+
+    #[test]
+    fn focused_tabs_shadow_the_file_view_pipeline() {
+        let mut app = test_app();
+        app.tabs.push(crate::app::Tab::new(std::env::temp_dir()));
+        app.focus = Focus::Tabs;
+        app.pane_mut().cursor = 7;
+        app.pane_mut().selected.insert(PathBuf::from("selected"));
+        for key in ['j', 'k', 'd', 'z'] {
+            press_char(&mut app, key);
+        }
+        assert_eq!(app.pane().cursor, 7);
+        assert!(!app.pane().selected.is_empty());
+        assert_eq!(app.pending_delete, None);
+        assert_eq!(app.pending_chord_leader, None);
+        assert!(app.typeahead.is_empty());
+    }
+
+    #[test]
+    fn layout_changes_repair_body_and_return_focus() {
+        let mut app = test_app();
+        app.tab_mut()
+            .panes
+            .push(crate::app::Pane::new(std::env::temp_dir()));
+        app.tab_mut().active = 1;
+        app.toolbar_return = FocusRegion::View(1);
+        app.toggle_split();
+        assert_eq!(app.tab().active, 0);
+        assert_eq!(app.toolbar_return, FocusRegion::View(0));
+
+        app.focus = Focus::Places;
+        app.toolbar_return = FocusRegion::Places;
+        run_action(&mut app, Action::TogglePlaces, 1);
+        assert_eq!(app.focus, Focus::View);
+        assert_eq!(app.toolbar_return, FocusRegion::View(0));
+
+        app.tabs.push(crate::app::Tab::new(std::env::temp_dir()));
+        app.focus = Focus::Tabs;
+        app.toolbar_return = FocusRegion::Tabs;
+        app.close_tab();
+        assert_eq!(app.focus, Focus::View);
+        assert!(matches!(app.toolbar_return, FocusRegion::View(_)));
+    }
+
+    #[test]
+    fn modal_and_text_modes_do_not_leak_focus_actions() {
+        let mut app = test_app();
+        for mode in [
+            Mode::Command,
+            Mode::Search,
+            Mode::PathEdit,
+            Mode::Confirm(Confirm::EmptyTrash),
+        ] {
+            app.mode = mode.clone();
+            let before = current_focus_region(&app);
+            handle_key_event(&mut app, ctrl('k'));
+            assert_eq!(app.mode, mode);
+            assert_eq!(current_focus_region(&app), before);
+        }
+    }
+
+    #[test]
+    fn breadcrumb_entry_restores_a_remembered_openable_segment() {
+        let base = std::env::temp_dir().join(format!("dolvim-focus-{}", std::process::id()));
+        let left = base.join("left");
+        let right = base.join("right");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::create_dir_all(&right).unwrap();
+        let mut app = App::new(left);
+        app.pane_mut().crumb_focus = Some(base.clone());
+        enter_crumbs(&mut app, 0);
+        let expected = crate::ui::crumb_paths(&app.pane().cwd)
+            .iter()
+            .position(|path| path == &base)
+            .unwrap();
+        assert_eq!(app.mode, Mode::CrumbMenu(expected));
+        assert_eq!(app.pane().crumb_focus.as_ref(), Some(&base));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn unavailable_breadcrumb_falls_back_to_the_adjacent_group() {
+        let mut app = test_app();
+        app.pane_mut().cwd = PathBuf::new();
+        app.mode = Mode::Buttons(config::NAV_BUTTONS.len() - 1);
+        app.toolbar_return = FocusRegion::View(0);
+        move_focus(&mut app, Direction::Right);
+        assert_eq!(current_focus_region(&app), FocusRegion::ToolbarNav);
+        assert_eq!(app.mode, Mode::Menu(MenuKind::ViewMode));
+    }
+
+    #[test]
+    fn new_file_on_a_folder_creates_the_file_inside_it() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base =
+            std::env::temp_dir().join(format!("dolvim-new-file-{}-{unique}", std::process::id()));
+        let folder = base.join("folder");
+        std::fs::create_dir_all(&folder).unwrap();
+
+        {
+            let mut app = App::new(base.clone());
+            let entries = crate::fs::read_dir(&base, 0).unwrap();
+            app.pane_mut().set_entries(entries);
+
+            press_char(&mut app, 'o');
+            assert_eq!(app.mode, Mode::NewFile(folder.clone()));
+            for character in "created.txt".chars() {
+                press_char(&mut app, character);
+            }
+            handle_key_event(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+            assert!(folder.join("created.txt").is_file());
+            assert!(!base.join("created.txt").exists());
+        }
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn visual_delete_can_be_pasted_back() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "dolvim-visual-delete-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let deleted = base.join("preserved.txt");
+        std::fs::write(&deleted, b"keep me").unwrap();
+
+        {
+            let mut app = App::new(base.clone());
+            let entries = crate::fs::read_dir(&base, 0).unwrap();
+            app.pane_mut().set_entries(entries);
+
+            press_char(&mut app, 'v');
+            press_char(&mut app, 'd');
+            assert!(!deleted.exists());
+            assert!(app.clipboard.trashed);
+            assert_eq!(app.clipboard.paths, vec![deleted.clone()]);
+
+            press_char(&mut app, 'p');
+            assert_eq!(std::fs::read(&deleted).unwrap(), b"keep me");
+            assert!(!app.clipboard.trashed);
+        }
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn menu_button_opens_on_entry_and_accept_lands_in_the_view() {
+        let mut app = test_app();
+        app.focus = Focus::Places;
+        move_focus(&mut app, Direction::Up);
+        assert_eq!(app.mode, Mode::Buttons(0));
+        press_char(&mut app, 'l');
+        press_char(&mut app, 'l');
+        assert_eq!(app.mode, Mode::Menu(MenuKind::ViewMode));
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(current_focus_region(&app), FocusRegion::View(0));
     }
 }

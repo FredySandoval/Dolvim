@@ -66,6 +66,10 @@ fn xdg_mime(args: &[&str]) -> Option<String> {
 pub struct Clipboard {
     pub paths: Vec<PathBuf>,
     pub cut: bool,
+    /// The paths name items moved to the system Trash by Vim's `d` operator.
+    /// They are original paths (the portable identity exposed by `trash`), not
+    /// currently readable filesystem paths.
+    pub trashed: bool,
 }
 
 impl Clipboard {
@@ -73,6 +77,15 @@ impl Clipboard {
         export_uris(&paths);
         self.paths = paths;
         self.cut = cut;
+        self.trashed = false;
+    }
+
+    /// Keep a Vim delete in the unnamed register without publishing dead URIs
+    /// to the desktop clipboard.
+    pub fn set_trashed(&mut self, paths: Vec<PathBuf>) {
+        self.paths = paths;
+        self.cut = false;
+        self.trashed = true;
     }
 }
 
@@ -364,6 +377,27 @@ pub fn restore_from_trash(originals: &[PathBuf]) -> Result<usize, String> {
     let n = wanted.len();
     trash::os_limited::restore_all(wanted).map_err(trash_error)?;
     Ok(n)
+}
+
+/// Paste items saved by Vim's delete register into `destination`.
+///
+/// `TrashItem::original_parent` is the restore destination used by every
+/// backend. Replacing it lets `p` restore beside the cursor's current folder,
+/// rather than forcing the item back to the directory it was deleted from.
+pub fn restore_from_trash_to(
+    originals: &[PathBuf],
+    destination: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let mut wanted = trash_items(originals)?;
+    let restored_paths = wanted
+        .iter()
+        .map(|item| destination.join(&item.name))
+        .collect();
+    for item in &mut wanted {
+        item.original_parent = destination.to_path_buf();
+    }
+    trash::os_limited::restore_all(wanted).map_err(trash_error)?;
+    Ok(restored_paths)
 }
 
 pub fn purge_from_trash(originals: &[PathBuf]) -> Result<usize, String> {
@@ -878,6 +912,37 @@ mod tests {
         .unwrap();
         assert!(!temp_dir.join("out").exists());
         fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn deleted_register_restores_into_paste_destination() {
+        let source_dir = tmpdir("deleted-register-source");
+        let destination_dir = tmpdir("deleted-register-destination");
+        let original = source_dir.join("note.txt");
+        fs::write(&original, b"preserved").unwrap();
+
+        trash(std::slice::from_ref(&original)).unwrap();
+        assert!(!original.exists());
+        let restored =
+            restore_from_trash_to(std::slice::from_ref(&original), &destination_dir).unwrap();
+
+        let pasted = destination_dir.join("note.txt");
+        assert_eq!(restored, vec![pasted.clone()]);
+        assert_eq!(fs::read(pasted).unwrap(), b"preserved");
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(destination_dir).unwrap();
+    }
+
+    #[test]
+    fn clipboard_distinguishes_deleted_items_from_ordinary_copies() {
+        let path = PathBuf::from("item");
+        let mut clipboard = Clipboard::default();
+        clipboard.set_trashed(vec![path.clone()]);
+        assert!(clipboard.trashed);
+        assert_eq!(clipboard.paths, vec![path.clone()]);
+
+        clipboard.set(vec![path], false);
+        assert!(!clipboard.trashed);
     }
 
     #[test]
