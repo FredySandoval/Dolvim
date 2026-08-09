@@ -228,8 +228,13 @@ fn handle_left_press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
     app.tabs[app.active_tab].active = pane_idx;
     app.focus = Focus::View;
 
-    let path = app.pane().entry_at(vis).map(|e| e.path.clone());
-    let Some(path) = path else { return };
+    let entry_identity = app
+        .pane()
+        .entry_at(vis)
+        .map(|entry| (entry.path.clone(), entry.selection_key()));
+    let Some((path, selection_key)) = entry_identity else {
+        return;
+    };
 
     // The tree arrow opens a folder as a drawer in place, on one click. The
     // rest of the row is untouched, so double-clicking the name still enters
@@ -243,8 +248,8 @@ fn handle_left_press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
 
     if ctrl {
         let p = app.pane_mut();
-        if !p.selected.remove(&path) {
-            p.selected.insert(path.clone());
+        if !p.selected.remove(&selection_key) {
+            p.selected.insert(selection_key.clone());
         }
         p.cursor = vis;
         p.anchor = vis;
@@ -252,14 +257,14 @@ fn handle_left_press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
         let anchor = app.pane().anchor;
         let (a, b) = (anchor.min(vis), anchor.max(vis));
         let range: Vec<PathBuf> = (a..=b)
-            .filter_map(|i| app.pane().entry_at(i).map(|e| e.path.clone()))
+            .filter_map(|i| app.pane().entry_at(i).map(|e| e.selection_key()))
             .collect();
         let p = app.pane_mut();
         p.selected.clear();
         p.selected.extend(range);
         p.cursor = vis;
     } else {
-        let was_selected = app.pane().selected.contains(&path);
+        let was_selected = app.pane().selected.contains(&selection_key);
         let is_double_click = app.last_click.is_some_and(|last_click| {
             last_click.visible_index == vis
                 && last_click.at.elapsed() < Duration::from_millis(config::DOUBLE_CLICK_MS)
@@ -516,6 +521,7 @@ mod tests {
             mode: 0,
             readable: true,
             hidden: false,
+            trash_id: None,
             depth,
             expanded: false,
         };

@@ -177,23 +177,114 @@ fn finish_transfer(app: &mut App) {
         .lock()
         .ok()
         .and_then(|mut outcome_guard| outcome_guard.take());
-    match outcome {
-        Some(Ok(undo_op)) => {
-            // A pure copy journals nothing — there is nothing to put back.
-            if let ops::UndoOp::Move { moved_pairs } = &undo_op {
-                if !moved_pairs.is_empty() {
-                    app.undo.push(undo_op.clone());
-                }
-            }
-            if active_transfer.kind == ops::TransferKind::Move {
-                app.clipboard = ops::Clipboard::Empty;
-            }
-            app.info(format!("{} — done", active_transfer.label));
+    let Some(outcome) = outcome else {
+        app.error("Transfer finished without an outcome");
+        app.refresh_in_place();
+        return;
+    };
+
+    let committed_sources: std::collections::HashSet<_> = outcome
+        .committed
+        .iter()
+        .map(|effect| effect.source.clone())
+        .collect();
+    match active_transfer.kind {
+        ops::TransferKind::Move if !outcome.committed.is_empty() => {
+            app.undo.push(ops::UndoOp::Move {
+                moved_pairs: outcome
+                    .committed
+                    .iter()
+                    .map(|effect| (effect.source.clone(), effect.target.clone()))
+                    .collect(),
+            });
         }
-        Some(Err(transfer_error)) => app.error(transfer_error),
-        None => {}
+        ops::TransferKind::Restore if !outcome.committed.is_empty() => {
+            app.undo.push(ops::UndoOp::Restore {
+                restored_paths: outcome
+                    .committed
+                    .iter()
+                    .map(|effect| effect.target.clone())
+                    .collect(),
+                previous_items: outcome
+                    .committed
+                    .iter()
+                    .filter_map(|effect| effect.trash_ref.clone())
+                    .collect(),
+            });
+        }
+        _ => {}
     }
-    app.pane_mut().selected.clear();
+
+    if active_transfer.expected_register.as_ref() == Some(&app.register) {
+        match (&active_transfer.kind, &active_transfer.expected_register) {
+            (ops::TransferKind::Move, Some(ops::UnnamedRegister::Live { paths, cut: true })) => {
+                let remaining: Vec<_> = paths
+                    .iter()
+                    .filter(|path| !committed_sources.contains(*path))
+                    .cloned()
+                    .collect();
+                app.register = if remaining.is_empty() {
+                    ops::UnnamedRegister::Empty
+                } else {
+                    ops::UnnamedRegister::Live {
+                        paths: remaining,
+                        cut: true,
+                    }
+                };
+            }
+            (ops::TransferKind::Restore, Some(ops::UnnamedRegister::Deleted { items })) => {
+                let committed_ids: std::collections::HashSet<_> = outcome
+                    .committed
+                    .iter()
+                    .filter_map(|effect| effect.trash_ref.as_ref().map(|item| item.id.clone()))
+                    .collect();
+                let remaining: Vec<_> = items
+                    .iter()
+                    .filter(|item| !committed_ids.contains(&item.id))
+                    .cloned()
+                    .collect();
+                app.register = if remaining.is_empty() {
+                    ops::UnnamedRegister::Live {
+                        paths: outcome
+                            .committed
+                            .iter()
+                            .map(|effect| effect.target.clone())
+                            .collect(),
+                        cut: false,
+                    }
+                } else {
+                    ops::UnnamedRegister::Deleted { items: remaining }
+                };
+            }
+            _ => {}
+        }
+    }
+
+    let committed_selection_keys: std::collections::HashSet<_> = outcome
+        .committed
+        .iter()
+        .map(|effect| {
+            effect
+                .trash_ref
+                .as_ref()
+                .map_or_else(|| effect.source.clone(), ops::TrashRef::selection_key)
+        })
+        .collect();
+    app.pane_mut()
+        .selected
+        .retain(|key| !committed_selection_keys.contains(key));
+
+    let committed = outcome.committed.len();
+    let failed = outcome.failed.len();
+    if failed > 0 || outcome.cancelled {
+        app.error(format!(
+            "{} — {committed} committed, {failed} failed{}",
+            active_transfer.label,
+            if outcome.cancelled { ", cancelled" } else { "" }
+        ));
+    } else {
+        app.info(format!("{} — {committed} done", active_transfer.label));
+    }
     app.refresh_in_place();
 }
 

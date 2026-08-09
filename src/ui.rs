@@ -524,7 +524,7 @@ fn draw_pane(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
 
 fn entry_style(pane: &Pane, visible_index: usize, is_cut: bool) -> Style {
     let e = &pane.entries[pane.visible[visible_index]];
-    let selected = pane.selected.contains(&e.path);
+    let selected = pane.selected.contains(&e.selection_key());
     let fg = if is_cut {
         color::CUT
     } else if e.is_locked() {
@@ -602,7 +602,7 @@ fn draw_icons_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, act
         rows,
         margin_x,
     } = icon_grid(area);
-    let cut_set = app.clipboard.cut_paths().to_vec();
+    let cut_set = app.register.cut_paths().to_vec();
     let cut = !cut_set.is_empty();
     {
         let p = app.pane_at_mut(idx);
@@ -704,7 +704,7 @@ fn draw_icons_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, act
 
 fn draw_compact_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool) {
     let rows = area.height.max(1);
-    let cut_set = app.clipboard.cut_paths().to_vec();
+    let cut_set = app.register.cut_paths().to_vec();
     let cut = !cut_set.is_empty();
     // The margin is the pane's, not each column's: columns are already held
     // apart by the blank `compact_widths` leaves on the right.
@@ -919,7 +919,7 @@ fn draw_details_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, a
     let rows = list.height.max(1);
     let cols = detail_columns(area, time_width(app.pane_at(idx)));
     let sort = app.pane_at(idx).sort;
-    let cut_set = app.clipboard.cut_paths().to_vec();
+    let cut_set = app.register.cut_paths().to_vec();
     let cut = !cut_set.is_empty();
 
     {
@@ -1136,11 +1136,11 @@ fn status_bar(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.set_cursor_position((area.x + 1 + app.input_cursor as u16, area.y));
         return;
     }
-    if let Mode::Rename(_) | Mode::BatchRename | Mode::NewFolder | Mode::NewFile(_) = app.mode {
+    if let Mode::Rename(_) | Mode::BatchRename | Mode::NewFolder(_) | Mode::NewFile(_) = app.mode {
         let label = match app.mode {
             Mode::Rename(_) => "Rename to:",
             Mode::BatchRename => "Rename pattern (# = counter):",
-            Mode::NewFolder => "New folder:",
+            Mode::NewFolder(_) => "New folder:",
             _ => "New file:",
         };
         let text = format!(" {label} {}", app.input);
@@ -1421,7 +1421,8 @@ fn help_lines() -> Vec<Line<'static>> {
         key_row("L / Enter", "open        H / Backspace  up"),
         key_row("Alt+← / Alt+→", "back / forward in history"),
         section_heading("Selection"),
-        key_row("v  V", "visual, visual by row"),
+        key_row("v  V  Ctrl+V", "visual, by row, block (Icons only)"),
+        key_row("y", "yank visual selection"),
         key_row("Ctrl+A  Ctrl+Shift+A", "select all / invert"),
         section_heading("Files"),
         key_row("x  5x", "trash the item / n items"),
@@ -1826,6 +1827,7 @@ mod tests {
             mode: 0,
             readable: true,
             hidden: false,
+            trash_id: None,
             depth: 2,
             expanded: false,
         };

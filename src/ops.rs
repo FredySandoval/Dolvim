@@ -7,7 +7,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 use crate::config;
@@ -70,8 +70,16 @@ pub struct TrashRef {
     pub name: std::ffi::OsString,
 }
 
+impl TrashRef {
+    pub fn selection_key(&self) -> PathBuf {
+        let mut key = std::ffi::OsString::from("trash-generation:");
+        key.push(&self.id);
+        PathBuf::from(key)
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum Clipboard {
+pub enum UnnamedRegister {
     #[default]
     Empty,
     Live {
@@ -83,7 +91,7 @@ pub enum Clipboard {
     },
 }
 
-impl Clipboard {
+impl UnnamedRegister {
     pub fn set(&mut self, paths: Vec<PathBuf>, cut: bool) {
         export_uris(&paths);
         *self = if paths.is_empty() {
@@ -286,8 +294,8 @@ pub enum UndoOp {
 
 #[derive(Clone, Debug)]
 pub struct RegisterChange {
-    pub expected: Clipboard,
-    pub replacement: Clipboard,
+    pub expected: UnnamedRegister,
+    pub replacement: UnnamedRegister,
 }
 
 #[derive(Clone, Debug)]
@@ -319,11 +327,20 @@ pub fn undo(op: &UndoOp) -> Result<UndoOutcome, String> {
             )))
         }
         UndoOp::Move { moved_pairs } => {
-            for (from, to) in moved_pairs {
-                if let Some(p) = from.parent() {
-                    let _ = fs::create_dir_all(p);
+            let mut reversed: Vec<&(PathBuf, PathBuf)> = Vec::new();
+            for pair @ (from, to) in moved_pairs.iter().rev() {
+                if let Some(parent) = from.parent() {
+                    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
                 }
-                fs::rename(to, from).map_err(|e| e.to_string())?;
+                if let Err(error) = fs::rename(to, from) {
+                    // Restore the pre-undo state so the unchanged journal entry
+                    // remains truthful when the caller puts it back.
+                    for (rolled_from, rolled_to) in reversed.into_iter().rev() {
+                        let _ = fs::rename(rolled_from, rolled_to);
+                    }
+                    return Err(error.to_string());
+                }
+                reversed.push(pair);
             }
             Ok(UndoOutcome::message(format!(
                 "Moved {} item(s) back",
@@ -335,10 +352,10 @@ pub fn undo(op: &UndoOp) -> Result<UndoOutcome, String> {
             let mut outcome =
                 UndoOutcome::message(format!("Restored {} item(s) from Trash", items.len()));
             outcome.register_change = Some(RegisterChange {
-                expected: Clipboard::Deleted {
+                expected: UnnamedRegister::Deleted {
                     items: items.clone(),
                 },
-                replacement: Clipboard::Live {
+                replacement: UnnamedRegister::Live {
                     paths: restored,
                     cut: false,
                 },
@@ -368,11 +385,11 @@ pub fn undo(op: &UndoOp) -> Result<UndoOutcome, String> {
             Ok(UndoOutcome {
                 message: format!("Undid paste of {} item(s)", restored_paths.len()),
                 register_change: Some(RegisterChange {
-                    expected: Clipboard::Live {
+                    expected: UnnamedRegister::Live {
                         paths: restored_paths.clone(),
                         cut: false,
                     },
-                    replacement: Clipboard::Deleted {
+                    replacement: UnnamedRegister::Deleted {
                         items: deleted.committed,
                     },
                 }),
@@ -420,6 +437,11 @@ pub fn file_name_of(path: &Path) -> String {
 // Trash
 // ---------------------------------------------------------------------------
 
+fn trash_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ItemFailure {
     pub path: PathBuf,
@@ -444,6 +466,7 @@ impl TrashOutcome {
 /// that actually moved. This intentionally does not flatten partial completion
 /// into `Err(String)`.
 pub fn trash(paths: &[PathBuf]) -> TrashOutcome {
+    let _guard = trash_lock();
     let mut outcome = TrashOutcome::default();
     for path in paths {
         let before = trash::os_limited::list()
@@ -503,6 +526,7 @@ pub fn list_trash() -> Vec<Entry> {
                 mode: 0o644,
                 readable: true,
                 hidden: false,
+                trash_id: Some(trash_item.id),
                 depth: 0,
                 expanded: false,
             }
@@ -529,28 +553,30 @@ fn trash_error(e: trash::Error) -> String {
     }
 }
 
-/// A Trash entry's `path` is where it came from, not where it now sits, so
-/// both operations on trashed items look them up by that original path.
-fn trash_items(originals: &[PathBuf]) -> Result<Vec<trash::TrashItem>, String> {
-    let items = trash::os_limited::list().map_err(trash_error)?;
-    let wanted: Vec<_> = items
+fn exact_trash_items(items: &[TrashRef]) -> Result<Vec<trash::TrashItem>, String> {
+    let listed = trash::os_limited::list().map_err(trash_error)?;
+    let mut by_id: std::collections::HashMap<_, _> = listed
         .into_iter()
-        .filter(|trash_item| {
-            originals.iter().any(|original_path| {
-                trash_item.original_parent.join(&trash_item.name) == *original_path
+        .map(|item| (item.id.clone(), item))
+        .collect();
+    items
+        .iter()
+        .map(|item| {
+            by_id.remove(&item.id).ok_or_else(|| {
+                format!(
+                    "{} is no longer in Trash",
+                    file_name_of(&item.original_path)
+                )
             })
         })
-        .collect();
-    if wanted.is_empty() {
-        return Err("No matching items in Trash".into());
-    }
-    Ok(wanted)
+        .collect()
 }
 
 fn restore_trash_refs(
     items: &[TrashRef],
     destination: Option<&Path>,
 ) -> Result<Vec<PathBuf>, String> {
+    let _guard = trash_lock();
     let listed = trash::os_limited::list().map_err(trash_error)?;
     let by_id: std::collections::HashMap<_, _> = listed
         .into_iter()
@@ -578,25 +604,29 @@ fn restore_trash_refs(
     Ok(restored_paths)
 }
 
-pub fn restore_deleted_to(items: &[TrashRef], destination: &Path) -> Result<Vec<PathBuf>, String> {
+#[cfg(test)]
+fn restore_deleted_to(items: &[TrashRef], destination: &Path) -> Result<Vec<PathBuf>, String> {
     restore_trash_refs(items, Some(destination))
 }
 
-pub fn restore_from_trash(originals: &[PathBuf]) -> Result<usize, String> {
-    let wanted = trash_items(originals)?;
+pub fn restore_from_trash(items: &[TrashRef]) -> Result<usize, String> {
+    let _guard = trash_lock();
+    let wanted = exact_trash_items(items)?;
     let n = wanted.len();
     trash::os_limited::restore_all(wanted).map_err(trash_error)?;
     Ok(n)
 }
 
-pub fn purge_from_trash(originals: &[PathBuf]) -> Result<usize, String> {
-    let wanted = trash_items(originals)?;
+pub fn purge_from_trash(items: &[TrashRef]) -> Result<usize, String> {
+    let _guard = trash_lock();
+    let wanted = exact_trash_items(items)?;
     let n = wanted.len();
     trash::os_limited::purge_all(wanted).map_err(trash_error)?;
     Ok(n)
 }
 
 pub fn empty_trash() -> Result<usize, String> {
+    let _guard = trash_lock();
     let items = trash::os_limited::list().map_err(trash_error)?;
     let n = items.len();
     trash::os_limited::purge_all(items).map_err(trash_error)?;
@@ -607,28 +637,51 @@ pub fn empty_trash() -> Result<usize, String> {
 // Create / rename
 // ---------------------------------------------------------------------------
 
-pub fn new_folder(dir: &Path, name: &str) -> Result<UndoOp, String> {
-    let p = dir.join(name);
-    if p.exists() {
-        return Err(format!("{name} already exists"));
+fn validated_name(name: &str) -> Result<&std::ffi::OsStr, String> {
+    if name.trim().is_empty() {
+        return Err("Name cannot be empty".into());
     }
-    fs::create_dir(&p).map_err(|e| e.to_string())?;
+    let path = Path::new(name);
+    let mut components = path.components();
+    let Some(std::path::Component::Normal(component)) = components.next() else {
+        return Err("Name must be a single file name".into());
+    };
+    if components.next().is_some() || path.as_os_str() != component {
+        return Err("Name must be a single file name".into());
+    }
+    Ok(component)
+}
+
+pub fn new_folder(dir: &Path, name: &str) -> Result<UndoOp, String> {
+    let p = dir.join(validated_name(name)?);
+    fs::create_dir(&p).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            format!("{name} already exists")
+        } else {
+            error.to_string()
+        }
+    })?;
     Ok(UndoOp::Create { path: p })
 }
 
 pub fn new_file(dir: &Path, name: &str) -> Result<UndoOp, String> {
-    let p = dir.join(name);
-    if p.exists() {
-        return Err(format!("{name} already exists"));
-    }
-    fs::File::create(&p).map_err(|e| e.to_string())?;
+    let p = dir.join(validated_name(name)?);
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&p)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("{name} already exists")
+            } else {
+                error.to_string()
+            }
+        })?;
     Ok(UndoOp::Create { path: p })
 }
 
 pub fn rename(from: &Path, new_name: &str) -> Result<UndoOp, String> {
-    if new_name.is_empty() || new_name.contains('/') {
-        return Err("Invalid name".into());
-    }
+    validated_name(new_name)?;
     let to = from.with_file_name(new_name);
     if to == from {
         return Err("Unchanged".into());
@@ -649,46 +702,77 @@ pub fn batch_rename(paths: &[PathBuf], pattern: &str) -> Result<UndoOp, String> 
     if !pattern.contains('#') {
         return Err("Pattern must contain # for the counter".into());
     }
-    let hash_count = pattern.chars().filter(|c| *c == '#').count();
-    let mut renamed_pairs = Vec::new();
-    for (index, source_path) in paths.iter().enumerate() {
-        let counter_text = format!("{:0width$}", index + 1, width = hash_count);
-        let mut new_name = String::new();
-        let mut counter_written = false;
-        for pattern_char in pattern.chars() {
-            if pattern_char == '#' {
-                if !counter_written {
-                    new_name.push_str(&counter_text);
-                    counter_written = true;
+    let hash_count = pattern
+        .chars()
+        .filter(|character| *character == '#')
+        .count();
+    let mut planned = Vec::with_capacity(paths.len());
+    let mut destinations = std::collections::HashSet::new();
+    for (index, source) in paths.iter().enumerate() {
+        let counter = format!("{:0width$}", index + 1, width = hash_count);
+        let mut name = String::new();
+        let mut wrote_counter = false;
+        for character in pattern.chars() {
+            if character == '#' {
+                if !wrote_counter {
+                    name.push_str(&counter);
+                    wrote_counter = true;
                 }
             } else {
-                new_name.push(pattern_char);
+                name.push(character);
             }
         }
-        // Keep the original extension when the pattern does not supply one.
-        let new_name = if !new_name.contains('.') {
-            match source_path.extension() {
-                Some(extension) => format!("{new_name}.{}", extension.to_string_lossy()),
-                None => new_name,
+        if !name.contains('.') {
+            if let Some(extension) = source.extension() {
+                name = format!("{name}.{}", extension.to_string_lossy());
             }
-        } else {
-            new_name
-        };
-        let to = source_path.with_file_name(&new_name);
-        if to.exists() && to != *source_path {
-            return Err(format!("{new_name} already exists"));
         }
-        fs::rename(source_path, &to).map_err(|e| format!("{}: {e}", file_name_of(source_path)))?;
-        renamed_pairs.push((source_path.clone(), to));
+        validated_name(&name)?;
+        let destination = source.with_file_name(&name);
+        if !destinations.insert(destination.clone()) {
+            return Err(format!("Batch pattern produces duplicate name {name}"));
+        }
+        if destination.exists() && destination != *source {
+            return Err(format!("{name} already exists"));
+        }
+        planned.push((source.clone(), destination));
+    }
+
+    let mut committed: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (source, destination) in &planned {
+        if source == destination {
+            continue;
+        }
+        if let Err(error) = fs::rename(source, destination) {
+            for (from, to) in committed.iter().rev() {
+                let _ = fs::rename(to, from);
+            }
+            return Err(format!("{}: {error}", file_name_of(source)));
+        }
+        committed.push((source.clone(), destination.clone()));
     }
     Ok(UndoOp::Move {
-        moved_pairs: renamed_pairs,
+        moved_pairs: committed,
     })
 }
 
 // ---------------------------------------------------------------------------
 // Copy / move with progress
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub struct TransferEffect {
+    pub source: PathBuf,
+    pub target: PathBuf,
+    pub trash_ref: Option<TrashRef>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TransferOutcome {
+    pub committed: Vec<TransferEffect>,
+    pub failed: Vec<ItemFailure>,
+    pub cancelled: bool,
+}
 
 pub struct Progress {
     pub kind: TransferKind,
@@ -698,7 +782,9 @@ pub struct Progress {
     pub current_file: Arc<Mutex<String>>,
     pub cancel_requested: Arc<AtomicBool>,
     pub finished: Arc<AtomicBool>,
-    pub outcome: Arc<Mutex<Option<Result<UndoOp, String>>>>,
+    pub outcome: Arc<Mutex<Option<TransferOutcome>>>,
+    /// Register state this paste was derived from. Drag transfers leave it None.
+    pub expected_register: Option<UnnamedRegister>,
 }
 
 impl Progress {
@@ -716,28 +802,25 @@ impl Progress {
 pub enum TransferKind {
     Copy,
     Move,
+    Restore,
 }
 
 /// Start a copy or move in the background. Returns immediately.
 pub fn start_transfer(sources: Vec<PathBuf>, dest: PathBuf, kind: TransferKind) -> Progress {
-    let transfer_progress = Progress {
+    debug_assert!(kind != TransferKind::Restore);
+    let transfer_progress = new_progress(
         kind,
-        label: format!(
+        format!(
             "{} {} item(s) to {}",
-            match kind {
-                TransferKind::Move => "Moving",
-                TransferKind::Copy => "Copying",
+            if kind == TransferKind::Move {
+                "Moving"
+            } else {
+                "Copying"
             },
             sources.len(),
             file_name_of(&dest)
         ),
-        total_bytes: Arc::new(AtomicU64::new(0)),
-        copied_bytes: Arc::new(AtomicU64::new(0)),
-        current_file: Arc::new(Mutex::new(String::new())),
-        cancel_requested: Arc::new(AtomicBool::new(false)),
-        finished: Arc::new(AtomicBool::new(false)),
-        outcome: Arc::new(Mutex::new(None)),
-    };
+    );
     let (total_bytes, copied_bytes, current_file, cancel_requested, finished, outcome) = (
         Arc::clone(&transfer_progress.total_bytes),
         Arc::clone(&transfer_progress.copied_bytes),
@@ -746,59 +829,159 @@ pub fn start_transfer(sources: Vec<PathBuf>, dest: PathBuf, kind: TransferKind) 
         Arc::clone(&transfer_progress.finished),
         Arc::clone(&transfer_progress.outcome),
     );
-
     thread::spawn(move || {
         total_bytes.store(
-            sources.iter().map(|s| tree_size(s)).sum(),
+            sources.iter().map(|source| tree_size(source)).sum(),
             Ordering::Relaxed,
         );
-        let mut moved_pairs = Vec::new();
-        let mut err = None;
-        for src in &sources {
+        let mut result = TransferOutcome::default();
+        for source in &sources {
             if cancel_requested.load(Ordering::Relaxed) {
+                result.cancelled = true;
                 break;
             }
-            let target = unique_target(&dest.join(file_name_of(src)));
-            // A rename within one filesystem is instant; try it first.
-            if kind == TransferKind::Move && fs::rename(src, &target).is_ok() {
-                copied_bytes.fetch_add(tree_size(src), Ordering::Relaxed);
-                moved_pairs.push((src.clone(), target));
-                continue;
-            }
-            if let Err(e) = copy_tree(
-                src,
+            let target = match unique_target(&dest.join(file_name_of(source))) {
+                Ok(target) => target,
+                Err(error) => {
+                    result.failed.push(ItemFailure {
+                        path: source.clone(),
+                        message: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            if let Err(error) = copy_tree(
+                source,
                 &target,
                 &copied_bytes,
                 &current_file,
                 &cancel_requested,
             ) {
-                err = Some(format!("{}: {e}", file_name_of(src)));
+                let _ = remove_tree(&target);
+                result.failed.push(ItemFailure {
+                    path: source.clone(),
+                    message: error.to_string(),
+                });
+                continue;
+            }
+            if cancel_requested.load(Ordering::Relaxed) {
+                let _ = remove_tree(&target);
+                result.cancelled = true;
                 break;
             }
-            if kind == TransferKind::Move && !cancel_requested.load(Ordering::Relaxed) {
-                if let Err(remove_error) = remove_tree(src) {
-                    err = Some(format!("{}: {remove_error}", file_name_of(src)));
-                    break;
+            if kind == TransferKind::Move {
+                if let Err(error) = remove_tree(source) {
+                    let _ = remove_tree(&target);
+                    result.failed.push(ItemFailure {
+                        path: source.clone(),
+                        message: error.to_string(),
+                    });
+                    continue;
                 }
-                moved_pairs.push((src.clone(), target));
             }
+            result.committed.push(TransferEffect {
+                source: source.clone(),
+                target,
+                trash_ref: None,
+            });
         }
-        let result = match err {
-            Some(e) => Err(e),
-            None if cancel_requested.load(Ordering::Relaxed) => Err("Cancelled".into()),
-            None if kind == TransferKind::Move => Ok(UndoOp::Move { moved_pairs }),
-            // A copy leaves nothing to undo, so report it as a no-op journal
-            // entry the caller drops.
-            None => Ok(UndoOp::Move {
-                moved_pairs: Vec::new(),
-            }),
-        };
-        if let Ok(mut outcome_guard) = outcome.lock() {
-            *outcome_guard = Some(result);
+        if let Ok(mut guard) = outcome.lock() {
+            *guard = Some(result);
         }
         finished.store(true, Ordering::Relaxed);
     });
     transfer_progress
+}
+
+pub fn start_restore(items: Vec<TrashRef>, destination: PathBuf) -> Progress {
+    let mut progress = new_progress(
+        TransferKind::Restore,
+        format!(
+            "Restoring {} item(s) to {}",
+            items.len(),
+            file_name_of(&destination)
+        ),
+    );
+    progress.expected_register = Some(UnnamedRegister::Deleted {
+        items: items.clone(),
+    });
+    let (total, copied, current, cancel, finished, outcome) = (
+        Arc::clone(&progress.total_bytes),
+        Arc::clone(&progress.copied_bytes),
+        Arc::clone(&progress.current_file),
+        Arc::clone(&progress.cancel_requested),
+        Arc::clone(&progress.finished),
+        Arc::clone(&progress.outcome),
+    );
+    thread::spawn(move || {
+        total.store(items.len() as u64, Ordering::Relaxed);
+        let mut result = TransferOutcome::default();
+        for item in items {
+            if cancel.load(Ordering::Relaxed) {
+                result.cancelled = true;
+                break;
+            }
+            if let Ok(mut name) = current.lock() {
+                *name = item.name.to_string_lossy().into_owned();
+            }
+            let target = match unique_target(&destination.join(&item.name)) {
+                Ok(target) => target,
+                Err(error) => {
+                    result.failed.push(ItemFailure {
+                        path: item.original_path.clone(),
+                        message: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            match restore_one_to(&item, &target) {
+                Ok(()) => {
+                    copied.fetch_add(1, Ordering::Relaxed);
+                    result.committed.push(TransferEffect {
+                        source: item.original_path.clone(),
+                        target,
+                        trash_ref: Some(item),
+                    });
+                }
+                Err(message) => result.failed.push(ItemFailure {
+                    path: item.original_path.clone(),
+                    message,
+                }),
+            }
+        }
+        if let Ok(mut guard) = outcome.lock() {
+            *guard = Some(result);
+        }
+        finished.store(true, Ordering::Relaxed);
+    });
+    progress
+}
+
+fn new_progress(kind: TransferKind, label: String) -> Progress {
+    Progress {
+        kind,
+        label,
+        total_bytes: Arc::new(AtomicU64::new(0)),
+        copied_bytes: Arc::new(AtomicU64::new(0)),
+        current_file: Arc::new(Mutex::new(String::new())),
+        cancel_requested: Arc::new(AtomicBool::new(false)),
+        finished: Arc::new(AtomicBool::new(false)),
+        outcome: Arc::new(Mutex::new(None)),
+        expected_register: None,
+    }
+}
+
+fn restore_one_to(item: &TrashRef, target: &Path) -> Result<(), String> {
+    let _guard = trash_lock();
+    let mut exact = exact_trash_items(std::slice::from_ref(item))?
+        .pop()
+        .ok_or_else(|| "No matching item in Trash".to_string())?;
+    exact.original_parent = target.parent().unwrap_or(Path::new("/")).to_path_buf();
+    exact.name = target
+        .file_name()
+        .ok_or_else(|| "Invalid restore destination".to_string())?
+        .to_os_string();
+    trash::os_limited::restore_all(vec![exact]).map_err(trash_error)
 }
 
 fn tree_size(path: &Path) -> u64 {
@@ -821,9 +1004,9 @@ fn tree_size(path: &Path) -> u64 {
 
 /// Never clobber silently: `file.txt` becomes `file (1).txt`, as Dolphin does
 /// when you paste into the directory a file already lives in.
-fn unique_target(path: &Path) -> PathBuf {
+fn unique_target(path: &Path) -> io::Result<PathBuf> {
     if !path.exists() {
-        return path.to_path_buf();
+        return Ok(path.to_path_buf());
     }
     let stem = path
         .file_stem()
@@ -836,10 +1019,13 @@ fn unique_target(path: &Path) -> PathBuf {
     for suffix_number in 1..10_000 {
         let candidate = path.with_file_name(format!("{stem} ({suffix_number}){ext}"));
         if !candidate.exists() {
-            return candidate;
+            return Ok(candidate);
         }
     }
-    path.to_path_buf()
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "No collision-free destination name is available",
+    ))
 }
 
 fn copy_tree(
@@ -859,7 +1045,7 @@ fn copy_tree(
         return Ok(());
     }
     if meta.is_dir() {
-        fs::create_dir_all(dest)?;
+        fs::create_dir(dest)?;
         for dir_entry in fs::read_dir(src)? {
             let dir_entry = dir_entry?;
             copy_tree(
@@ -891,7 +1077,10 @@ fn copy_file_streaming(
 ) -> io::Result<()> {
     use io::{Read, Write};
     let mut source_file = fs::File::open(src)?;
-    let mut dest_file = fs::File::create(dest)?;
+    let mut dest_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)?;
     let mut buf = vec![0u8; config::COPY_CHUNK_BYTES];
     loop {
         if cancel_requested.load(Ordering::Relaxed) {
@@ -922,13 +1111,24 @@ pub fn remove_tree(p: &Path) -> io::Result<()> {
     }
 }
 
-pub fn delete_permanently(paths: &[PathBuf]) -> Result<usize, String> {
-    let mut n = 0;
-    for p in paths {
-        remove_tree(p).map_err(|e| format!("{}: {e}", file_name_of(p)))?;
-        n += 1;
+#[derive(Clone, Debug, Default)]
+pub struct DeleteOutcome {
+    pub committed: Vec<PathBuf>,
+    pub failed: Vec<ItemFailure>,
+}
+
+pub fn delete_permanently(paths: &[PathBuf]) -> DeleteOutcome {
+    let mut outcome = DeleteOutcome::default();
+    for path in paths {
+        match remove_tree(path) {
+            Ok(()) => outcome.committed.push(path.clone()),
+            Err(error) => outcome.failed.push(ItemFailure {
+                path: path.clone(),
+                message: format!("{}: {error}", file_name_of(path)),
+            }),
+        }
     }
-    Ok(n)
+    outcome
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,6 +1209,25 @@ mod tests {
     }
 
     #[test]
+    fn creation_accepts_only_one_safe_name_and_never_clobbers() {
+        let temp_dir = tmpdir("create-name");
+        for invalid in ["", "   ", ".", "..", "a/b", "/absolute"] {
+            assert!(
+                new_file(&temp_dir, invalid).is_err(),
+                "accepted {invalid:?}"
+            );
+            assert!(
+                new_folder(&temp_dir, invalid).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+        fs::write(temp_dir.join("existing"), b"keep").unwrap();
+        assert!(new_file(&temp_dir, "existing").is_err());
+        assert_eq!(fs::read(temp_dir.join("existing")).unwrap(), b"keep");
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
     fn rename_round_trips_through_undo() {
         let temp_dir = tmpdir("rename");
         let file_path = temp_dir.join("a.txt");
@@ -1063,7 +1282,10 @@ mod tests {
         let temp_dir = tmpdir("unique");
         let file_path = temp_dir.join("f.txt");
         fs::write(&file_path, b"x").unwrap();
-        assert_eq!(unique_target(&file_path), temp_dir.join("f (1).txt"));
+        assert_eq!(
+            unique_target(&file_path).unwrap(),
+            temp_dir.join("f (1).txt")
+        );
         fs::remove_dir_all(&temp_dir).unwrap();
     }
 
@@ -1106,6 +1328,48 @@ mod tests {
     }
 
     #[test]
+    fn deleted_restore_uses_transfer_collision_policy() {
+        let source_dir = tmpdir("restore-transfer-source");
+        let destination_dir = tmpdir("restore-transfer-destination");
+        let original = source_dir.join("note.txt");
+        fs::write(&original, b"restored").unwrap();
+        fs::write(destination_dir.join("note.txt"), b"existing").unwrap();
+        let deleted = trash(std::slice::from_ref(&original));
+        assert!(deleted.failed.is_empty());
+
+        let progress = start_restore(deleted.committed, destination_dir.clone());
+        while !progress.finished.load(Ordering::Relaxed) {
+            std::thread::yield_now();
+        }
+        let outcome = progress.outcome.lock().unwrap().take().unwrap();
+        assert!(outcome.failed.is_empty());
+        assert_eq!(outcome.committed.len(), 1);
+        assert_eq!(
+            fs::read(destination_dir.join("note.txt")).unwrap(),
+            b"existing"
+        );
+        assert_eq!(
+            fs::read(destination_dir.join("note (1).txt")).unwrap(),
+            b"restored"
+        );
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(destination_dir).unwrap();
+    }
+
+    #[test]
+    fn permanent_delete_reports_partial_effects() {
+        let temp_dir = tmpdir("partial-delete");
+        let existing = temp_dir.join("existing");
+        let missing = temp_dir.join("missing");
+        fs::write(&existing, b"data").unwrap();
+        let outcome = delete_permanently(&[existing.clone(), missing.clone()]);
+        assert_eq!(outcome.committed, vec![existing]);
+        assert_eq!(outcome.failed.len(), 1);
+        assert_eq!(outcome.failed[0].path, missing);
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
     fn deleted_register_restores_into_paste_destination() {
         let source_dir = tmpdir("deleted-register-source");
         let destination_dir = tmpdir("deleted-register-destination");
@@ -1132,18 +1396,32 @@ mod tests {
             original_path: path.clone(),
             name: "item".into(),
         };
-        let mut clipboard = Clipboard::default();
-        clipboard.set_deleted(vec![item.clone()]);
-        assert_eq!(clipboard, Clipboard::Deleted { items: vec![item] });
+        let mut register = UnnamedRegister::default();
+        register.set_deleted(vec![item.clone()]);
+        assert_eq!(register, UnnamedRegister::Deleted { items: vec![item] });
 
-        clipboard.set(vec![path.clone()], false);
+        register.set(vec![path.clone()], false);
         assert_eq!(
-            clipboard,
-            Clipboard::Live {
-                paths: vec![path],
+            register,
+            UnnamedRegister::Live {
+                paths: vec![path.clone()],
                 cut: false
             }
         );
+        register.set(vec![path.clone()], true);
+        assert_eq!(
+            register,
+            UnnamedRegister::Live {
+                paths: vec![path.clone()],
+                cut: true
+            }
+        );
+        register.set_deleted(vec![TrashRef {
+            id: "new-generation".into(),
+            original_path: path,
+            name: "item".into(),
+        }]);
+        assert!(matches!(register, UnnamedRegister::Deleted { .. }));
     }
 
     #[test]

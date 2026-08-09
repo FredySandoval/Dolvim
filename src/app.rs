@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::time::Instant;
 
@@ -10,7 +11,7 @@ use ratatui::layout::Rect;
 
 use crate::config;
 use crate::fs::{self, Entry, Lister, Sort, SortKey};
-use crate::ops::{self, Clipboard, Progress, UndoOp};
+use crate::ops::{self, Progress, UndoOp, UnnamedRegister};
 use crate::places::{self, Row, Target};
 use crate::thumbs::Thumbs;
 use crate::watch::Watcher;
@@ -71,12 +72,20 @@ impl FocusRegion {
 /// What the keyboard is currently feeding. Text-entry modes carry their buffer
 /// in `App::input`; `Mode` only says who owns the next keystroke.
 #[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CreationIntent {
+    pub directory: PathBuf,
+    pub pane_id: u64,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Mode {
     Normal,
     Visual,
-    /// `V`. Linewise: the range grows in whole rows of the grid. In Details a
-    /// row holds one item, so there it is the same thing as `Visual`.
+    /// `V`. Linewise: the range grows by whole Icon rows and by individual
+    /// file lines in Compact and Details.
     VisualLine,
+    /// `Ctrl+V`. Rectangular selection, available only in Icons view.
+    VisualBlock,
     /// `:` command line.
     Command,
     /// `/` incremental search.
@@ -90,9 +99,9 @@ pub enum Mode {
     /// F2 with a multi-selection: one pattern renames them all.
     BatchRename,
     /// F10 / `O`.
-    NewFolder,
-    /// `o`; the payload is the directory where the file will be created.
-    NewFile(PathBuf),
+    NewFolder(CreationIntent),
+    /// `o`; captures the destination and pane when the prompt opens.
+    NewFile(CreationIntent),
     /// A yes/no gate. Carries what to do when the answer is yes.
     Confirm(Confirm),
     /// Modal information overlays.
@@ -106,9 +115,9 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// Either visual: a range is being dragged and motions extend it.
+    /// Any visual mode: a range is being dragged and motions extend it.
     pub fn is_visual(&self) -> bool {
-        matches!(self, Mode::Visual | Mode::VisualLine)
+        matches!(self, Mode::Visual | Mode::VisualLine | Mode::VisualBlock)
     }
 
     /// What the status bar calls this mode. The match is exhaustive so that a
@@ -118,12 +127,13 @@ impl Mode {
             Mode::Normal => "NORMAL",
             Mode::Visual => "VISUAL",
             Mode::VisualLine => "V-LINE",
+            Mode::VisualBlock => "V-BLOCK",
             Mode::Command => "COMMAND",
             Mode::Search => "SEARCH",
             Mode::Filter => "FILTER",
             Mode::PathEdit => "PATH",
             Mode::Rename(_) | Mode::BatchRename => "RENAME",
-            Mode::NewFolder => "NEW FOLDER",
+            Mode::NewFolder(_) => "NEW FOLDER",
             Mode::NewFile(_) => "NEW FILE",
             Mode::Confirm(_) => "CONFIRM",
             Mode::Properties => "PROPERTIES",
@@ -155,12 +165,13 @@ pub enum Confirm {
     DeletePermanently(Vec<PathBuf>),
     /// The same question for items already in the Trash, which have to be
     /// purged through the trash index rather than unlinked where they lie.
-    PurgeFromTrash(Vec<PathBuf>),
+    PurgeFromTrash(Vec<ops::TrashRef>),
     EmptyTrash,
 }
 
 /// One file view. Two of these exist when the split view is on.
 pub struct Pane {
+    pub id: u64,
     pub cwd: PathBuf,
     /// The Places target this pane is showing, when it is not a plain dir.
     pub target: Target,
@@ -176,6 +187,8 @@ pub struct Pane {
     pub show_hidden: bool,
     pub filter: String,
     pub expanded: HashSet<PathBuf>,
+    /// Path that an asynchronous refresh should place under the cursor.
+    pub pending_focus: Option<PathBuf>,
     pub history: Vec<PathBuf>,
     pub history_pos: usize,
     pub seq: u64,
@@ -204,9 +217,43 @@ pub struct Pane {
     pub crumb_pick: Option<PathBuf>,
 }
 
+fn expanded_listing(roots: Vec<Entry>, expanded: &HashSet<PathBuf>, sort: Sort) -> Vec<Entry> {
+    fn append(
+        mut entry: Entry,
+        depth: u16,
+        expanded: &HashSet<PathBuf>,
+        sort: Sort,
+        output: &mut Vec<Entry>,
+    ) {
+        entry.depth = depth;
+        entry.expanded = entry.is_dir() && expanded.contains(&entry.path);
+        let path = entry.path.clone();
+        let is_expanded = entry.expanded;
+        output.push(entry);
+        if !is_expanded {
+            return;
+        }
+        if let Ok(mut children) = fs::read_dir(&path, depth + 1) {
+            fs::sort_entries(&mut children, sort);
+            for child in children {
+                append(child, depth + 1, expanded, sort, output);
+            }
+        }
+    }
+
+    let mut output = Vec::new();
+    for root in roots {
+        append(root, 0, expanded, sort, &mut output);
+    }
+    output
+}
+
+static NEXT_PANE_ID: AtomicU64 = AtomicU64::new(1);
+
 impl Pane {
     pub fn new(cwd: PathBuf) -> Pane {
         Pane {
+            id: NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed),
             target: Target::Dir(cwd.clone()),
             history: vec![cwd.clone()],
             cwd,
@@ -221,6 +268,7 @@ impl Pane {
             show_hidden: false,
             filter: String::new(),
             expanded: HashSet::new(),
+            pending_focus: None,
             history_pos: 0,
             seq: 0,
             loading: true,
@@ -265,9 +313,29 @@ impl Pane {
     /// `refilter` — doing it in that order sends the cursor to a random file
     /// on every refresh.
     pub fn set_entries(&mut self, entries: Vec<Entry>) {
-        let keep = self.current().map(|e| e.path.clone());
+        let keep = self.current().map(|entry| entry.path.clone());
         self.entries = entries;
         self.refilter_keeping(keep);
+        let Some(wanted) = self.pending_focus.clone() else {
+            return;
+        };
+        let Some(created) = self.entries.iter().find(|entry| entry.path == wanted) else {
+            // A listing that raced the create must not consume the intent. The
+            // watcher-triggered listing that contains it will finish the job.
+            return;
+        };
+        if created.hidden {
+            self.show_hidden = true;
+        }
+        self.filter.clear();
+        self.pending_focus = None;
+        self.refilter_keeping(Some(wanted));
+    }
+
+    /// Ask the next listing to focus a path that may not exist in the current
+    /// snapshot yet, as after create or rename.
+    pub fn focus_after_refresh(&mut self, path: PathBuf) {
+        self.pending_focus = Some(path);
     }
 
     /// Recompute `visible` from `entries` honouring hidden, filter and sort,
@@ -278,7 +346,17 @@ impl Pane {
     }
 
     fn refilter_keeping(&mut self, keep: Option<PathBuf>) {
-        fs::sort_entries(&mut self.entries, self.sort);
+        // A worker listing contains roots only. Rebuild expanded descendants
+        // from the durable path set before filtering; globally sorting the flat
+        // tree would separate children from their parents.
+        let mut roots: Vec<Entry> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.depth == 0)
+            .cloned()
+            .collect();
+        fs::sort_entries(&mut roots, self.sort);
+        self.entries = expanded_listing(roots, &self.expanded, self.sort);
         self.revisible();
         self.cursor = keep
             .and_then(|p| {
@@ -331,13 +409,24 @@ impl Pane {
         }
     }
 
-    /// Items per row for the current view mode; 1 for Details.
+    /// Items in one contiguous navigation line: a row in Icons, a column in
+    /// Compact, and one entry in Details.
     pub fn stride(&self) -> usize {
         match self.view {
             ViewMode::Icons => self.grid_cols.max(1) as usize,
             // Compact flows down columns, so a horizontal step is a full column.
             ViewMode::Compact => self.grid_rows.max(1) as usize,
             ViewMode::Details => 1,
+        }
+    }
+
+    /// Items in a linewise selection unit. This deliberately differs from
+    /// navigation stride in Compact: its column-major storage makes a whole
+    /// column contiguous, but each vertically navigated entry is one file line.
+    pub fn linewise_width(&self) -> usize {
+        match self.view {
+            ViewMode::Icons => self.grid_cols.max(1) as usize,
+            ViewMode::Compact | ViewMode::Details => 1,
         }
     }
 
@@ -362,10 +451,33 @@ impl Pane {
                 .iter()
                 .filter_map(|&entry_index| {
                     let e = &self.entries[entry_index];
-                    self.selected.contains(&e.path).then(|| e.path.clone())
+                    self.selected
+                        .contains(&e.selection_key())
+                        .then(|| e.path.clone())
                 })
                 .collect()
         }
+    }
+
+    /// Exact Trash generations selected by the cursor/range. Trash rows may
+    /// share an original path, so pathname alone is never an operation identity.
+    pub fn selected_trash_refs(&self) -> Vec<ops::TrashRef> {
+        let to_ref = |entry: &Entry| {
+            Some(ops::TrashRef {
+                id: entry.trash_id.clone()?,
+                original_path: entry.path.clone(),
+                name: entry.path.file_name()?.to_os_string(),
+            })
+        };
+        if self.selected.is_empty() {
+            return self.current().and_then(to_ref).into_iter().collect();
+        }
+        self.visible
+            .iter()
+            .filter_map(|&index| self.entries.get(index))
+            .filter(|entry| self.selected.contains(&entry.selection_key()))
+            .filter_map(to_ref)
+            .collect()
     }
 
     /// Visible items `a..=b`, clamped to the listing. The linewise range a vim
@@ -507,7 +619,7 @@ pub struct App {
     /// Buffer for whichever text-entry mode is active.
     pub input: String,
     pub input_cursor: usize,
-    pub clipboard: Clipboard,
+    pub register: UnnamedRegister,
     pub undo: Vec<UndoOp>,
     pub status: String,
     pub status_is_error: bool,
@@ -563,7 +675,7 @@ impl App {
             mode: Mode::Normal,
             input: String::new(),
             input_cursor: 0,
-            clipboard: Clipboard::default(),
+            register: UnnamedRegister::default(),
             undo: Vec::new(),
             status: String::new(),
             status_is_error: false,
@@ -621,6 +733,30 @@ impl App {
         &mut self.tabs[self.active_tab].panes[i]
     }
 
+    /// Reveal a newly created path in the pane that opened the prompt, even if
+    /// another pane became active while filesystem events were arriving.
+    pub fn reveal_created(&mut self, intent: CreationIntent, path: PathBuf) {
+        let owner = self.tabs.iter().enumerate().find_map(|(tab_index, tab)| {
+            tab.panes
+                .iter()
+                .position(|pane| pane.id == intent.pane_id)
+                .map(|pane_index| (tab_index, pane_index))
+        });
+        let Some((tab_index, pane_index)) = owner else {
+            self.error("The pane that requested creation was closed");
+            return;
+        };
+        self.active_tab = tab_index;
+        self.tabs[tab_index].active = pane_index;
+        if self.pane().cwd != intent.directory {
+            self.goto(Target::Dir(intent.directory.clone()), true);
+            self.pane_mut().focus_after_refresh(path);
+        } else {
+            self.pane_mut().focus_after_refresh(path);
+            self.refresh_in_place();
+        }
+    }
+
     pub fn split_on(&self) -> bool {
         self.tab().panes.len() > 1
     }
@@ -633,6 +769,15 @@ impl App {
     pub fn error(&mut self, msg: impl Into<String>) {
         self.status = msg.into();
         self.status_is_error = true;
+    }
+
+    /// End a visual range and discard its transient selection. Visual ranges
+    /// are mode-owned; callers must copy their paths before leaving.
+    pub fn leave_visual(&mut self) {
+        if self.mode.is_visual() {
+            self.mode = Mode::Normal;
+            self.pane_mut().selected.clear();
+        }
     }
 
     // -- loading -----------------------------------------------------------
@@ -871,6 +1016,7 @@ impl App {
 
     pub fn move_cursor(&mut self, delta: isize, extend: bool) {
         let is_linewise = self.mode == Mode::VisualLine;
+        let is_blockwise = self.mode == Mode::VisualBlock;
         let pane = self.pane_mut();
         if pane.visible.is_empty() {
             return;
@@ -879,16 +1025,38 @@ impl App {
         let next = (pane.cursor as isize + delta).clamp(0, last) as usize;
         pane.cursor = next;
         if extend {
-            let (mut range_start, mut range_end) = (pane.anchor.min(next), pane.anchor.max(next));
-            // Linewise: grow the range out to the row edges on both sides.
-            if is_linewise {
-                let stride = pane.stride();
-                range_start -= range_start % stride;
-                range_end = (range_end - range_end % stride + stride - 1).min(last as usize);
-            }
-            let range: Vec<PathBuf> = (range_start..=range_end)
+            let indices = if is_blockwise {
+                let cols = pane.grid_cols.max(1) as usize;
+                let (anchor_row, anchor_col) = (pane.anchor / cols, pane.anchor % cols);
+                let (cursor_row, cursor_col) = (next / cols, next % cols);
+                let mut block = Vec::new();
+                for row in anchor_row.min(cursor_row)..=anchor_row.max(cursor_row) {
+                    for col in anchor_col.min(cursor_col)..=anchor_col.max(cursor_col) {
+                        let index = row * cols + col;
+                        if index < pane.visible.len() {
+                            block.push(index);
+                        }
+                    }
+                }
+                block
+            } else {
+                let (mut range_start, mut range_end) =
+                    (pane.anchor.min(next), pane.anchor.max(next));
+                // Linewise: grow the range out to the selection-line edges. This
+                // is not always the navigation stride; Compact stores whole columns
+                // contiguously, while its vertically walked file lines are singular.
+                if is_linewise {
+                    let width = pane.linewise_width();
+                    range_start -= range_start % width;
+                    range_end = (range_end - range_end % width + width - 1).min(last as usize);
+                }
+                (range_start..=range_end).collect()
+            };
+            let range: Vec<PathBuf> = indices
+                .into_iter()
                 .filter_map(|visible_index| {
-                    pane.entry_at(visible_index).map(|entry| entry.path.clone())
+                    pane.entry_at(visible_index)
+                        .map(|entry| entry.selection_key())
                 })
                 .collect();
             pane.selected.clear();
@@ -933,8 +1101,9 @@ impl App {
             return;
         };
         let pane = self.pane_mut();
-        if !pane.selected.remove(&entry.path) {
-            pane.selected.insert(entry.path);
+        let key = entry.selection_key();
+        if !pane.selected.remove(&key) {
+            pane.selected.insert(key);
         }
     }
 
@@ -943,7 +1112,7 @@ impl App {
         pane.selected = pane
             .visible
             .iter()
-            .map(|&entry_index| pane.entries[entry_index].path.clone())
+            .map(|&entry_index| pane.entries[entry_index].selection_key())
             .collect();
     }
 
@@ -952,7 +1121,7 @@ impl App {
         let all: HashSet<PathBuf> = pane
             .visible
             .iter()
-            .map(|&entry_index| pane.entries[entry_index].path.clone())
+            .map(|&entry_index| pane.entries[entry_index].selection_key())
             .collect();
         pane.selected = all.difference(&pane.selected).cloned().collect();
     }
@@ -994,6 +1163,10 @@ impl App {
     // -- view controls -----------------------------------------------------
 
     pub fn set_view(&mut self, v: ViewMode) {
+        if self.mode == Mode::VisualBlock && v != ViewMode::Icons {
+            self.leave_visual();
+            self.info("Visual block selection ended: it is only available in Icons mode");
+        }
         self.pane_mut().view = v;
     }
 
@@ -1234,6 +1407,7 @@ mod tests {
                 mode: 0,
                 readable: true,
                 hidden: name.starts_with('.'),
+                trash_id: None,
                 depth: 0,
                 expanded: false,
             })
@@ -1280,6 +1454,127 @@ mod tests {
         pane.show_hidden = true;
         pane.refilter();
         assert_eq!(pane.current().unwrap().name, before);
+    }
+
+    #[test]
+    fn refresh_rebuilds_the_expanded_tree() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("dolvim-expand-{unique}"));
+        let folder = base.join("folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("first.txt"), b"first").unwrap();
+
+        let mut pane = Pane::new(base.clone());
+        pane.expanded.insert(folder.clone());
+        pane.set_entries(fs::read_dir(&base, 0).unwrap());
+        assert!(pane.entries.iter().any(|entry| entry.name == "first.txt"));
+
+        std::fs::write(folder.join("second.txt"), b"second").unwrap();
+        pane.set_entries(fs::read_dir(&base, 0).unwrap());
+        assert!(pane.expanded.contains(&folder));
+        assert!(pane.entries.iter().any(|entry| entry.name == "first.txt"));
+        assert!(pane.entries.iter().any(|entry| entry.name == "second.txt"));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn duplicate_trash_paths_keep_distinct_selection_identity() {
+        let path = PathBuf::from("/tmp/same.txt");
+        let mut first = entries_named(&["same.txt"]).remove(0);
+        first.path = path.clone();
+        first.trash_id = Some("generation-1".into());
+        let mut second = first.clone();
+        second.trash_id = Some("generation-2".into());
+        let mut pane = Pane::new(PathBuf::from("trash:/"));
+        pane.entries = vec![first.clone(), second];
+        pane.visible = vec![0, 1];
+        pane.selected.insert(first.selection_key());
+
+        let selected = pane.selected_trash_refs();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, std::ffi::OsString::from("generation-1"));
+    }
+
+    #[test]
+    fn pending_focus_is_applied_by_the_next_listing() {
+        let mut pane = pane_with(&["a"]);
+        let wanted = PathBuf::from("/tmp/b");
+        pane.focus_after_refresh(wanted.clone());
+        pane.set_entries(entries_named(&["a", "b"]));
+        assert_eq!(pane.current().map(|entry| &entry.path), Some(&wanted));
+        assert!(pane.pending_focus.is_none());
+    }
+
+    #[test]
+    fn compact_visual_line_selects_entries_one_line_at_a_time() {
+        let mut app = App::new(PathBuf::from("/tmp"));
+        let mut pane = pane_with(&["a", "b", "c", "d"]);
+        pane.view = ViewMode::Compact;
+        pane.grid_rows = 4;
+        pane.cursor = 1;
+        pane.anchor = 1;
+        *app.pane_mut() = pane;
+        app.mode = Mode::VisualLine;
+
+        app.move_cursor(0, true);
+        assert_eq!(app.pane().selected.len(), 1);
+        app.move_cursor(1, true);
+        assert_eq!(app.pane().selected.len(), 2);
+    }
+
+    #[test]
+    fn icon_visual_block_selects_a_rectangle() {
+        let mut app = App::new(PathBuf::from("/tmp"));
+        let mut pane = pane_with(&["a", "b", "c", "d", "e", "f", "g", "h", "i"]);
+        pane.view = ViewMode::Icons;
+        pane.grid_cols = 3;
+        pane.cursor = 0;
+        pane.anchor = 0;
+        *app.pane_mut() = pane;
+        app.mode = Mode::VisualBlock;
+
+        app.move_cursor(4, true);
+        let selected: HashSet<String> = app
+            .pane()
+            .selected
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            selected,
+            HashSet::from(["a".into(), "b".into(), "d".into(), "e".into()])
+        );
+    }
+
+    #[test]
+    fn leaving_icons_ends_visual_block() {
+        let mut app = App::new(PathBuf::from("/tmp"));
+        app.pane_mut().view = ViewMode::Icons;
+        app.mode = Mode::VisualBlock;
+        app.pane_mut().selected.insert(PathBuf::from("selected"));
+
+        app.set_view(ViewMode::Compact);
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.pane().selected.is_empty());
+    }
+
+    #[test]
+    fn icon_visual_line_still_selects_a_whole_grid_row() {
+        let mut app = App::new(PathBuf::from("/tmp"));
+        let mut pane = pane_with(&["a", "b", "c", "d"]);
+        pane.view = ViewMode::Icons;
+        pane.grid_cols = 2;
+        pane.cursor = 1;
+        pane.anchor = 1;
+        *app.pane_mut() = pane;
+        app.mode = Mode::VisualLine;
+
+        app.move_cursor(0, true);
+        assert_eq!(app.pane().selected.len(), 2);
     }
 
     #[test]

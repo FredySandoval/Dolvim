@@ -1,13 +1,15 @@
 //! The modal input engine, and the single place where an `Action` turns into
 //! a state change.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::{
-    App, Confirm, Direction, Focus, FocusRegion, MarkPending, MenuKind, Mode, ViewMode,
+    App, Confirm, CreationIntent, Direction, Focus, FocusRegion, MarkPending, MenuKind, Mode,
+    ViewMode,
 };
 use crate::config;
 use crate::fs::SortKey;
@@ -56,7 +58,9 @@ pub fn handle_key_event(app: &mut App, key_event: KeyEvent) {
     }
 
     match app.mode.clone() {
-        Mode::Normal | Mode::Visual | Mode::VisualLine => handle_normal_key(app, key_event),
+        Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
+            handle_normal_key(app, key_event)
+        }
         Mode::Confirm(c) => handle_confirm_key(app, key_event, c),
         Mode::Properties | Mode::Help => {
             if lookup_binding(app, key_event) == Some(Action::Cancel) {
@@ -92,8 +96,11 @@ fn handle_normal_key(app: &mut App, key_event: KeyEvent) {
         // Esc ends the visual and takes the range with it: the selection
         // belonged to the drag, not to the pane. Outside a visual it is the
         // key that clears whatever selection stands.
-        app.mode = Mode::Normal;
-        app.pane_mut().selected.clear();
+        if app.mode.is_visual() {
+            app.leave_visual();
+        } else {
+            app.pane_mut().selected.clear();
+        }
         return;
     }
 
@@ -162,10 +169,13 @@ fn handle_normal_key(app: &mut App, key_event: KeyEvent) {
         return;
     }
 
-    // Anything printable and unbound is Dolphin's type-ahead.
-    if let KeyCode::Char(c) = key_event.code {
-        if key_event.modifiers.is_empty() {
-            app.typeahead(c);
+    // Type-ahead belongs to Normal mode. In a visual mode an unknown key must
+    // not refilter the listing underneath the path-based visual range.
+    if app.mode == Mode::Normal {
+        if let KeyCode::Char(c) = key_event.code {
+            if key_event.modifiers.is_empty() {
+                app.typeahead(c);
+            }
         }
     }
 }
@@ -264,6 +274,21 @@ fn operand_paths(app: &App, count: usize) -> Vec<PathBuf> {
     }
 }
 
+/// Write live paths to the unnamed register and desktop clipboard through one
+/// transaction. An empty request is rejected so a failed yank cannot erase an
+/// existing register. A visual range is consumed only after the write commits.
+fn write_live_register(app: &mut App, cut: bool, verb: &str, empty_message: &str) {
+    let paths = app.pane().selected_paths();
+    if paths.is_empty() {
+        app.error(empty_message);
+        return;
+    }
+    let count = paths.len();
+    app.register.set(paths, cut);
+    app.info(format!("{verb} {count} item(s)"));
+    app.leave_visual();
+}
+
 /// The one path to the Trash. Every delete key ends here so that the undo
 /// entry, the message and the refresh cannot drift apart.
 fn move_to_trash(app: &mut App, paths: Vec<PathBuf>) -> Vec<ops::TrashRef> {
@@ -274,7 +299,10 @@ fn move_to_trash(app: &mut App, paths: Vec<PathBuf>) -> Vec<ops::TrashRef> {
     // means purge, as it does in Dolphin. It goes behind the Shift+Del
     // confirmation: this is the one place the key is not undoable.
     if app.pane().target == Target::Trash {
-        app.mode = Mode::Confirm(Confirm::PurgeFromTrash(paths));
+        let items = app.pane().selected_trash_refs();
+        if !items.is_empty() {
+            app.mode = Mode::Confirm(Confirm::PurgeFromTrash(items));
+        }
         return Vec::new();
     }
 
@@ -314,9 +342,7 @@ fn move_to_trash(app: &mut App, paths: Vec<PathBuf>) -> Vec<ops::TrashRef> {
             outcome.failed[0].message
         ));
     }
-    if app.mode.is_visual() {
-        app.mode = Mode::Normal;
-    }
+    app.leave_visual();
     outcome.committed
 }
 
@@ -325,7 +351,7 @@ fn move_to_trash(app: &mut App, paths: Vec<PathBuf>) -> Vec<ops::TrashRef> {
 fn delete_to_register(app: &mut App, paths: Vec<PathBuf>) {
     let deleted = move_to_trash(app, paths);
     if !deleted.is_empty() {
-        app.clipboard.set_deleted(deleted);
+        app.register.set_deleted(deleted);
     }
 }
 
@@ -334,7 +360,7 @@ fn delete_to_register(app: &mut App, paths: Vec<PathBuf>) {
 /// linewise without disturbing the anchor.
 fn enter_visual(app: &mut App, target_mode: Mode) {
     if app.mode == target_mode {
-        app.mode = Mode::Normal;
+        app.leave_visual();
         return;
     }
     if !app.mode.is_visual() {
@@ -468,7 +494,10 @@ fn lookup_binding(app: &App, key_event: KeyEvent) -> Option<Action> {
         })
     };
 
-    if matches!(app.mode, Mode::Normal | Mode::Visual | Mode::VisualLine) {
+    if matches!(
+        app.mode,
+        Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+    ) {
         match app.focus {
             Focus::Places => return find(BindMode::Places).map(|binding| binding.action),
             Focus::Tabs => return find(BindMode::Tabs).map(|binding| binding.action),
@@ -577,7 +606,9 @@ pub enum Action {
     InvertSelect,
     EnterVisual,
     EnterVisualLine,
+    EnterVisualBlock,
     /* file operations */
+    Yank,
     Copy,
     Cut,
     /// `d` in Normal: trash a range once a motion says which.
@@ -682,6 +713,7 @@ pub enum BindMode {
     Normal,
     Visual,
     VisualLine,
+    VisualBlock,
     /// Places panel focus.
     Places,
     /// Tab pane focus. Like Places, this refines the normal/visual modes.
@@ -710,13 +742,14 @@ impl BindMode {
             (Self::Normal, Mode::Normal)
                 | (Self::Visual, Mode::Visual)
                 | (Self::VisualLine, Mode::VisualLine)
+                | (Self::VisualBlock, Mode::VisualBlock)
                 | (Self::Command, Mode::Command)
                 | (Self::Search, Mode::Search)
                 | (Self::Filter, Mode::Filter)
                 | (Self::PathEdit, Mode::PathEdit)
                 | (Self::Rename, Mode::Rename(_))
                 | (Self::BatchRename, Mode::BatchRename)
-                | (Self::NewFolder, Mode::NewFolder)
+                | (Self::NewFolder, Mode::NewFolder(_))
                 | (Self::NewFile, Mode::NewFile(_))
                 | (Self::Confirm, Mode::Confirm(_))
                 | (Self::Properties, Mode::Properties)
@@ -871,18 +904,24 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
         Action::InvertSelect => app.invert_selection(),
         Action::EnterVisual => enter_visual(app, Mode::Visual),
         Action::EnterVisualLine => enter_visual(app, Mode::VisualLine),
+        Action::EnterVisualBlock => {
+            if app.pane().view == ViewMode::Icons {
+                enter_visual(app, Mode::VisualBlock);
+            } else {
+                app.error("Visual block selection is only available in Icons mode");
+            }
+        }
 
         // file operations
-        Action::Copy | Action::Cut => {
+        Action::Yank | Action::Copy | Action::Cut => {
             let cut = action == Action::Cut;
-            let clipboard_paths = app.pane().selected_paths();
-            let copied_count = clipboard_paths.len();
-            app.clipboard.set(clipboard_paths, cut);
-            app.info(format!(
-                "{} {copied_count} item(s)",
-                if cut { "Cut" } else { "Copied" }
-            ));
-            app.mode = Mode::Normal;
+            let (verb, empty_message) = match action {
+                Action::Yank => ("Yanked", "Nothing to yank"),
+                Action::Copy => ("Copied", "Nothing to copy"),
+                Action::Cut => ("Cut", "Nothing to cut"),
+                _ => unreachable!(),
+            };
+            write_live_register(app, cut, verb, empty_message);
         }
         Action::Paste => paste_clipboard(app),
         Action::Trash => {
@@ -908,29 +947,35 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
             let perm_delete_paths = operand_paths(app, count);
             if !perm_delete_paths.is_empty() {
                 app.mode = Mode::Confirm(if app.pane().target == Target::Trash {
-                    Confirm::PurgeFromTrash(perm_delete_paths)
+                    Confirm::PurgeFromTrash(app.pane().selected_trash_refs())
                 } else {
                     Confirm::DeletePermanently(perm_delete_paths)
                 });
             }
         }
         Action::Rename => start_rename(app),
-        Action::NewFolder => enter_text(app, Mode::NewFolder, String::new()),
+        Action::NewFolder => {
+            if let Some(intent) = creation_intent(app, app.pane().cwd.clone()) {
+                enter_text(app, Mode::NewFolder(intent), String::new());
+            }
+        }
         Action::NewFile => {
             let parent = app
                 .pane()
                 .current()
-                .filter(|entry| entry.is_dir())
+                .filter(|entry| entry.path.is_dir())
                 .map_or_else(|| app.pane().cwd.clone(), |entry| entry.path.clone());
-            enter_text(app, Mode::NewFile(parent), String::new());
+            if let Some(intent) = creation_intent(app, parent) {
+                enter_text(app, Mode::NewFile(intent), String::new());
+            }
         }
         Action::Undo => match app.undo.pop() {
             None => app.info("Nothing to undo"),
             Some(op) => match ops::undo(&op) {
                 Ok(outcome) => {
                     if let Some(change) = outcome.register_change {
-                        if app.clipboard == change.expected {
-                            app.clipboard = change.replacement;
+                        if app.register == change.expected {
+                            app.register = change.replacement;
                         }
                     }
                     ops::rebase_trash_history(&mut app.undo, &outcome.trash_replacements);
@@ -984,8 +1029,8 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
         }
         Action::EmptyTrash => app.mode = Mode::Confirm(Confirm::EmptyTrash),
         Action::Restore => {
-            let restore_paths = operand_paths(app, count);
-            match ops::restore_from_trash(&restore_paths) {
+            let items = app.pane().selected_trash_refs();
+            match ops::restore_from_trash(&items) {
                 Ok(restored_count) => {
                     app.info(format!("Restored {restored_count} item(s)"));
                     app.reload();
@@ -1115,6 +1160,31 @@ fn enter_text(app: &mut App, mode: Mode, seed: String) {
     app.input_cursor = app.input.chars().count();
 }
 
+fn creation_intent(app: &mut App, directory: PathBuf) -> Option<CreationIntent> {
+    if !matches!(app.pane().target, Target::Dir(_)) {
+        app.error("Creation is unavailable in this location");
+        return None;
+    }
+    let metadata = match std::fs::metadata(&directory) {
+        Ok(metadata) if metadata.is_dir() => metadata,
+        _ => {
+            app.error(format!("Not a directory: {}", directory.display()));
+            return None;
+        }
+    };
+    if metadata.permissions().mode() & 0o222 == 0 {
+        app.error(format!(
+            "Directory is not writable: {}",
+            directory.display()
+        ));
+        return None;
+    }
+    Some(CreationIntent {
+        directory,
+        pane_id: app.pane().id,
+    })
+}
+
 fn start_rename(app: &mut App) {
     let selected_paths = app.pane().selected_paths();
     match selected_paths.len() {
@@ -1128,30 +1198,17 @@ fn start_rename(app: &mut App) {
 }
 
 fn paste_clipboard(app: &mut App) {
-    // Deleted registers use exact backend Trash identities. After restoration,
-    // they become an ordinary live copy register so repeated `p` is meaningful.
-    if let ops::Clipboard::Deleted { items } = app.clipboard.clone() {
-        let dest = app.pane().cwd.clone();
-        match ops::restore_deleted_to(&items, &dest) {
-            Ok(restored_paths) => {
-                let restored_count = restored_paths.len();
-                app.undo.push(ops::UndoOp::Restore {
-                    restored_paths: restored_paths.clone(),
-                    previous_items: items,
-                });
-                app.clipboard.set(restored_paths, false);
-                app.info(format!("Pasted {restored_count} item(s)"));
-                app.refresh_in_place();
-            }
-            Err(e) => app.error(e),
-        }
+    // Deleted generations use the same background completion pipeline as live
+    // copies: collision allocation, progress, cancellation and partial effects.
+    if let ops::UnnamedRegister::Deleted { items } = app.register.clone() {
+        app.transfer_progress = Some(ops::start_restore(items, app.pane().cwd.clone()));
         return;
     }
 
     // Prefer our own clipboard: it knows cut-vs-copy, which uri-list cannot say.
-    let (mut paths, cut) = match &app.clipboard {
-        ops::Clipboard::Live { paths, cut } => (paths.clone(), *cut),
-        ops::Clipboard::Empty | ops::Clipboard::Deleted { .. } => (Vec::new(), false),
+    let (mut paths, cut) = match &app.register {
+        ops::UnnamedRegister::Live { paths, cut } => (paths.clone(), *cut),
+        ops::UnnamedRegister::Empty | ops::UnnamedRegister::Deleted { .. } => (Vec::new(), false),
     };
     if paths.is_empty() {
         paths = ops::import_uris();
@@ -1166,9 +1223,11 @@ fn paste_clipboard(app: &mut App) {
     } else {
         ops::TransferKind::Copy
     };
-    app.transfer_progress = Some(ops::start_transfer(paths, dest, transfer_kind));
-    // A cut register is consumed only by the completion reducer after a fully
-    // successful move. Keeping it here makes failure and cancellation retryable.
+    let mut progress = ops::start_transfer(paths, dest, transfer_kind);
+    progress.expected_register = Some(app.register.clone());
+    app.transfer_progress = Some(progress);
+    // The completion reducer removes only committed move sources from a cut
+    // register; failed and cancelled sources stay retryable.
 }
 
 fn search_step(app: &mut App, search_direction: isize) {
@@ -1379,22 +1438,20 @@ fn commit_text_input(app: &mut App) {
                 Err(e) => app.error(e),
             }
         }
-        Mode::NewFolder => {
-            let cwd = app.pane().cwd.clone();
-            match ops::new_folder(&cwd, &input) {
-                Ok(op) => {
-                    app.undo.push(op);
-                    app.refresh_in_place();
-                    app.select_by_path(&cwd.join(&input));
-                    app.info(format!("Created {input}"));
-                }
-                Err(e) => app.error(e),
-            }
-        }
-        Mode::NewFile(parent) => match ops::new_file(&parent, &input) {
+        Mode::NewFolder(intent) => match ops::new_folder(&intent.directory, &input) {
             Ok(op) => {
+                let created = intent.directory.join(&input);
                 app.undo.push(op);
-                app.refresh_in_place();
+                app.reveal_created(intent, created);
+                app.info(format!("Created {input}"));
+            }
+            Err(e) => app.error(e),
+        },
+        Mode::NewFile(intent) => match ops::new_file(&intent.directory, &input) {
+            Ok(op) => {
+                let created = intent.directory.join(&input);
+                app.undo.push(op);
+                app.reveal_created(intent, created);
                 app.info(format!("Created {input}"));
             }
             Err(e) => app.error(e),
@@ -1482,14 +1539,30 @@ fn handle_confirm_key(app: &mut App, key_event: KeyEvent, pending_confirm: Confi
         _ => return,
     }
     match pending_confirm {
-        Confirm::DeletePermanently(paths) => match ops::delete_permanently(&paths) {
-            Ok(n) => {
-                app.pane_mut().selected.clear();
+        Confirm::DeletePermanently(paths) => {
+            let outcome = ops::delete_permanently(&paths);
+            let committed: std::collections::HashSet<_> =
+                outcome.committed.iter().cloned().collect();
+            app.pane_mut()
+                .selected
+                .retain(|key| !committed.contains(key));
+            if !outcome.committed.is_empty() {
                 app.refresh_in_place();
-                app.info(format!("Deleted {n} item(s) permanently"));
             }
-            Err(e) => app.error(e),
-        },
+            if outcome.failed.is_empty() {
+                app.info(format!(
+                    "Deleted {} item(s) permanently",
+                    outcome.committed.len()
+                ));
+            } else {
+                app.error(format!(
+                    "Deleted {} item(s); {} failed: {}",
+                    outcome.committed.len(),
+                    outcome.failed.len(),
+                    outcome.failed[0].message
+                ));
+            }
+        }
         Confirm::PurgeFromTrash(paths) => match ops::purge_from_trash(&paths) {
             Ok(n) => {
                 app.pane_mut().selected.clear();
@@ -1555,7 +1628,7 @@ pub fn menu_items(kind: &MenuKind) -> Vec<MenuItem> {
             menu_item("Delete              Shift+Del", Action::DeletePerm),
             menu_item("Cut                    Ctrl+X", Action::Cut),
             menu_item("Copy                   Ctrl+C", Action::Copy),
-            menu_item("Paste                  Ctrl+V", Action::Paste),
+            menu_item("Paste                       p", Action::Paste),
             menu_item("Compress                     ", Action::Compress),
             menu_item("Restore from Trash           ", Action::Restore),
             menu_item("Empty Trash                  ", Action::EmptyTrash),
@@ -1869,6 +1942,14 @@ mod tests {
         );
     }
 
+    fn finish_test_transfer(app: &mut App) {
+        let progress = app.transfer_progress.as_ref().unwrap();
+        while !progress.finished.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::yield_now();
+        }
+        crate::finish_transfer(app);
+    }
+
     #[test]
     fn digits_accumulate_into_a_count() {
         let mut app = test_app();
@@ -2150,6 +2231,108 @@ mod tests {
         );
         assert_eq!(app.pending_chord_leader, None);
         assert_eq!(app.count, "2");
+    }
+
+    fn install_test_entries(app: &mut App, names: &[&str]) {
+        app.pane_mut().entries = names
+            .iter()
+            .map(|name| crate::fs::Entry {
+                name: (*name).into(),
+                path: PathBuf::from("/tmp").join(name),
+                kind: crate::fs::Kind::File,
+                size: 0,
+                mtime: 0,
+                mode: 0,
+                readable: true,
+                hidden: false,
+                trash_id: None,
+                depth: 0,
+                expanded: false,
+            })
+            .collect();
+        app.pane_mut().visible = (0..names.len()).collect();
+    }
+
+    #[test]
+    fn visual_line_yank_commits_register_and_consumes_range() {
+        let mut app = test_app();
+        install_test_entries(&mut app, &["a", "b", "c"]);
+        app.pane_mut().view = ViewMode::Compact;
+        app.pane_mut().grid_rows = 3;
+        app.pane_mut().cursor = 1;
+        app.pane_mut().anchor = 1;
+        app.mode = Mode::VisualLine;
+        app.move_cursor(0, true);
+
+        press_char(&mut app, 'y');
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.pane().selected.is_empty());
+        assert_eq!(app.status, "Yanked 1 item(s)");
+        assert_eq!(
+            app.register,
+            ops::UnnamedRegister::Live {
+                paths: vec![PathBuf::from("/tmp/b")],
+                cut: false,
+            }
+        );
+    }
+
+    #[test]
+    fn unbound_visual_keys_cannot_refilter_the_range() {
+        let mut app = test_app();
+        install_test_entries(&mut app, &["a", "b"]);
+        app.mode = Mode::VisualLine;
+        app.pane_mut().anchor = 0;
+        app.move_cursor(0, true);
+
+        press_char(&mut app, 'r');
+
+        assert!(app.typeahead.is_empty());
+        assert!(app.pane().filter.is_empty());
+        assert_eq!(app.pane().selected.len(), 1);
+        assert_eq!(app.mode, Mode::VisualLine);
+    }
+
+    #[test]
+    fn ctrl_v_is_visual_block_never_paste() {
+        let ctrl_v = normalize(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        for mode in [
+            Mode::Normal,
+            Mode::Visual,
+            Mode::VisualLine,
+            Mode::VisualBlock,
+        ] {
+            assert_eq!(
+                lookup_binding_for_mode(&mode, ctrl_v),
+                Some(Action::EnterVisualBlock)
+            );
+        }
+    }
+
+    #[test]
+    fn visual_block_warns_outside_icons() {
+        let mut app = test_app();
+        app.pane_mut().view = ViewMode::Compact;
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.status_is_error);
+        assert!(app.status.contains("only available in Icons"));
+    }
+
+    #[test]
+    fn ctrl_v_enters_visual_block_in_icons() {
+        let mut app = test_app();
+        app.pane_mut().view = ViewMode::Icons;
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.mode, Mode::VisualBlock);
     }
 
     #[test]
@@ -2445,6 +2628,131 @@ mod tests {
     }
 
     #[test]
+    fn new_folder_is_a_sibling_and_receives_focus() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("dolvim-new-folder-{unique}"));
+        std::fs::create_dir_all(base.join("folder-under-cursor")).unwrap();
+        let mut app = App::new(base.clone());
+        app.pane_mut()
+            .set_entries(crate::fs::read_dir(&base, 0).unwrap());
+
+        press_char(&mut app, 'O');
+        assert!(matches!(
+            &app.mode,
+            Mode::NewFolder(intent) if intent.directory == base
+        ));
+        for character in "sibling".chars() {
+            press_char(&mut app, character);
+        }
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        for _ in 0..1_000 {
+            app.pump_fs_events();
+            if !app.pane().loading && app.pane().pending_focus.is_none() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            app.pane().current().map(|entry| entry.path.clone()),
+            Some(base.join("sibling"))
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn creation_is_rejected_in_virtual_locations() {
+        let mut app = test_app();
+        app.pane_mut().target = Target::Trash;
+        press_char(&mut app, 'o');
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.status_is_error);
+    }
+
+    #[test]
+    fn creation_intent_survives_a_split_pane_focus_change() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("dolvim-create-split-{unique}"));
+        let left = base.join("left");
+        let right = base.join("right");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::create_dir_all(&right).unwrap();
+        let mut app = App::new(left.clone());
+        app.tab_mut().panes.push(crate::app::Pane::new(right));
+
+        press_char(&mut app, 'o');
+        app.tab_mut().active = 1;
+        for character in "left.txt".chars() {
+            press_char(&mut app, character);
+        }
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(left.join("left.txt").is_file());
+        assert_eq!(app.tab().active, 0);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn disappearing_creation_target_fails_without_history() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("dolvim-create-gone-{unique}"));
+        let folder = base.join("folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut app = App::new(base.clone());
+        app.pane_mut()
+            .set_entries(crate::fs::read_dir(&base, 0).unwrap());
+        press_char(&mut app, 'o');
+        let undo_len = app.undo.len();
+        std::fs::remove_dir(&folder).unwrap();
+        for character in "never.txt".chars() {
+            press_char(&mut app, character);
+        }
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.undo.len(), undo_len);
+        assert!(app.status_is_error);
+        assert!(!folder.join("never.txt").exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn symlinked_folder_is_a_defined_new_file_destination() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("dolvim-create-symlink-{unique}"));
+        let target = base.join("target");
+        let link = base.join("link");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut app = App::new(base.clone());
+        app.pane_mut()
+            .set_entries(crate::fs::read_dir(&base, 0).unwrap());
+        let link_index = app
+            .pane()
+            .visible
+            .iter()
+            .position(|&index| app.pane().entries[index].path == link)
+            .unwrap();
+        app.pane_mut().cursor = link_index;
+        press_char(&mut app, 'o');
+        for character in "through-link.txt".chars() {
+            press_char(&mut app, character);
+        }
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(target.join("through-link.txt").is_file());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn new_file_on_a_folder_creates_the_file_inside_it() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2461,7 +2769,10 @@ mod tests {
             app.pane_mut().set_entries(entries);
 
             press_char(&mut app, 'o');
-            assert_eq!(app.mode, Mode::NewFile(folder.clone()));
+            assert!(matches!(
+                &app.mode,
+                Mode::NewFile(intent) if intent.directory == folder
+            ));
             for character in "created.txt".chars() {
                 press_char(&mut app, character);
             }
@@ -2469,6 +2780,18 @@ mod tests {
 
             assert!(folder.join("created.txt").is_file());
             assert!(!base.join("created.txt").exists());
+            for _ in 0..1_000 {
+                app.pump_fs_events();
+                if !app.pane().loading && app.pane().pending_focus.is_none() {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            assert_eq!(app.pane().cwd, folder);
+            assert_eq!(
+                app.pane().current().map(|entry| entry.path.clone()),
+                Some(folder.join("created.txt"))
+            );
         }
 
         std::fs::remove_dir_all(base).unwrap();
@@ -2496,8 +2819,8 @@ mod tests {
             press_char(&mut app, 'v');
             press_char(&mut app, 'd');
             assert!(!deleted.exists());
-            match &app.clipboard {
-                ops::Clipboard::Deleted { items } => {
+            match &app.register {
+                ops::UnnamedRegister::Deleted { items } => {
                     assert_eq!(items.len(), 1);
                     assert_eq!(items[0].original_path, deleted);
                 }
@@ -2505,10 +2828,11 @@ mod tests {
             }
 
             press_char(&mut app, 'p');
+            finish_test_transfer(&mut app);
             assert_eq!(std::fs::read(&deleted).unwrap(), b"keep me");
             assert!(matches!(
-                app.clipboard,
-                ops::Clipboard::Live { cut: false, .. }
+                app.register,
+                ops::UnnamedRegister::Live { cut: false, .. }
             ));
         }
 
@@ -2516,10 +2840,58 @@ mod tests {
     }
 
     #[test]
+    fn partial_move_reduces_register_history_and_status_from_committed_effects() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("dolvim-partial-move-{unique}"));
+        let source_dir = base.join("source");
+        let destination = base.join("destination");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        let valid = source_dir.join("valid.txt");
+        let missing = source_dir.join("missing.txt");
+        std::fs::write(&valid, b"payload").unwrap();
+
+        let mut app = App::new(destination.clone());
+        app.register = ops::UnnamedRegister::Live {
+            paths: vec![valid.clone(), missing.clone()],
+            cut: true,
+        };
+        let mut progress = ops::start_transfer(
+            vec![valid.clone(), missing.clone()],
+            destination.clone(),
+            ops::TransferKind::Move,
+        );
+        progress.expected_register = Some(app.register.clone());
+        app.transfer_progress = Some(progress);
+        finish_test_transfer(&mut app);
+
+        assert!(!valid.exists());
+        assert_eq!(
+            std::fs::read(destination.join("valid.txt")).unwrap(),
+            b"payload"
+        );
+        assert_eq!(
+            app.register,
+            ops::UnnamedRegister::Live {
+                paths: vec![missing],
+                cut: true,
+            }
+        );
+        assert!(
+            matches!(app.undo.last(), Some(ops::UndoOp::Move { moved_pairs }) if moved_pairs.len() == 1)
+        );
+        assert!(app.status_is_error);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn failed_delete_preserves_register_and_history() {
         let mut app = test_app();
         let previous = PathBuf::from("previous-register-item");
-        app.clipboard.set(vec![previous.clone()], false);
+        app.register.set(vec![previous.clone()], false);
         let undo_len = app.undo.len();
 
         delete_to_register(
@@ -2529,8 +2901,8 @@ mod tests {
         );
 
         assert_eq!(
-            app.clipboard,
-            ops::Clipboard::Live {
+            app.register,
+            ops::UnnamedRegister::Live {
                 paths: vec![previous],
                 cut: false,
             }
@@ -2559,19 +2931,20 @@ mod tests {
             press_char(&mut app, 'v');
             press_char(&mut app, 'd');
             press_char(&mut app, 'p');
+            finish_test_transfer(&mut app);
             assert!(path.exists());
 
             press_char(&mut app, 'u');
             assert!(!path.exists());
-            assert!(matches!(app.clipboard, ops::Clipboard::Deleted { .. }));
+            assert!(matches!(app.register, ops::UnnamedRegister::Deleted { .. }));
 
             // The older delete entry was rebound to the new Trash generation,
             // rather than being left stale by undoing paste.
             press_char(&mut app, 'u');
             assert_eq!(std::fs::read(&path).unwrap(), b"payload");
             assert!(matches!(
-                app.clipboard,
-                ops::Clipboard::Live { cut: false, .. }
+                app.register,
+                ops::UnnamedRegister::Live { cut: false, .. }
             ));
         }
         std::fs::remove_dir_all(base).unwrap();
@@ -2599,8 +2972,8 @@ mod tests {
             press_char(&mut app, 'd');
             press_char(&mut app, 'u');
             assert!(matches!(
-                app.clipboard,
-                ops::Clipboard::Live { cut: false, .. }
+                app.register,
+                ops::UnnamedRegister::Live { cut: false, .. }
             ));
 
             press_char(&mut app, 'p');

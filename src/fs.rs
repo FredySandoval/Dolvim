@@ -33,6 +33,8 @@ pub struct Entry {
     /// Free to compute: the child count already has to open it.
     pub readable: bool,
     pub hidden: bool,
+    /// Backend generation identity when this row comes from the Trash view.
+    pub trash_id: Option<std::ffi::OsString>,
     /// Depth in an expanded Details tree; 0 for a plain listing.
     pub depth: u16,
     pub expanded: bool,
@@ -41,6 +43,19 @@ pub struct Entry {
 impl Entry {
     pub fn is_dir(&self) -> bool {
         self.kind == Kind::Dir
+    }
+
+    /// Stable selection identity. Live rows use their path; Trash generations
+    /// add the backend ID so duplicate deletions of one pathname remain distinct.
+    pub fn selection_key(&self) -> PathBuf {
+        match &self.trash_id {
+            None => self.path.clone(),
+            Some(id) => {
+                let mut key = std::ffi::OsString::from("trash-generation:");
+                key.push(id);
+                PathBuf::from(key)
+            }
+        }
     }
 
     /// A directory the current user cannot look inside.
@@ -295,6 +310,7 @@ pub fn read_dir(path: &Path, depth: u16) -> std::io::Result<Vec<Entry>> {
             mtime: metadata.mtime(),
             mode: metadata.permissions().mode(),
             readable: child_count.map(|count| count.is_some()).unwrap_or(true),
+            trash_id: None,
             depth,
             expanded: false,
         });
@@ -747,6 +763,7 @@ mod tests {
             mode: 0,
             readable: true,
             hidden: false,
+            trash_id: None,
             depth: 0,
             expanded: false,
         };
