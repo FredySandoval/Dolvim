@@ -12,6 +12,7 @@ pub mod color {
     pub const TOOLBAR_BG:Color = Color::Rgb(244, 245, 246); /* toolbar, breadcrumb, tab strip  */
     pub const PANEL_BG  :Color = Color::Rgb(239, 240, 241); /* Places and Information panels   */
     pub const VIEW_BG   :Color = Color::Rgb(255, 255, 255); /* the file view itself            */
+    pub const HOVER     :Color = Color::Rgb(224, 239, 249); /* item under the active cursor    */
     pub const SELECTION :Color = Color::Rgb(194, 224, 245); /* selected row / cell fill        */
     pub const ACCENT    :Color = Color::Rgb( 61, 174, 233); /* focus bar, active tab underline */
     pub const TEXT      :Color = Color::Rgb( 35,  38,  41); /* default foreground              */
