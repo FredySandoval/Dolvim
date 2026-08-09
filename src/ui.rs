@@ -765,7 +765,7 @@ fn draw_compact_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, a
             if st.bg == Some(color::SELECTION) {
                 fill(frame.buffer_mut(), cell, color::SELECTION);
             }
-            let text = format!("{} {}", e.glyph(), e.name);
+            let text = compact_entry_text(&e);
             frame
                 .buffer_mut()
                 .set_string(x, y, clip(&text, w.saturating_sub(1) as usize), st);
@@ -783,15 +783,21 @@ fn draw_compact_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, a
 /// long one is read in full. Widths for *all* columns, scrolled or not: which
 /// column an item lands in depends only on the row count, so this does not
 /// shift as the view scrolls.
+fn compact_entry_text(e: &fs::Entry) -> String {
+    format!(
+        "{}{} {}",
+        " ".repeat((e.depth * 2) as usize),
+        e.glyph(),
+        e.name
+    )
+}
+
 fn compact_widths(p: &crate::app::Pane, rows: u16, avail: u16) -> Vec<u16> {
     let mut out = Vec::new();
     for col in p.visible.chunks(rows as usize) {
         let max_item_width = col
             .iter()
-            .map(|&i| {
-                let e = &p.entries[i];
-                e.glyph().width().max(1) + 1 + e.name.width()
-            })
+            .map(|&i| compact_entry_text(&p.entries[i]).width())
             .max()
             .unwrap_or(1);
         // One trailing blank keeps neighbouring columns from touching.
@@ -1585,20 +1591,21 @@ fn outline(buf: &mut Buffer, rect: Rect, active: bool) {
 /// The cursor is the terminal's own: a block sitting *on* the entry's icon with
 /// its colours inverted. A bar in the margin had to borrow a column and read as
 /// a fifth kind of line; the icon is already there and already means "this one".
-/// The row keeps the selection fill behind it, so where you are and what is
-/// selected stay two separate readings.
+/// An unselected cursor row gets the configurable hover fill. Selection wins
+/// where the two overlap, while the accent icon still identifies the cursor.
 fn cursor_block(buf: &mut Buffer, icon: Rect, row: Rect, active: bool) {
     if active {
         for y in row.y..row.bottom() {
             for x in row.x..row.right() {
                 if let Some(cell) = buf.cell_mut((x, y)) {
-                    cell.set_bg(color::SELECTION);
+                    if cell.bg != color::SELECTION {
+                        cell.set_bg(color::HOVER);
+                    }
                 }
             }
         }
     }
-    // SEPARATOR is a hairline colour: legible as a 1 px rule, invisible as a
-    // block behind inverted text. The unfocused pane gets DIM instead.
+    // ACCENT identifies the active cursor; the unfocused pane gets DIM.
     let bg = if active { color::ACCENT } else { color::DIM };
     for y in icon.y..icon.bottom() {
         for x in icon.x..icon.right() {
@@ -1806,6 +1813,39 @@ mod tests {
         // A dotfile has no extension to protect.
         let wrapped_lines = wrap_name(&format!(".{}", "a".repeat(60)), 13, 3);
         assert!(wrapped_lines[2].ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn compact_entries_include_their_tree_depth() {
+        let entry = fs::Entry {
+            name: "child.txt".into(),
+            path: PathBuf::from("parent/child.txt"),
+            kind: fs::Kind::File,
+            size: 0,
+            mtime: 0,
+            mode: 0,
+            readable: true,
+            hidden: false,
+            depth: 2,
+            expanded: false,
+        };
+        let text = compact_entry_text(&entry);
+        assert!(text.starts_with("    "), "compact entry was: {text:?}");
+        assert!(text.ends_with("child.txt"));
+    }
+
+    #[test]
+    fn cursor_hover_does_not_hide_selection() {
+        assert_ne!(color::HOVER, color::SELECTION);
+        let area = Rect::new(0, 0, 3, 1);
+        let mut buf = Buffer::empty(area);
+        buf.cell_mut((0, 0)).unwrap().set_bg(color::VIEW_BG);
+        buf.cell_mut((1, 0)).unwrap().set_bg(color::SELECTION);
+        cursor_block(&mut buf, Rect::new(2, 0, 1, 1), area, true);
+
+        assert_eq!(buf.cell((0, 0)).unwrap().bg, color::HOVER);
+        assert_eq!(buf.cell((1, 0)).unwrap().bg, color::SELECTION);
+        assert_eq!(buf.cell((2, 0)).unwrap().bg, color::ACCENT);
     }
 
     #[test]
