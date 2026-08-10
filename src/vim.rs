@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::{
-    App, Confirm, CreationIntent, Direction, Focus, FocusRegion, MarkPending, MenuKind, Mode,
+    App, Confirm, Direction, Focus, FocusRegion, MarkPending, MenuKind, Mode, RevealIntent,
     ViewMode,
 };
 use crate::config;
@@ -47,10 +47,11 @@ pub fn handle_key_event(app: &mut App, key_event: KeyEvent) {
     let key_event = normalize(key_event);
     // The transfer popup is modal, as Dolphin's is. Letting keys through means
     // you can navigate away from a live copy, or start a second one on top of
-    // `app.transfer_progress` and orphan the first thread with no way to see or stop it.
-    if let Some(active_transfer) = &app.transfer_progress {
+    // `app.active_transfer` and orphan the first thread with no way to see or stop it.
+    if let Some(active_transfer) = &app.active_transfer {
         if key_event.code == KeyCode::Esc {
             active_transfer
+                .progress
                 .cancel_requested
                 .store(true, Ordering::Relaxed);
         }
@@ -623,7 +624,6 @@ pub enum Action {
     NewFile,
     Undo,
     Properties,
-    Compress,
     Extract,
     EmptyTrash,
     Restore,
@@ -644,6 +644,12 @@ pub enum Action {
     ToggleInfo,
     ToggleFilterBar,
     ToggleExpand,
+    CloseFold,
+    OpenFold,
+    CloseFoldRecursive,
+    OpenFoldRecursive,
+    CloseAllFolds,
+    OpenAllFolds,
     /* sorting */
     SortName,
     SortSize,
@@ -818,16 +824,14 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
         Action::GoUp => app.go_up(),
         Action::GoHome => app.goto(Target::Dir(places::home()), true),
         Action::Open => app.activate(),
-        // `H`/`L` walk the tree in the two list views. Icons spends its
-        // horizontal axis on the grid, so there they mean nothing rather than
-        // meaning something the row beside them contradicts.
+        // `H`/`L` walk the directory tree independently of how the current
+        // view lays its items out. Lowercase `h`/`l` remain grid movement in
+        // Icons, while the distinct uppercase actions leave or enter a folder.
         Action::NavigateUp | Action::NavigateInto => {
-            if app.pane().view != ViewMode::Icons {
-                if action == Action::NavigateUp {
-                    app.go_up();
-                } else {
-                    app.activate();
-                }
+            if action == Action::NavigateUp {
+                app.go_up();
+            } else {
+                app.activate();
             }
         }
         Action::OpenInNewTab => {
@@ -955,16 +959,17 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
         }
         Action::Rename => start_rename(app),
         Action::NewFolder => {
-            if let Some(intent) = creation_intent(app, app.pane().cwd.clone()) {
+            let parent = if app.pane().view == ViewMode::Compact {
+                current_folder_or_cwd(app)
+            } else {
+                app.pane().cwd.clone()
+            };
+            if let Some(intent) = creation_intent(app, parent) {
                 enter_text(app, Mode::NewFolder(intent), String::new());
             }
         }
         Action::NewFile => {
-            let parent = app
-                .pane()
-                .current()
-                .filter(|entry| entry.path.is_dir())
-                .map_or_else(|| app.pane().cwd.clone(), |entry| entry.path.clone());
+            let parent = current_folder_or_cwd(app);
             if let Some(intent) = creation_intent(app, parent) {
                 enter_text(app, Mode::NewFile(intent), String::new());
             }
@@ -974,7 +979,7 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
             Some(op) => match ops::undo(&op) {
                 Ok(outcome) => {
                     if let Some(change) = outcome.register_change {
-                        if app.register == change.expected {
+                        if app.register.matches_expected(&change.expected) {
                             app.register = change.replacement;
                         }
                     }
@@ -991,23 +996,6 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
         Action::Properties => {
             if app.pane().current().is_some() {
                 app.mode = Mode::Properties;
-            }
-        }
-        Action::Compress => {
-            let compress_paths = app.pane().selected_paths();
-            if compress_paths.is_empty() {
-                return;
-            }
-            let dest = app
-                .pane()
-                .cwd
-                .join(format!("{}.tar.gz", ops::file_name_of(&compress_paths[0])));
-            match ops::compress(&compress_paths, &dest) {
-                Ok(m) => {
-                    app.info(m);
-                    app.refresh_in_place();
-                }
-                Err(e) => app.error(e),
             }
         }
         Action::Extract => {
@@ -1077,6 +1065,12 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
             }
         }
         Action::ToggleExpand => app.toggle_expand(),
+        Action::CloseFold => app.close_fold(false),
+        Action::OpenFold => app.open_fold(false),
+        Action::CloseFoldRecursive => app.close_fold(true),
+        Action::OpenFoldRecursive => app.open_fold(true),
+        Action::CloseAllFolds => app.close_all_folds(),
+        Action::OpenAllFolds => app.open_all_folds(),
 
         // sorting
         Action::SortName => app.set_sort(SortKey::Name),
@@ -1160,7 +1154,14 @@ fn enter_text(app: &mut App, mode: Mode, seed: String) {
     app.input_cursor = app.input.chars().count();
 }
 
-fn creation_intent(app: &mut App, directory: PathBuf) -> Option<CreationIntent> {
+fn current_folder_or_cwd(app: &App) -> PathBuf {
+    app.pane()
+        .current()
+        .filter(|entry| entry.path.is_dir())
+        .map_or_else(|| app.pane().cwd.clone(), |entry| entry.path.clone())
+}
+
+fn creation_intent(app: &mut App, directory: PathBuf) -> Option<RevealIntent> {
     if !matches!(app.pane().target, Target::Dir(_)) {
         app.error("Creation is unavailable in this location");
         return None;
@@ -1179,10 +1180,14 @@ fn creation_intent(app: &mut App, directory: PathBuf) -> Option<CreationIntent> 
         ));
         return None;
     }
-    Some(CreationIntent {
-        directory,
-        pane_id: app.pane().id,
-    })
+    Some(reveal_intent(app, directory))
+}
+
+/// Capture both an operation's filesystem destination and how its result must
+/// be revealed. Creation and paste use the same policy instead of independently
+/// reconstructing UI behavior after the mutation has already started.
+fn reveal_intent(app: &App, directory: PathBuf) -> RevealIntent {
+    app.reveal_intent_for_pane(app.tab().active, directory)
 }
 
 fn start_rename(app: &mut App) {
@@ -1198,10 +1203,16 @@ fn start_rename(app: &mut App) {
 }
 
 fn paste_clipboard(app: &mut App) {
+    // A folder under the cursor is an explicit paste target in every view. A
+    // regular file keeps the displayed directory as the destination.
+    let destination = current_folder_or_cwd(app);
+    let reveal = reveal_intent(app, destination.clone());
+
     // Deleted generations use the same background completion pipeline as live
     // copies: collision allocation, progress, cancellation and partial effects.
     if let ops::UnnamedRegister::Deleted { items } = app.register.clone() {
-        app.transfer_progress = Some(ops::start_restore(items, app.pane().cwd.clone()));
+        let progress = ops::start_restore(items, destination);
+        app.begin_transfer(progress, Some(reveal));
         return;
     }
 
@@ -1217,15 +1228,14 @@ fn paste_clipboard(app: &mut App) {
         app.info("Clipboard is empty");
         return;
     }
-    let dest = app.pane().cwd.clone();
     let transfer_kind = if cut {
         ops::TransferKind::Move
     } else {
         ops::TransferKind::Copy
     };
-    let mut progress = ops::start_transfer(paths, dest, transfer_kind);
+    let mut progress = ops::start_transfer(paths, destination, transfer_kind);
     progress.expected_register = Some(app.register.clone());
-    app.transfer_progress = Some(progress);
+    app.begin_transfer(progress, Some(reveal));
     // The completion reducer removes only committed move sources from a cut
     // register; failed and cancelled sources stay retryable.
 }
@@ -1442,7 +1452,7 @@ fn commit_text_input(app: &mut App) {
             Ok(op) => {
                 let created = intent.directory.join(&input);
                 app.undo.push(op);
-                app.reveal_created(intent, created);
+                app.reveal_completed(intent, created);
                 app.info(format!("Created {input}"));
             }
             Err(e) => app.error(e),
@@ -1451,7 +1461,7 @@ fn commit_text_input(app: &mut App) {
             Ok(op) => {
                 let created = intent.directory.join(&input);
                 app.undo.push(op);
-                app.reveal_created(intent, created);
+                app.reveal_completed(intent, created);
                 app.info(format!("Created {input}"));
             }
             Err(e) => app.error(e),
@@ -1629,7 +1639,6 @@ pub fn menu_items(kind: &MenuKind) -> Vec<MenuItem> {
             menu_item("Cut                    Ctrl+X", Action::Cut),
             menu_item("Copy                   Ctrl+C", Action::Copy),
             menu_item("Paste                       p", Action::Paste),
-            menu_item("Compress                     ", Action::Compress),
             menu_item("Restore from Trash           ", Action::Restore),
             menu_item("Empty Trash                  ", Action::EmptyTrash),
             menu_item("Extract here                 ", Action::Extract),
@@ -1943,11 +1952,22 @@ mod tests {
     }
 
     fn finish_test_transfer(app: &mut App) {
-        let progress = app.transfer_progress.as_ref().unwrap();
+        let progress = &app.active_transfer.as_ref().unwrap().progress;
         while !progress.finished.load(std::sync::atomic::Ordering::Relaxed) {
             std::thread::yield_now();
         }
         crate::finish_transfer(app);
+    }
+
+    fn finish_test_listing(app: &mut App) {
+        for _ in 0..1_000 {
+            app.pump_fs_events();
+            if !app.pane().loading && app.pane().pending_focus.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("listing did not finish");
     }
 
     #[test]
@@ -2399,6 +2419,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn shift_h_and_l_navigate_directories_in_every_view() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "dolvim-shift-hl-navigation-{}-{unique}",
+            std::process::id()
+        ));
+        let child = base.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+
+        for view in [ViewMode::Icons, ViewMode::Compact, ViewMode::Details] {
+            let mut app = App::new(base.clone());
+            app.pane_mut().view = view;
+            app.pane_mut()
+                .set_entries(crate::fs::read_dir(&base, 0).unwrap());
+
+            press_char(&mut app, 'L');
+            assert_eq!(app.pane().cwd, child, "L failed in {view:?}");
+
+            press_char(&mut app, 'H');
+            assert_eq!(app.pane().cwd, base, "H failed in {view:?}");
+        }
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     /// Ctrl+Shift+Tab under the kitty protocol, and the bare `CSI Z` a legacy
     /// terminal sends for the same chord: both are the previous tab.
     #[test]
@@ -2628,6 +2677,59 @@ mod tests {
     }
 
     #[test]
+    fn compact_creation_expands_the_hovered_folder_and_focuses_the_result() {
+        for (key, name, is_file) in [('o', "child.txt", true), ('O', "child-dir", false)] {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let base = std::env::temp_dir().join(format!(
+                "dolvim-compact-create-{}-{unique}",
+                std::process::id()
+            ));
+            let folder = base.join("folder-under-cursor");
+            std::fs::create_dir_all(&folder).unwrap();
+            let created = folder.join(name);
+
+            let mut app = App::new(base.clone());
+            app.pane_mut().view = ViewMode::Compact;
+            app.pane_mut()
+                .set_entries(crate::fs::read_dir(&base, 0).unwrap());
+
+            press_char(&mut app, key);
+            assert!(match &app.mode {
+                Mode::NewFile(intent) | Mode::NewFolder(intent) => {
+                    intent.directory == folder
+                        && intent.mode == crate::app::RevealMode::ExpandDirectory
+                }
+                _ => false,
+            });
+            for character in name.chars() {
+                press_char(&mut app, character);
+            }
+            handle_key_event(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+            assert_eq!(created.is_file(), is_file);
+            assert_eq!(created.is_dir(), !is_file);
+            for _ in 0..1_000 {
+                app.pump_fs_events();
+                if !app.pane().loading && app.pane().pending_focus.is_none() {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            assert_eq!(app.pane().cwd, base);
+            assert!(app.pane().expanded.contains(&folder));
+            assert_eq!(
+                app.pane().current().map(|entry| entry.path.clone()),
+                Some(created)
+            );
+
+            std::fs::remove_dir_all(base).unwrap();
+        }
+    }
+
+    #[test]
     fn new_folder_is_a_sibling_and_receives_focus() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2798,6 +2900,62 @@ mod tests {
     }
 
     #[test]
+    fn yank_close_tab_then_paste_targets_the_folder_under_the_cursor() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "dolvim-yank-close-tab-paste-{}-{unique}",
+            std::process::id()
+        ));
+        let source_dir = base.join("source");
+        let destination_root = base.join("destination-root");
+        let destination = destination_root.join("folder-under-cursor");
+        let source = source_dir.join("copied.txt");
+        let pasted = destination.join("copied.txt");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(&source, b"payload").unwrap();
+
+        let mut app = App::new(destination_root.clone());
+        app.pane_mut()
+            .set_entries(crate::fs::read_dir(&destination_root, 0).unwrap());
+        assert_eq!(
+            app.pane().current().map(|entry| entry.path.clone()),
+            Some(destination.clone())
+        );
+
+        let mut source_tab = crate::app::Tab::new(source_dir.clone());
+        source_tab
+            .pane_mut()
+            .set_entries(crate::fs::read_dir(&source_dir, 0).unwrap());
+        app.tabs.push(source_tab);
+        app.active_tab = 1;
+
+        // This is the reported keyboard workflow: line-yank in the source tab,
+        // close it, then paste into the folder selected in the revealed tab.
+        press_char(&mut app, 'V');
+        press_char(&mut app, 'y');
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(
+            app.pane().current().map(|entry| entry.path.clone()),
+            Some(destination.clone())
+        );
+
+        press_char(&mut app, 'p');
+        finish_test_transfer(&mut app);
+
+        assert_eq!(std::fs::read(&pasted).unwrap(), b"payload");
+        assert!(!destination_root.join("copied.txt").exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn visual_delete_can_be_pasted_back() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2840,6 +2998,118 @@ mod tests {
     }
 
     #[test]
+    fn deleted_selection_pastes_into_the_current_folder_in_every_view() {
+        for (view_index, view) in [ViewMode::Icons, ViewMode::Compact, ViewMode::Details]
+            .into_iter()
+            .enumerate()
+        {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let base = std::env::temp_dir().join(format!(
+                "dolvim-delete-folder-paste-{}-{view_index}-{unique}",
+                std::process::id()
+            ));
+            let destination = base.join("destination");
+            let original = base.join("original.txt");
+            let pasted = destination.join("original.txt");
+            std::fs::create_dir_all(&destination).unwrap();
+            std::fs::write(&original, b"payload").unwrap();
+
+            let mut app = App::new(base.clone());
+            app.pane_mut().view = view;
+            app.pane_mut()
+                .set_entries(crate::fs::read_dir(&base, 0).unwrap());
+            let original_cursor = app
+                .pane()
+                .visible
+                .iter()
+                .position(|&index| app.pane().entries[index].path == original)
+                .unwrap();
+            app.pane_mut().cursor = original_cursor;
+
+            press_char(&mut app, 'V');
+            press_char(&mut app, 'd');
+            assert!(!original.exists());
+
+            let destination_cursor = app
+                .pane()
+                .visible
+                .iter()
+                .position(|&index| app.pane().entries[index].path == destination)
+                .unwrap();
+            app.pane_mut().cursor = destination_cursor;
+            press_char(&mut app, 'p');
+            finish_test_transfer(&mut app);
+
+            assert_eq!(std::fs::read(&pasted).unwrap(), b"payload");
+            assert!(!original.exists());
+            finish_test_listing(&mut app);
+            if view == ViewMode::Compact {
+                assert_eq!(app.pane().cwd, base);
+                assert!(app.pane().expanded.contains(&destination));
+            } else {
+                assert_eq!(app.pane().cwd, destination);
+            }
+            assert_eq!(
+                app.pane().current().map(|entry| entry.path.clone()),
+                Some(pasted)
+            );
+            std::fs::remove_dir_all(base).unwrap();
+        }
+    }
+
+    #[test]
+    fn compact_paste_reveals_the_collision_resolved_transfer_target() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "dolvim-paste-reveal-collision-{}-{unique}",
+            std::process::id()
+        ));
+        let source_dir = base.join("source");
+        let destination = base.join("destination");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        let source = source_dir.join("item.txt");
+        std::fs::write(&source, b"new payload").unwrap();
+        std::fs::write(destination.join("item.txt"), b"existing").unwrap();
+        let pasted = destination.join("item (1).txt");
+
+        let mut app = App::new(base.clone());
+        app.pane_mut().view = ViewMode::Compact;
+        app.pane_mut()
+            .set_entries(crate::fs::read_dir(&base, 0).unwrap());
+        let destination_cursor = app
+            .pane()
+            .visible
+            .iter()
+            .position(|&index| app.pane().entries[index].path == destination)
+            .unwrap();
+        app.pane_mut().cursor = destination_cursor;
+        app.register = ops::UnnamedRegister::Live {
+            paths: vec![source],
+            cut: false,
+        };
+
+        press_char(&mut app, 'p');
+        finish_test_transfer(&mut app);
+        finish_test_listing(&mut app);
+
+        assert_eq!(std::fs::read(&pasted).unwrap(), b"new payload");
+        assert_eq!(app.pane().cwd, base);
+        assert!(app.pane().expanded.contains(&destination));
+        assert_eq!(
+            app.pane().current().map(|entry| entry.path.clone()),
+            Some(pasted)
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn partial_move_reduces_register_history_and_status_from_committed_effects() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2865,7 +3135,7 @@ mod tests {
             ops::TransferKind::Move,
         );
         progress.expected_register = Some(app.register.clone());
-        app.transfer_progress = Some(progress);
+        app.begin_transfer(progress, None);
         finish_test_transfer(&mut app);
 
         assert!(!valid.exists());
@@ -2911,7 +3181,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_paste_and_undo_rebases_the_older_delete_history() {
+    fn relocated_delete_paste_keeps_the_original_location_in_undo_history() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -2920,28 +3190,48 @@ mod tests {
             "dolvim-delete-paste-undo-{}-{unique}",
             std::process::id()
         ));
-        std::fs::create_dir_all(&base).unwrap();
-        let path = base.join("item.txt");
-        std::fs::write(&path, b"payload").unwrap();
+        let destination = base.join("destination");
+        std::fs::create_dir_all(&destination).unwrap();
+        let original = base.join("item.txt");
+        let pasted = destination.join("item.txt");
+        std::fs::write(&original, b"payload").unwrap();
 
         {
             let mut app = App::new(base.clone());
             app.pane_mut()
                 .set_entries(crate::fs::read_dir(&base, 0).unwrap());
+            let original_cursor = app
+                .pane()
+                .visible
+                .iter()
+                .position(|&index| app.pane().entries[index].path == original)
+                .unwrap();
+            app.pane_mut().cursor = original_cursor;
             press_char(&mut app, 'v');
             press_char(&mut app, 'd');
+
+            let destination_cursor = app
+                .pane()
+                .visible
+                .iter()
+                .position(|&index| app.pane().entries[index].path == destination)
+                .unwrap();
+            app.pane_mut().cursor = destination_cursor;
             press_char(&mut app, 'p');
             finish_test_transfer(&mut app);
-            assert!(path.exists());
+            assert_eq!(std::fs::read(&pasted).unwrap(), b"payload");
+            assert!(!original.exists());
 
             press_char(&mut app, 'u');
-            assert!(!path.exists());
+            assert!(!pasted.exists());
+            assert!(!original.exists());
             assert!(matches!(app.register, ops::UnnamedRegister::Deleted { .. }));
 
-            // The older delete entry was rebound to the new Trash generation,
-            // rather than being left stale by undoing paste.
+            // The older delete entry follows the bytes to their new Trash
+            // generation without losing the location that entry must restore.
             press_char(&mut app, 'u');
-            assert_eq!(std::fs::read(&path).unwrap(), b"payload");
+            assert_eq!(std::fs::read(&original).unwrap(), b"payload");
+            assert!(!pasted.exists());
             assert!(matches!(
                 app.register,
                 ops::UnnamedRegister::Live { cut: false, .. }
@@ -2977,7 +3267,7 @@ mod tests {
             ));
 
             press_char(&mut app, 'p');
-            let progress = app.transfer_progress.as_ref().unwrap();
+            let progress = &app.active_transfer.as_ref().unwrap().progress;
             while !progress.finished.load(std::sync::atomic::Ordering::Relaxed) {
                 std::thread::yield_now();
             }

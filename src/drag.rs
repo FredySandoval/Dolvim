@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use crate::app::App;
+use crate::app::{App, RevealIntent};
 use crate::ops;
 
 const DRAG_HELPER_BINARIES: &[&str] = &["ripdrag", "dragon-drop", "dragon"];
@@ -134,12 +134,13 @@ pub fn drop_in(app: &mut App) {
         return;
     }
     let dest = app.pane().cwd.clone();
-    app.transfer_progress = Some(ops::start_transfer(paths, dest, ops::TransferKind::Copy));
+    let progress = ops::start_transfer(paths, dest, ops::TransferKind::Copy);
+    app.begin_transfer(progress, None);
 }
 
 /// Complete an internal drag onto `dest`. Shift forces a move, Ctrl a copy,
 /// and the default is Dolphin's: move within a filesystem, copy across one.
-pub fn drop_internal(app: &mut App, dest: PathBuf, shift: bool, ctrl: bool) {
+pub fn drop_internal(app: &mut App, dest: PathBuf, shift: bool, ctrl: bool, reveal: RevealIntent) {
     let Some(active_drag) = app.drag.take() else {
         return;
     };
@@ -165,7 +166,8 @@ pub fn drop_internal(app: &mut App, dest: PathBuf, shift: bool, ctrl: bool) {
     } else {
         ops::TransferKind::Copy
     };
-    app.transfer_progress = Some(ops::start_transfer(active_drag.paths, dest, transfer_kind));
+    let progress = ops::start_transfer(active_drag.paths, dest, transfer_kind);
+    app.begin_transfer_from(progress, Some(reveal), active_drag.source_pane_id);
 }
 
 fn same_device(source: &std::path::Path, dest: &std::path::Path) -> bool {

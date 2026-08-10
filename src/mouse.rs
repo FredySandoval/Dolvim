@@ -34,7 +34,7 @@ pub fn handle_mouse_event(app: &mut App, m: MouseEvent) {
     // Modal, for the reason given in `vim::handle_key_event` — a click can
     // reach Paste through the menu just as a key can, so blocking only the
     // keyboard would leave the orphaned-transfer hole open.
-    if app.transfer_progress.is_some() {
+    if app.active_transfer.is_some() {
         return;
     }
     let (x, y) = (m.column, m.row);
@@ -289,6 +289,7 @@ fn handle_left_press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
         };
         app.drag = Some(Drag {
             paths,
+            source_pane_id: app.pane().id,
             position: CellPos { x, y },
             origin: CellPos { x, y },
             started: false,
@@ -357,7 +358,8 @@ fn handle_left_release(app: &mut App, x: u16, y: u16, shift: bool, ctrl: bool) {
             .and_then(|r| r.target())
             .cloned()
         {
-            return drag::drop_internal(app, dir, shift, ctrl);
+            let reveal = app.reveal_intent_for_pane(app.tab().active, dir.clone());
+            return drag::drop_internal(app, dir, shift, ctrl, reveal);
         }
         app.drag = None;
         return;
@@ -376,11 +378,13 @@ fn handle_left_release(app: &mut App, x: u16, y: u16, shift: bool, ctrl: bool) {
             .filter(|e| e.is_dir())
             .map(|e| e.path.clone())
             .unwrap_or_else(|| app.pane_at(pane_idx).cwd.clone());
-        return drag::drop_internal(app, target, shift, ctrl);
+        let reveal = app.reveal_intent_for_pane(pane_idx, target.clone());
+        return drag::drop_internal(app, target, shift, ctrl, reveal);
     }
     if let Some(i) = pane_at(app, x, y) {
         let dir = app.pane_at(i).cwd.clone();
-        return drag::drop_internal(app, dir, shift, ctrl);
+        let reveal = app.reveal_intent_for_pane(i, dir.clone());
+        return drag::drop_internal(app, dir, shift, ctrl, reveal);
     }
     app.drag = None;
 }
@@ -545,6 +549,86 @@ mod tests {
         assert!(!on_expand_arrow(&app, 5, 1));
         // Files have no arrow to hit.
         assert!(!on_expand_arrow(&app, 5, 2));
+    }
+
+    #[test]
+    fn split_drag_keeps_source_cleanup_and_folder_reveal_owners_distinct() {
+        use crate::fs::{Entry, Kind};
+        use std::sync::atomic::Ordering;
+
+        let unique = format!(
+            "dolvim-split-drag-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let source_dir = root.join("source");
+        let target_dir = root.join("target");
+        let hovered_folder = target_dir.join("hovered");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&hovered_folder).unwrap();
+        let source = source_dir.join("item.txt");
+        std::fs::write(&source, b"payload").unwrap();
+
+        let mut app = App::new(source_dir);
+        app.toggle_split();
+        app.tab_mut().active = 0;
+        let source_pane_id = app.pane_at(0).id;
+        let target_pane_id = app.pane_at(1).id;
+        {
+            let pane = app.pane_at_mut(0);
+            pane.area = Rect::new(0, 0, 20, 10);
+        }
+        {
+            let pane = app.pane_at_mut(1);
+            pane.cwd = target_dir;
+            pane.target = Target::Dir(pane.cwd.clone());
+            pane.view = ViewMode::Details;
+            pane.area = Rect::new(20, 0, 20, 10);
+            pane.cell_height = 1;
+            pane.entries = vec![Entry {
+                name: "hovered".into(),
+                path: hovered_folder.clone(),
+                kind: Kind::Dir,
+                size: 0,
+                mtime: 0,
+                mode: 0,
+                readable: true,
+                hidden: false,
+                trash_id: None,
+                depth: 0,
+                expanded: false,
+            }];
+            pane.visible = vec![0];
+        }
+        app.drag = Some(Drag {
+            paths: vec![source.clone()],
+            source_pane_id,
+            position: CellPos { x: 21, y: 1 },
+            origin: CellPos { x: 1, y: 1 },
+            started: true,
+        });
+
+        // Details row zero is at y=1 (below its header). Ctrl makes this a copy
+        // so the fixture also verifies the worker's concrete destination.
+        handle_left_release(&mut app, 21, 1, false, true);
+        let transfer = app.active_transfer.as_ref().unwrap();
+        assert_eq!(transfer.selection_pane_id, source_pane_id);
+        let reveal = transfer.reveal.as_ref().unwrap();
+        assert_eq!(reveal.pane_id, target_pane_id);
+        assert_eq!(reveal.directory, hovered_folder);
+
+        while !transfer.progress.finished.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let outcome = transfer.progress.outcome.lock().unwrap();
+        let effect = outcome.as_ref().unwrap().committed.first().unwrap();
+        assert_eq!(effect.target, hovered_folder.join("item.txt"));
+        drop(outcome);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// `cols` truncates, so a compact grid leaves dead columns on the right.

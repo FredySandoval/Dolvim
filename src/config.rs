@@ -82,6 +82,10 @@ pub const WATCH_DEBOUNCE_MS   :  u64 =  120; /* refresh delay after changes     
 pub const TICK_MS             :  u64 =   40; /* event loop tick; listing/thumbnail poll rate    */
 pub const DRAG_THRESHOLD      :  u16 =    1; /* cells of movement before a drag begins          */
 
+/* MIME types without an OS association that should use the editor role */
+pub const EDITOR_MIME_TYPES   :&[&str] = &["application/javascript", "application/json", "application/sql", "application/toml", "application/xml", "application/x-perl", "application/x-shellscript", "application/x-yaml", "application/yaml", "inode/x-empty"];
+pub const EDITOR_MIME_SUFFIXES:&[&str] = &["+json", "+xml"];
+
 /* thumbnails and file view */
 pub const THUMB_CACHE_CAP     :usize =  512; /* decoded thumbnails held in memory               */
 pub const THUMB_MAX_INFLIGHT  :usize =   32; /* decodes queued at once; the rest wait           */
@@ -370,8 +374,14 @@ pub const CHORDS: &[Chord] = &[
     chord('g'  , 't'     , VIEW_MODES  , Action::NextTab     ),
     chord('g'  , 'T'     , VIEW_MODES  , Action::PrevTab     ),
     chord('g'  , 'u'     , VIEW_MODES  , Action::GoUp        ),
-    chord('z'  , 'a'     , VIEW_MODES  , Action::ToggleExpand),
-    chord('z'  , 'v'     , VIEW_MODES  , Action::CycleView   ),
+    chord('z'  , 'c'     , VIEW_MODES  , Action::CloseFold          ),
+    chord('z'  , 'o'     , VIEW_MODES  , Action::OpenFold           ),
+    chord('z'  , 'a'     , VIEW_MODES  , Action::ToggleExpand       ),
+    chord('z'  , 'C'     , VIEW_MODES  , Action::CloseFoldRecursive ),
+    chord('z'  , 'O'     , VIEW_MODES  , Action::OpenFoldRecursive  ),
+    chord('z'  , 'M'     , VIEW_MODES  , Action::CloseAllFolds      ),
+    chord('z'  , 'R'     , VIEW_MODES  , Action::OpenAllFolds       ),
+    chord('z'  , 'v'     , VIEW_MODES  , Action::CycleView          ),
     chord('c'  , 'w'     , VIEW_MODES  , Action::Rename      ),
     /* Space leader; selection moved to `v` */
     chord(' '  , 'h'     , VIEW_MODES  , Action::ToggleHidden),
@@ -492,4 +502,23 @@ mod sanity {
     fn both_toolbar_groups_are_inhabited() {
         assert!(!NAV_BUTTONS.is_empty() && !RIGHT_BUTTONS.is_empty());
     }
+
+    #[test]
+    fn fold_chords_match_vim_semantics() {
+        let expected = [
+            ('c', Action::CloseFold),
+            ('o', Action::OpenFold),
+            ('a', Action::ToggleExpand),
+            ('C', Action::CloseFoldRecursive),
+            ('O', Action::OpenFoldRecursive),
+            ('M', Action::CloseAllFolds),
+            ('R', Action::OpenAllFolds),
+        ];
+        for (follower, action) in expected {
+            assert!(CHORDS.iter().any(|chord| {
+                chord.leader == 'z' && chord.follower == follower && chord.action == action
+            }));
+        }
+    }
+
 }

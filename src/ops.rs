@@ -14,51 +14,6 @@ use crate::config;
 use crate::fs::{Entry, Kind};
 
 // ---------------------------------------------------------------------------
-// Opening files
-// ---------------------------------------------------------------------------
-
-/// Does this file's handler want a terminal of its own?
-///
-/// The desktop entry answers outright, in `Terminal=`. Every shortcut gets it
-/// wrong in one direction or the other: the mime type cannot tell `nvim` from
-/// a graphical editor for the same `text/x-c`, and `$DISPLAY` is set here even
-/// though the handler is a tty program. Unknown means "not a terminal app",
-/// which is the safe way to be wrong — a detached child cannot corrupt our
-/// screen, whereas a terminal one we failed to yield to certainly can.
-pub fn opens_in_terminal(path: &Path) -> bool {
-    let Some(entry) = desktop_entry(path) else {
-        return false;
-    };
-    entry
-        .lines()
-        // `Terminal=` belongs to [Desktop Entry]; later groups are per-action.
-        .take_while(|l| !l.starts_with("[Desktop Action"))
-        .any(|l| l.trim().eq_ignore_ascii_case("terminal=true"))
-}
-
-fn desktop_entry(path: &Path) -> Option<String> {
-    let mime = xdg_mime(&["query", "filetype", &path.to_string_lossy()])?;
-    let id = xdg_mime(&["query", "default", &mime])?;
-    let home = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| crate::places::home().join(".local/share"));
-    let dirs =
-        std::env::var("XDG_DATA_DIRS").unwrap_or_else(|_| "/usr/local/share:/usr/share".into());
-    std::iter::once(home)
-        .chain(dirs.split(':').map(PathBuf::from))
-        .find_map(|d| fs::read_to_string(d.join("applications").join(&id)).ok())
-}
-
-fn xdg_mime(args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("xdg-mime")
-        .args(args)
-        .output()
-        .ok()?;
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!s.is_empty()).then_some(s)
-}
-
-// ---------------------------------------------------------------------------
 // Clipboard
 // ---------------------------------------------------------------------------
 
@@ -113,6 +68,27 @@ impl UnnamedRegister {
         match self {
             Self::Live { paths, cut: true } => paths,
             _ => &[],
+        }
+    }
+
+    /// Whether this is the register generation a deferred change expects.
+    /// Trash ids are the durable identity; restore-location metadata may differ
+    /// between a paste undo and the older delete undo that shares those bytes.
+    pub fn matches_expected(&self, expected: &Self) -> bool {
+        match (self, expected) {
+            (
+                Self::Deleted { items },
+                Self::Deleted {
+                    items: expected_items,
+                },
+            ) => {
+                items.len() == expected_items.len()
+                    && items
+                        .iter()
+                        .zip(expected_items)
+                        .all(|(item, expected_item)| item.id == expected_item.id)
+            }
+            _ => self == expected,
         }
     }
 }
@@ -420,7 +396,10 @@ pub fn rebase_trash_history(
                 if let Some((_, replacement)) =
                     replacements.iter().find(|(old_id, _)| *old_id == item.id)
                 {
-                    *item = replacement.clone();
+                    // The new generation identifies where the bytes are now in
+                    // Trash, but this older undo entry must retain the location
+                    // it originally promised to restore.
+                    item.id = replacement.id.clone();
                 }
             }
         }
@@ -595,6 +574,16 @@ fn restore_trash_refs(
             item.original_parent = dir.to_path_buf();
             dir.join(&item.name)
         } else {
+            let original_name = item_ref
+                .original_path
+                .file_name()
+                .ok_or_else(|| "Invalid original Trash path".to_string())?;
+            item.original_parent = item_ref
+                .original_path
+                .parent()
+                .ok_or_else(|| "Invalid original Trash path".to_string())?
+                .to_path_buf();
+            item.name = original_name.to_os_string();
             item_ref.original_path.clone()
         };
         restored_paths.push(path);
@@ -1132,7 +1121,7 @@ pub fn delete_permanently(paths: &[PathBuf]) -> DeleteOutcome {
 }
 
 // ---------------------------------------------------------------------------
-// Archives — shelled out, presence-checked, as PLAN.md specifies
+// Archive extraction — shelled out and presence-checked
 // ---------------------------------------------------------------------------
 
 pub fn extract(archive: &Path, dest_dir: &Path) -> Result<String, String> {
@@ -1170,27 +1159,6 @@ pub fn extract(archive: &Path, dest_dir: &Path) -> Result<String, String> {
         .map_err(|e| e.to_string())?;
     if out.status.success() {
         Ok(format!("Extracted {}", file_name_of(archive)))
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-    }
-}
-
-pub fn compress(paths: &[PathBuf], dest: &Path) -> Result<String, String> {
-    if which("tar").is_none() {
-        return Err("tar is not installed".into());
-    }
-    let parent = paths
-        .first()
-        .and_then(|p| p.parent())
-        .ok_or("Nothing selected")?;
-    let mut cmd = std::process::Command::new("tar");
-    cmd.arg("-czf").arg(dest).arg("-C").arg(parent);
-    for p in paths {
-        cmd.arg(file_name_of(p));
-    }
-    let out = cmd.output().map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(format!("Created {}", file_name_of(dest)))
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }

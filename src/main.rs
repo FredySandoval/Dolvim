@@ -9,6 +9,7 @@ mod config;
 mod drag;
 mod fs;
 mod mouse;
+mod open;
 mod ops;
 mod places;
 mod thumbs;
@@ -138,20 +139,23 @@ fn run(start: PathBuf) -> io::Result<()> {
         }
 
         app.pump_fs_events();
+        app.pump_external_launches();
         app.thumbs.pump_decoded_thumbs();
         finish_transfer(&mut app);
 
         if let Some(suspend_request) = app.suspend.take() {
-            hand_over(&mut terminal, || match suspend_request {
+            let open_result = hand_over(&mut terminal, || match suspend_request {
                 Suspend::Shell(dir) => {
                     let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
                     println!("dolvim: shell in {} — exit to return", dir.display());
                     let _ = Command::new(shell).current_dir(&dir).status();
+                    None
                 }
-                Suspend::Open(path) => {
-                    let _ = Command::new("xdg-open").arg(&path).status();
-                }
+                Suspend::Open(plan) => Some(plan.run_foreground()),
             })?;
+            if let Some(Err(error)) = open_result {
+                app.error(error);
+            }
             app.refresh_in_place();
         }
     }
@@ -162,17 +166,22 @@ fn run(start: PathBuf) -> io::Result<()> {
 
 /// Collect a finished background transfer: journal it, report it, relist.
 fn finish_transfer(app: &mut App) {
-    let done = app
-        .transfer_progress
-        .as_ref()
-        .is_some_and(|transfer| transfer.finished.load(std::sync::atomic::Ordering::Relaxed));
+    let done = app.active_transfer.as_ref().is_some_and(|transfer| {
+        transfer
+            .progress
+            .finished
+            .load(std::sync::atomic::Ordering::Relaxed)
+    });
     if !done {
         return;
     }
-    let Some(active_transfer) = app.transfer_progress.take() else {
+    let Some(active_transfer) = app.active_transfer.take() else {
         return;
     };
-    let outcome = active_transfer
+    let reveal = active_transfer.reveal;
+    let selection_pane_id = active_transfer.selection_pane_id;
+    let progress = active_transfer.progress;
+    let outcome = progress
         .outcome
         .lock()
         .ok()
@@ -188,7 +197,7 @@ fn finish_transfer(app: &mut App) {
         .iter()
         .map(|effect| effect.source.clone())
         .collect();
-    match active_transfer.kind {
+    match progress.kind {
         ops::TransferKind::Move if !outcome.committed.is_empty() => {
             app.undo.push(ops::UndoOp::Move {
                 moved_pairs: outcome
@@ -215,8 +224,8 @@ fn finish_transfer(app: &mut App) {
         _ => {}
     }
 
-    if active_transfer.expected_register.as_ref() == Some(&app.register) {
-        match (&active_transfer.kind, &active_transfer.expected_register) {
+    if progress.expected_register.as_ref() == Some(&app.register) {
+        match (&progress.kind, &progress.expected_register) {
             (ops::TransferKind::Move, Some(ops::UnnamedRegister::Live { paths, cut: true })) => {
                 let remaining: Vec<_> = paths
                     .iter()
@@ -270,22 +279,34 @@ fn finish_transfer(app: &mut App) {
                 .map_or_else(|| effect.source.clone(), ops::TrashRef::selection_key)
         })
         .collect();
-    app.pane_mut()
-        .selected
-        .retain(|key| !committed_selection_keys.contains(key));
+    app.remove_selection_keys(selection_pane_id, &committed_selection_keys);
 
     let committed = outcome.committed.len();
     let failed = outcome.failed.len();
     if failed > 0 || outcome.cancelled {
         app.error(format!(
             "{} — {committed} committed, {failed} failed{}",
-            active_transfer.label,
+            progress.label,
             if outcome.cancelled { ", cancelled" } else { "" }
         ));
     } else {
-        app.info(format!("{} — {committed} done", active_transfer.label));
+        app.info(format!("{} — {committed} done", progress.label));
     }
-    app.refresh_in_place();
+    let reveal_pane_id = reveal.as_ref().map(|intent| intent.pane_id);
+    if reveal_pane_id != Some(selection_pane_id) {
+        app.refresh_pane_in_place(selection_pane_id);
+    }
+    if let (Some(intent), Some(target)) = (
+        reveal,
+        outcome
+            .committed
+            .first()
+            .map(|effect| effect.target.clone()),
+    ) {
+        app.reveal_completed(intent, target);
+    } else {
+        app.refresh_in_place();
+    }
 }
 
 /// Give the terminal to a child that needs all of it — a shell, an editor —
@@ -293,15 +314,15 @@ fn finish_transfer(app: &mut App) {
 /// `restore` and a re-entry is the whole mechanism, and the only correct one:
 /// two programs in raw mode on one tty fight over the cursor and the screen.
 /// See docs/DECISIONS.md for why there is no PTY here.
-fn hand_over(
+fn hand_over<T>(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    run_child: impl FnOnce(),
-) -> io::Result<()> {
+    run_child: impl FnOnce() -> T,
+) -> io::Result<T> {
     restore_terminal();
-    run_child();
+    let result = run_child();
     // Back through the same door we came in by: the child ran with the terminal
     // as it found it, and the enhancement flags have to be pushed again for us.
     enter_raw_screen()?;
     terminal.clear()?;
-    Ok(())
+    Ok(result)
 }

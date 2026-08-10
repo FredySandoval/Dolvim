@@ -2,7 +2,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::time::Instant;
@@ -11,6 +10,7 @@ use ratatui::layout::Rect;
 
 use crate::config;
 use crate::fs::{self, Entry, Lister, Sort, SortKey};
+use crate::open;
 use crate::ops::{self, Progress, UndoOp, UnnamedRegister};
 use crate::places::{self, Row, Target};
 use crate::thumbs::Thumbs;
@@ -21,8 +21,8 @@ use crate::watch::Watcher;
 pub enum Suspend {
     /// F4: a shell in this directory.
     Shell(PathBuf),
-    /// A file whose handler is a terminal program.
-    Open(PathBuf),
+    /// A resolved command whose handler needs exclusive use of the terminal.
+    Open(open::Plan),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -71,10 +71,31 @@ impl FocusRegion {
 
 /// What the keyboard is currently feeding. Text-entry modes carry their buffer
 /// in `App::input`; `Mode` only says who owns the next keystroke.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RevealMode {
+    /// Open the operation's destination when it differs from the pane cwd.
+    NavigateDirectory,
+    /// Keep the parent visible and expand the destination inline.
+    ExpandDirectory,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct CreationIntent {
+pub struct RevealIntent {
     pub directory: PathBuf,
     pub pane_id: u64,
+    pub mode: RevealMode,
+}
+
+/// A filesystem worker and the UI contract captured when it was started.
+/// Keeping them together prevents asynchronous completion from losing which
+/// pane, destination, and reveal policy belong to the operation.
+pub struct ActiveTransfer {
+    pub progress: Progress,
+    pub reveal: Option<RevealIntent>,
+    /// Pane whose selection produced the operation. This is deliberately not
+    /// derived from `reveal`: a split-pane drag starts in one pane and is
+    /// revealed in the other.
+    pub selection_pane_id: u64,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -99,9 +120,9 @@ pub enum Mode {
     /// F2 with a multi-selection: one pattern renames them all.
     BatchRename,
     /// F10 / `O`.
-    NewFolder(CreationIntent),
+    NewFolder(RevealIntent),
     /// `o`; captures the destination and pane when the prompt opens.
-    NewFile(CreationIntent),
+    NewFile(RevealIntent),
     /// A yes/no gate. Carries what to do when the answer is yes.
     Confirm(Confirm),
     /// Modal information overlays.
@@ -246,6 +267,37 @@ fn expanded_listing(roots: Vec<Entry>, expanded: &HashSet<PathBuf>, sort: Sort) 
         append(root, 0, expanded, sort, &mut output);
     }
     output
+}
+
+/// Collect folders below `roots`, guarding against directory symlink cycles.
+/// The paths themselves (rather than canonical paths) remain the fold keys.
+fn recursive_folders(roots: Vec<PathBuf>) -> (HashSet<PathBuf>, Option<(PathBuf, std::io::Error)>) {
+    let mut folders = HashSet::new();
+    let mut visited = HashSet::new();
+    let mut pending = roots;
+    let mut first_error = None;
+
+    while let Some(path) = pending.pop() {
+        folders.insert(path.clone());
+        let identity = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if !visited.insert(identity) {
+            continue;
+        }
+        match fs::read_dir(&path, 0) {
+            Ok(entries) => pending.extend(
+                entries
+                    .into_iter()
+                    .filter(Entry::is_dir)
+                    .map(|entry| entry.path),
+            ),
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some((path, error));
+                }
+            }
+        }
+    }
+    (folders, first_error)
 }
 
 static NEXT_PANE_ID: AtomicU64 = AtomicU64::new(1);
@@ -599,6 +651,9 @@ pub struct CellPos {
 
 pub struct Drag {
     pub paths: Vec<PathBuf>,
+    /// Stable identity of the source pane; active-pane state may change while
+    /// the pointer crosses a split.
+    pub source_pane_id: u64,
     pub position: CellPos,
     pub origin: CellPos,
     pub started: bool,
@@ -646,7 +701,8 @@ pub struct App {
     /// Last left-click (when, which item) — the double-click detector.
     pub last_click: Option<LastClick>,
     pub thumbs: Thumbs,
-    pub transfer_progress: Option<Progress>,
+    pub active_transfer: Option<ActiveTransfer>,
+    external_launches: Vec<Receiver<Result<(), String>>>,
     pub quit: bool,
     /// Set when something needs the terminal to itself; `main` hands it over.
     pub suspend: Option<Suspend>,
@@ -693,7 +749,8 @@ impl App {
             disk: None,
             last_click: None,
             thumbs: Thumbs::new(),
-            transfer_progress: None,
+            active_transfer: None,
+            external_launches: Vec::new(),
             quit: false,
             suspend: None,
             lister,
@@ -733,9 +790,65 @@ impl App {
         &mut self.tabs[self.active_tab].panes[i]
     }
 
-    /// Reveal a newly created path in the pane that opened the prompt, even if
-    /// another pane became active while filesystem events were arriving.
-    pub fn reveal_created(&mut self, intent: CreationIntent, path: PathBuf) {
+    /// Start a worker together with the UI behavior its completion owns.
+    pub fn begin_transfer(&mut self, progress: Progress, reveal: Option<RevealIntent>) {
+        let selection_pane_id = self.pane().id;
+        self.begin_transfer_from(progress, reveal, selection_pane_id);
+    }
+
+    /// Split-pane transfers have two owners: the source owns selection cleanup,
+    /// while the destination owns refresh/reveal. Never reconstruct either from
+    /// whichever pane happens to be active when the worker finishes.
+    pub fn begin_transfer_from(
+        &mut self,
+        progress: Progress,
+        reveal: Option<RevealIntent>,
+        selection_pane_id: u64,
+    ) {
+        debug_assert!(self.active_transfer.is_none());
+        self.active_transfer = Some(ActiveTransfer {
+            progress,
+            reveal,
+            selection_pane_id,
+        });
+    }
+
+    /// Capture the destination pane and its view policy before an asynchronous
+    /// operation starts. Indices are render-local; pane ids survive focus and
+    /// tab changes while the worker runs.
+    pub fn reveal_intent_for_pane(&self, pane_index: usize, directory: PathBuf) -> RevealIntent {
+        let pane = self.pane_at(pane_index);
+        let mode = if pane.view == ViewMode::Compact
+            && directory != pane.cwd
+            && directory.starts_with(&pane.cwd)
+        {
+            RevealMode::ExpandDirectory
+        } else {
+            RevealMode::NavigateDirectory
+        };
+        RevealIntent {
+            directory,
+            pane_id: pane.id,
+            mode,
+        }
+    }
+
+    /// Consume selection state in the pane that owns a completed operation,
+    /// rather than whichever split happens to be active in the reducer.
+    pub fn remove_selection_keys(&mut self, pane_id: u64, keys: &HashSet<PathBuf>) {
+        if let Some(pane) = self
+            .tabs
+            .iter_mut()
+            .flat_map(|tab| tab.panes.iter_mut())
+            .find(|pane| pane.id == pane_id)
+        {
+            pane.selected.retain(|key| !keys.contains(key));
+        }
+    }
+
+    /// Reveal a newly completed path in the pane that started the operation,
+    /// even if another pane became active while filesystem events were arriving.
+    pub fn reveal_completed(&mut self, intent: RevealIntent, path: PathBuf) {
         let owner = self.tabs.iter().enumerate().find_map(|(tab_index, tab)| {
             tab.panes
                 .iter()
@@ -748,7 +861,15 @@ impl App {
         };
         self.active_tab = tab_index;
         self.tabs[tab_index].active = pane_index;
-        if self.pane().cwd != intent.directory {
+        let can_expand_in_place = intent.mode == RevealMode::ExpandDirectory
+            && intent.directory != self.pane().cwd
+            && intent.directory.starts_with(&self.pane().cwd);
+        if can_expand_in_place {
+            let pane = self.pane_mut();
+            pane.expanded.insert(intent.directory);
+            pane.focus_after_refresh(path);
+            self.refresh_in_place();
+        } else if self.pane().cwd != intent.directory {
             self.goto(Target::Dir(intent.directory.clone()), true);
             self.pane_mut().focus_after_refresh(path);
         } else {
@@ -882,6 +1003,28 @@ impl App {
         }
     }
 
+    /// Relist a particular directory pane without changing tab or split focus.
+    /// Completion reducers use this for an operation's source pane; the global
+    /// watcher only follows one directory and therefore cannot make split-pane
+    /// consistency dependably converge on its own.
+    pub fn refresh_pane_in_place(&mut self, pane_id: u64) {
+        let request = self
+            .tabs
+            .iter_mut()
+            .flat_map(|tab| tab.panes.iter_mut())
+            .find(|pane| pane.id == pane_id)
+            .and_then(|pane| match &pane.target {
+                Target::Dir(directory) => {
+                    pane.seq += 1;
+                    Some((directory.clone(), pane.seq))
+                }
+                _ => None,
+            });
+        if let Some((directory, seq)) = request {
+            self.lister.request(directory, seq);
+        }
+    }
+
     /// inotify said something changed: relist without moving the cursor.
     pub fn refresh_in_place(&mut self) {
         let target = self.pane().target.clone();
@@ -991,24 +1134,45 @@ impl App {
     }
 
     pub fn open_external(&mut self, path: &Path) {
-        // A handler that wants a tty cannot share ours: both would sit in raw
-        // mode redrawing over each other, which is the glitching. Step out for
-        // the duration instead.
-        if ops::opens_in_terminal(path) {
-            self.suspend = Some(Suspend::Open(path.to_path_buf()));
-            return;
+        let plan = match open::resolve(path) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.error(error.to_string());
+                return;
+            }
+        };
+        let message = format!("Opening {}", ops::file_name_of(path));
+        if plan.needs_terminal() {
+            // A TUI handler cannot share our raw alternate screen. Main owns
+            // terminal lifecycle, so pass it the already-resolved command.
+            self.info(message);
+            self.suspend = Some(Suspend::Open(plan));
+        } else {
+            match plan.spawn_detached() {
+                Ok(result_rx) => {
+                    self.external_launches.push(result_rx);
+                    self.info(message);
+                }
+                Err(error) => self.error(error),
+            }
         }
-        // Detached, with its streams closed: a graphical handler that grumbles
-        // on stderr would otherwise print into our alternate screen.
-        match std::process::Command::new("xdg-open")
-            .arg(path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(_) => self.info(format!("Opening {}", ops::file_name_of(path))),
-            Err(spawn_error) => self.error(format!("xdg-open failed: {spawn_error}")),
+    }
+
+    /// Collect failures from detached launchers without blocking the UI.
+    pub fn pump_external_launches(&mut self) {
+        let mut failures = Vec::new();
+        self.external_launches
+            .retain(|receiver| match receiver.try_recv() {
+                Ok(Ok(())) => false,
+                Ok(Err(error)) => {
+                    failures.push(error);
+                    false
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => true,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+            });
+        if let Some(error) = failures.pop() {
+            self.error(error);
         }
     }
 
@@ -1286,72 +1450,112 @@ impl App {
 
     // -- details tree ------------------------------------------------------
 
-    /// Dolphin's expandable folders: splice the child listing in beneath the
-    /// folder row, at depth+1, or remove it again.
+    /// Toggle the innermost fold at the cursor (`za`). A folder row starts its
+    /// own fold, while any other row belongs to its nearest expanded ancestor.
+    /// Closing from a descendant moves the cursor to that folder's row and
+    /// preserves deeper fold state, as a one-level Vim fold toggle does.
     pub fn toggle_expand(&mut self) {
+        let Some(entry) = self.pane().current().cloned() else {
+            return;
+        };
+        if entry.is_dir() {
+            if self.pane().expanded.contains(&entry.path) {
+                self.close_fold(false);
+            } else {
+                self.open_fold(false);
+            }
+            return;
+        }
+
+        // `depth` bounds this walk to represented tree ancestors: the pane's
+        // cwd is not itself a visible fold, even if a stale key exists for it.
+        let containing_fold = entry
+            .path
+            .ancestors()
+            .skip(1)
+            .take(entry.depth as usize)
+            .find(|path| self.pane().expanded.contains(*path))
+            .map(Path::to_path_buf);
+        let Some(containing_fold) = containing_fold else {
+            return;
+        };
+        let pane = self.pane_mut();
+        pane.expanded.remove(&containing_fold);
+        pane.refilter_keeping(Some(containing_fold));
+    }
+
+    /// Open the folder under the cursor, optionally including every folder
+    /// beneath it (`zo`/`zO`).
+    pub fn open_fold(&mut self, recursive: bool) {
         let Some(entry) = self.pane().current().cloned() else {
             return;
         };
         if !entry.is_dir() {
             return;
         }
-        let collapsing = self.pane().expanded.contains(&entry.path);
-        let child_entries = if collapsing {
-            Vec::new()
-        } else {
-            match fs::read_dir(&entry.path, entry.depth + 1) {
-                Ok(mut child_entries) => {
-                    fs::sort_entries(&mut child_entries, self.pane().sort);
-                    child_entries
-                }
-                Err(err) => {
-                    self.error(format!("Cannot read {}: {err}", entry.name));
-                    return;
-                }
+
+        if recursive {
+            let (folders, first_error) = recursive_folders(vec![entry.path.clone()]);
+            let pane = self.pane_mut();
+            pane.expanded.extend(folders);
+            pane.refilter();
+            if let Some((path, error)) = first_error {
+                self.error(format!("Cannot read {}: {error}", path.display()));
             }
+        } else {
+            if let Err(error) = fs::read_dir(&entry.path, entry.depth + 1) {
+                self.error(format!("Cannot read {}: {error}", entry.name));
+                return;
+            }
+            let pane = self.pane_mut();
+            pane.expanded.insert(entry.path);
+            pane.refilter();
+        }
+    }
+
+    /// Close the folder under the cursor. `zc` closes only that fold and keeps
+    /// nested state; `zC` forgets every descendant fold too.
+    pub fn close_fold(&mut self, recursive: bool) {
+        let Some(entry) = self.pane().current().cloned() else {
+            return;
         };
+        if !entry.is_dir() || !self.pane().expanded.contains(&entry.path) {
+            return;
+        }
         let pane = self.pane_mut();
-        let keep_path = pane
-            .visible
-            .get(pane.cursor)
-            .map(|&entry_index| pane.entries[entry_index].path.clone());
-        if collapsing {
-            pane.expanded.remove(&entry.path);
-            let prefix = entry.path.clone();
-            pane.expanded.retain(|expanded_path| {
-                !expanded_path.starts_with(&prefix) || *expanded_path == prefix
-            });
-            pane.entries.retain(|candidate_entry| {
-                candidate_entry.path == prefix || !candidate_entry.path.starts_with(&prefix)
-            });
+        if recursive {
+            pane.expanded.retain(|path| !path.starts_with(&entry.path));
         } else {
-            let insert_index = pane
-                .entries
-                .iter()
-                .position(|candidate_entry| candidate_entry.path == entry.path)
-                .unwrap_or(0);
-            pane.entries
-                .splice(insert_index + 1..insert_index + 1, child_entries);
-            pane.expanded.insert(entry.path.clone());
+            pane.expanded.remove(&entry.path);
         }
-        for candidate_entry in &mut pane.entries {
-            if candidate_entry.path == entry.path {
-                candidate_entry.expanded = !collapsing;
-            }
+        pane.refilter();
+    }
+
+    /// Close every fold in the active pane (`zM`).
+    pub fn close_all_folds(&mut self) {
+        let pane = self.pane_mut();
+        pane.expanded.clear();
+        pane.refilter();
+    }
+
+    /// Open every folder reachable from this pane's roots (`zR`). Canonical
+    /// directory identities prevent symlink cycles from making this traversal
+    /// unbounded.
+    pub fn open_all_folds(&mut self) {
+        let roots = self
+            .pane()
+            .entries
+            .iter()
+            .filter(|entry| entry.depth == 0 && entry.is_dir())
+            .map(|entry| entry.path.clone())
+            .collect();
+        let (folders, first_error) = recursive_folders(roots);
+        let pane = self.pane_mut();
+        pane.expanded.extend(folders);
+        pane.refilter();
+        if let Some((path, error)) = first_error {
+            self.error(format!("Cannot read {}: {error}", path.display()));
         }
-        // The tree order is positional, so re-sorting would destroy it; only
-        // the filter is reapplied.
-        pane.revisible();
-        if let Some(keep_path) = keep_path {
-            if let Some(i) = pane
-                .visible
-                .iter()
-                .position(|&entry_index| pane.entries[entry_index].path == keep_path)
-            {
-                pane.cursor = i;
-            }
-        }
-        pane.clamp();
     }
 }
 
@@ -1601,5 +1805,94 @@ mod tests {
         // Past the end entirely: clamped to the last item, never empty.
         assert_eq!(file_names_of(pane.paths_in(9, 9)), ["c"]);
         assert!(pane_with(&[]).paths_in(0, 3).is_empty());
+    }
+    #[test]
+    fn toggle_fold_from_a_child_targets_its_innermost_containing_folder() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("dolvim-toggle-child-{unique}"));
+        let outer = base.join("outer");
+        let inner = outer.join("inner");
+        let leaf = inner.join("leaf");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(&leaf, b"leaf").unwrap();
+
+        let mut app = App::new(base.clone());
+        app.pane_mut().set_entries(fs::read_dir(&base, 0).unwrap());
+        app.open_all_folds();
+        app.pane_mut().cursor = app
+            .pane()
+            .visible
+            .iter()
+            .position(|&index| app.pane().entries[index].path == leaf)
+            .unwrap();
+
+        app.toggle_expand();
+
+        assert!(app.pane().expanded.contains(&outer));
+        assert!(!app.pane().expanded.contains(&inner));
+        assert_eq!(app.pane().current().map(|entry| &entry.path), Some(&inner));
+        assert!(!app.pane().entries.iter().any(|entry| entry.path == leaf));
+
+        // On the folder row itself, `za` still toggles that folder rather than
+        // its containing outer fold.
+        app.toggle_expand();
+        assert!(app.pane().expanded.contains(&outer));
+        assert!(app.pane().expanded.contains(&inner));
+        assert!(app.pane().entries.iter().any(|entry| entry.path == leaf));
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn fold_commands_distinguish_one_level_recursive_and_all() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("dolvim-folds-{unique}"));
+        let a = base.join("a");
+        let b = a.join("b");
+        let x = base.join("x");
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::create_dir_all(x.join("y")).unwrap();
+        std::fs::write(b.join("leaf"), b"leaf").unwrap();
+
+        let mut app = App::new(base.clone());
+        app.pane_mut().set_entries(fs::read_dir(&base, 0).unwrap());
+        app.pane_mut().cursor = app
+            .pane()
+            .visible
+            .iter()
+            .position(|&index| app.pane().entries[index].path == a)
+            .unwrap();
+
+        app.open_fold(true);
+        assert!(app.pane().expanded.contains(&a));
+        assert!(app.pane().expanded.contains(&b));
+        assert!(app.pane().entries.iter().any(|entry| entry.name == "leaf"));
+
+        app.close_fold(false);
+        assert!(!app.pane().expanded.contains(&a));
+        assert!(app.pane().expanded.contains(&b));
+        assert!(!app.pane().entries.iter().any(|entry| entry.name == "leaf"));
+        app.open_fold(false);
+        assert!(app.pane().entries.iter().any(|entry| entry.name == "leaf"));
+
+        app.close_fold(true);
+        assert!(!app.pane().expanded.contains(&a));
+        assert!(!app.pane().expanded.contains(&b));
+        app.open_all_folds();
+        assert!(app.pane().expanded.contains(&a));
+        assert!(app.pane().expanded.contains(&b));
+        assert!(app.pane().expanded.contains(&x));
+        assert!(app.pane().expanded.contains(&x.join("y")));
+        app.close_all_folds();
+        assert!(app.pane().expanded.is_empty());
+        assert!(app.pane().entries.iter().all(|entry| entry.depth == 0));
+
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

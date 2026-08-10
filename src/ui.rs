@@ -1232,16 +1232,17 @@ fn plural(n: usize) -> &'static str {
 // ---------------------------------------------------------------------------
 
 fn overlays(frame: &mut Frame, app: &mut App, area: Rect) {
-    if let Some(transfer_progress) = &app.transfer_progress {
+    if let Some(active_transfer) = &app.active_transfer {
         let r = centre_rect(area, config::PROGRESS_POPUP_W, config::PROGRESS_POPUP_H);
-        let fraction = transfer_progress.fraction();
-        let current_file = transfer_progress
+        let fraction = active_transfer.progress.fraction();
+        let current_file = active_transfer
+            .progress
             .current_file
             .lock()
             .map(|current_file_guard| current_file_guard.clone())
             .unwrap_or_default();
         let body = vec![
-            Line::from(transfer_progress.label.clone()),
+            Line::from(active_transfer.progress.label.clone()),
             Line::from(Span::styled(current_file, Style::default().fg(color::DIM))),
             Line::from(progress_bar(fraction, config::PROGRESS_BAR_WIDTH)),
             Line::from(Span::styled("Esc cancel", Style::default().fg(color::DIM))),
