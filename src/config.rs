@@ -229,7 +229,7 @@ pub const KEY_BINDINGS: &[Bind] = &[
     bind(CTRL    , Char('l')    , &[TABS]    , Action::Focus(Direction::Right) ),
 
     /* Dolphin-like bindings */
-    /* modifier   key              modes                             action                   */
+ /* modifier          key             modes           action               */
     bind(ALT       , Left        , VIEW_MODES   , Action::Back            ),
     bind(ALT       , Right       , VIEW_MODES   , Action::Forward         ),
     bind(ALT       , Up          , VIEW_MODES   , Action::GoUp            ),
