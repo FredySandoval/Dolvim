@@ -126,6 +126,7 @@ fn handle_normal_key(app: &mut App, key_event: KeyEvent) {
     // A pending mark owns the next key too, and for the same reason: the letter
     // names the mark and can be any letter, so nothing else may read it.
     if let Some(pending_mark) = app.pending_mark.take() {
+        app.count.clear();
         if let KeyCode::Char(c) = key_event.code {
             if !key_event
                 .modifiers
@@ -149,9 +150,13 @@ fn handle_normal_key(app: &mut App, key_event: KeyEvent) {
     // its 5 the same way `5j` does. A key the operator cannot use cancels it
     // and then means what it usually means, so `d` then Ctrl+d scrolls rather
     // than being swallowed.
-    if let Some(count_before_operator) = app.pending_delete.take() {
-        if delete_motion(app, key_event, count_before_operator) == MotionResult::Handled {
+    if let Some(before) = app.pending_delete.take() {
+        let count_before = before.parse().unwrap_or(1).max(1);
+        if delete_motion(app, key_event, count_before) == MotionResult::Handled {
             return;
+        }
+        if app.count.is_empty() {
+            app.count = before;
         }
     }
 
@@ -165,8 +170,16 @@ fn handle_normal_key(app: &mut App, key_event: KeyEvent) {
     }
 
     if let Some(a) = lookup_binding(app, key_event) {
-        let n = take_count(app);
-        run_action(app, a, n);
+        // The delete operator and the mark operators own their own count
+        // prefix: they read or keep it while pending so showcmd echoes the
+        // exact typed digits. Every other action takes (and clears) it here
+        // as usual.
+        if matches!(a, Action::DeleteOp | Action::SetMark | Action::JumpMark) {
+            run_action(app, a, 1);
+        } else {
+            let n = take_count(app);
+            run_action(app, a, n);
+        }
         return;
     }
 
@@ -937,8 +950,20 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
         }
         Action::DeleteOp => {
             if app.pane().selected.is_empty() {
-                app.pending_delete = Some(count);
+                // Keyboard dispatch leaves the literal prefix in `count` for
+                // showcmd. Other callers still get the count they supplied.
+                let typed = if app.count.is_empty() {
+                    if count > 1 {
+                        count.to_string()
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    std::mem::take(&mut app.count)
+                };
+                app.pending_delete = Some(typed);
             } else {
+                app.count.clear();
                 let trash_paths = app.pane().selected_paths();
                 delete_to_register(app, trash_paths);
             }
@@ -1999,6 +2024,127 @@ mod tests {
         assert_eq!(app.count, "12");
     }
 
+    /// `showcmd` reports the half-typed command: a lone count, a chord leader
+    /// (`g`, `z`, `c`) waiting on a follower, and a count ahead of the leader.
+    #[test]
+    fn pending_command_shows_count_and_chord_leader() {
+        let mut app = test_app();
+        press_char(&mut app, '5');
+        assert_eq!(app.pending_command(), "5");
+
+        // `5z` waits for the follower that completes the fold chord.
+        press_char(&mut app, 'z');
+        assert_eq!(app.pending_chord_leader, Some('z'));
+        assert_eq!(app.pending_command(), "5z");
+    }
+
+    /// A lone chord leader still shows, even before it earns a follower.
+    #[test]
+    fn pending_command_shows_a_bare_leader() {
+        let mut app = test_app();
+        press_char(&mut app, 'g');
+        assert_eq!(app.pending_command(), "g");
+    }
+
+    /// A lone `d` reads as `d`, not the implicit count of 1 (`1d`) that the
+    /// state stores but the user never typed.
+    #[test]
+    fn pending_command_shows_a_bare_delete_operator_without_the_implicit_count() {
+        let mut app = test_app();
+        press_char(&mut app, 'd');
+        assert_eq!(app.pending_delete.as_deref(), Some(""));
+        assert_eq!(app.pending_command(), "d");
+        press_char(&mut app, '5');
+        assert_eq!(app.pending_command(), "d5");
+    }
+
+    /// An explicitly typed count is echoed verbatim: `1d` shows `1d` (not a
+    /// bare `d`) as Vim's showcmd does, and the trailing count joins it.
+    #[test]
+    fn pending_command_echoes_an_explicit_count_before_the_operator() {
+        let mut app = test_app();
+        press_char(&mut app, '1');
+        press_char(&mut app, 'd');
+        assert_eq!(app.pending_delete.as_deref(), Some("1"));
+        assert_eq!(app.pending_command(), "1d");
+    }
+
+    /// the literal count typed before a mark survives: `5m` reads as `5m`.
+    #[test]
+    fn pending_command_echoes_the_count_before_a_mark() {
+        let mut app = test_app();
+        press_char(&mut app, '5');
+        press_char(&mut app, 'm');
+        assert_eq!(app.pending_mark, Some(MarkPending::Set));
+        assert_eq!(app.pending_command(), "5m");
+        // the letter completes the mark and spends the showcmd count.
+        press_char(&mut app, 'a');
+        assert_eq!(app.pending_command(), "");
+        assert_eq!(app.count, "");
+    }
+
+    /// The Space chord leader is literal whitespace, so it reads as `<Space>`
+    /// while it waits for its follower rather than as invisible bold.
+    #[test]
+    fn pending_command_renders_a_space_leader_as_space_tag() {
+        let mut app = test_app();
+        press_char(&mut app, ' ');
+        assert_eq!(app.pending_command(), "<Space>");
+        // the follower completes the `Space` + `h` fold-chord and clears it.
+        press_char(&mut app, 'h');
+        assert_eq!(app.pending_command(), "");
+    }
+
+    /// A count typed ahead of the Space leader still precedes the tag.
+    #[test]
+    fn pending_command_keeps_the_count_before_a_space_leader() {
+        let mut app = test_app();
+        press_char(&mut app, '5');
+        press_char(&mut app, ' ');
+        assert_eq!(app.pending_command(), "5<Space>");
+        // the follower `h` completes the chord and spends the count too.
+        press_char(&mut app, 'h');
+        assert_eq!(app.pending_command(), "");
+    }
+
+    /// `3d` shows the operator and the count before it; a later `5` joins it,
+    /// exactly as Vim's showcmd accumulates `3d5`.
+    #[test]
+    fn pending_command_shows_operator_with_counts_on_both_sides() {
+        let mut app = test_app();
+        press_char(&mut app, '3');
+        press_char(&mut app, 'd');
+        assert_eq!(app.pending_delete.as_deref(), Some("3"));
+        assert_eq!(app.pending_command(), "3d");
+        press_char(&mut app, '5');
+        assert_eq!(app.pending_command(), "3d5");
+    }
+
+    /// Setting a mark and jumping to one each arm the operator and display it.
+    #[test]
+    fn pending_command_shows_a_mark_operator() {
+        let mut app = test_app();
+        press_char(&mut app, 'm');
+        assert_eq!(app.pending_command(), "m");
+        press_char(&mut app, 'd'); // completes `md`; nothing pending remains
+        assert_eq!(app.pending_command(), "");
+
+        press_char(&mut app, '\'');
+        assert_eq!(app.pending_command(), "'");
+    }
+
+    /// Completing a pending sequence clears the showcmd slot.
+    #[test]
+    fn pending_command_clears_after_the_command_completes() {
+        let mut app = test_app();
+        install_test_entries(&mut app, &["a", "b"]);
+        press_char(&mut app, '5');
+        press_char(&mut app, 'g');
+        assert_eq!(app.pending_command(), "5g");
+        press_char(&mut app, 'g'); // `gg` -> Top, follower consumed
+        assert_eq!(app.pending_command(), "");
+    }
+
     /// `ma` then `'a` is the whole of marks: the letter is read by the pending
     /// state rather than by the keymap, so any letter works — including one the
     /// keymap binds, as `'d` here proves by not deleting anything.
@@ -2117,7 +2263,7 @@ mod tests {
     fn ctrl_d_after_d_cancels_and_is_re_dispatched() {
         let mut app = test_app();
         press_char(&mut app, 'd');
-        assert_eq!(app.pending_delete, Some(1));
+        assert_eq!(app.pending_delete.as_deref(), Some(""));
         handle_key_event(
             &mut app,
             KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
@@ -2136,6 +2282,13 @@ mod tests {
         press_char(&mut app, 'w');
         assert_eq!(app.pending_delete, None);
         assert_eq!(app.count, "3");
+
+        app.count.clear();
+        press_char(&mut app, '5');
+        press_char(&mut app, 'd');
+        press_char(&mut app, 'w');
+        assert_eq!(app.pending_delete, None);
+        assert_eq!(app.count, "5");
     }
 
     #[test]

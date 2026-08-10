@@ -1200,7 +1200,17 @@ fn status_bar(frame: &mut Frame, app: &mut App, area: Rect) {
         style,
     );
 
-    // Right side: free space, where stock Dolphin puts it.
+    // Right side: the incomplete command sits immediately before the free
+    // space, where stock Dolphin puts it. `showcmd` owns the slot in Normal
+    // mode only; a pending count, operator, chord leader or mark name shows
+    // here in high contrast (bold, not the grayed free-space style) until the
+    // command completes or Esc clears it. The two are separate segments so the
+    // free-space readout stays dim even while a command is pending.
+    let pending = if app.mode == Mode::Normal {
+        app.pending_command()
+    } else {
+        String::new()
+    };
     let free = match app.disk_space() {
         Some(space) => format!(
             "  {} free of {}",
@@ -1209,13 +1219,38 @@ fn status_bar(frame: &mut Frame, app: &mut App, area: Rect) {
         ),
         None => String::new(),
     };
-    let right_text = format!("{free} ");
-    let rw = right_text.width() as u16;
-    if rw < area.width {
-        let x = area.right() - rw;
-        frame
-            .buffer_mut()
-            .set_string(x, area.y, &right_text, st.fg(color::DIM));
+    let avail = usize::from(area.width);
+    let pending = clip_start(&pending, avail);
+    let pending_w = pending.width();
+    let free_w = free.width();
+    // The free-space readout yields rather than hiding a pending command.
+    if !pending.is_empty() && pending_w <= avail {
+        if free_w > 0 && pending_w.saturating_add(free_w).saturating_add(1) <= avail {
+            let free_x = area.right() - free_w as u16 - 1;
+            frame
+                .buffer_mut()
+                .set_string(free_x, area.y, &free, st.fg(color::DIM));
+            frame.buffer_mut().set_string(
+                free_x - pending_w as u16,
+                area.y,
+                &pending,
+                st.add_modifier(Modifier::BOLD),
+            );
+        } else {
+            frame.buffer_mut().set_string(
+                area.right() - pending_w as u16,
+                area.y,
+                &pending,
+                st.add_modifier(Modifier::BOLD),
+            );
+        }
+    } else if free_w > 0 && free_w.saturating_add(1) <= avail {
+        frame.buffer_mut().set_string(
+            area.right() - free_w as u16 - 1,
+            area.y,
+            &free,
+            st.fg(color::DIM),
+        );
     }
 }
 
@@ -1686,6 +1721,28 @@ pub fn clip(s: &str, w: usize) -> String {
     format!("{}\u{2026}", truncate_to_width(s, w - 1))
 }
 
+/// Keep the end of a string visible, marking a dropped prefix with an ellipsis.
+fn clip_start(s: &str, w: usize) -> String {
+    if w == 0 || s.width() <= w {
+        return truncate_to_width(s, w);
+    }
+    if w == 1 {
+        return s.chars().next_back().into_iter().collect();
+    }
+    let mut used = 1;
+    let mut chars = Vec::new();
+    for c in s.chars().rev() {
+        let cw = c.to_string().width();
+        if used + cw > w {
+            break;
+        }
+        chars.push(c);
+        used += cw;
+    }
+    chars.reverse();
+    format!("\u{2026}{}", chars.into_iter().collect::<String>())
+}
+
 /// Truncate to `w` display columns, saying nothing about what was dropped.
 fn truncate_to_width(s: &str, w: usize) -> String {
     let mut out = String::new();
@@ -1794,6 +1851,8 @@ mod tests {
         assert_eq!(clip("abc", 5), "abc");
         assert_eq!(clip("abcdef", 4), "abc\u{2026}");
         assert_eq!(clip("abc", 0), "");
+        assert_eq!(clip_start("abcdef", 4), "\u{2026}def");
+        assert_eq!(clip_start("abc", 0), "");
     }
 
     #[test]
@@ -1897,6 +1956,111 @@ mod tests {
             .map(|x| buf.cell((x, 29)).unwrap().symbol().to_string())
             .collect();
         assert!(last.contains("folder"), "status bar was: {last}");
+    }
+
+    /// `showcmd`: a pending command renders at the right of the status line,
+    /// before the disk-free readout, in high contrast (bold) rather than the
+    /// grayed free-space style.
+    #[test]
+    fn pending_command_renders_before_disk_free_in_high_contrast() {
+        let mut app = App::new(std::env::temp_dir());
+        crate::vim::handle_key_event(
+            &mut app,
+            ratatui::crossterm::event::KeyEvent::new(
+                ratatui::crossterm::event::KeyCode::Char('5'),
+                ratatui::crossterm::event::KeyModifiers::NONE,
+            ),
+        );
+        crate::vim::handle_key_event(
+            &mut app,
+            ratatui::crossterm::event::KeyEvent::new(
+                ratatui::crossterm::event::KeyCode::Char('z'),
+                ratatui::crossterm::event::KeyModifiers::NONE,
+            ),
+        );
+        assert_eq!(app.pending_command(), "5z");
+
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let last: String = (0..100)
+            .map(|x| buf.cell((x, 29)).unwrap().symbol().to_string())
+            .collect();
+        let pos = last.find("5z");
+        assert!(pos.is_some(), "status bar was: {last}");
+        // The pending command sits flush against the left edge of the grayed
+        // free-space segment: `5z` is two cells wide and its last cell is the
+        // one immediately before the dim readout starts.
+        let pending_end = pos.unwrap() + 2;
+        let dim_start = (0..100)
+            .position(|x| buf.cell((x, 29)).unwrap().fg == color::DIM)
+            .expect("free-space readout must stay grayed");
+        assert_eq!(
+            pending_end, dim_start,
+            "pending must abut the free-space readout, got: {last}"
+        );
+        // The pending text is bold (high contrast) and never grayed; the
+        // free-space text is the opposite, so the two readouts stay distinct.
+        let pending_cell = buf.cell((pos.unwrap() as u16, 29)).unwrap();
+        let free_cell = buf.cell((dim_start as u16, 29)).unwrap();
+        assert!(
+            pending_cell.modifier.contains(Modifier::BOLD) && pending_cell.fg != color::DIM,
+            "pending command must be high contrast, got: {last}"
+        );
+        assert!(
+            free_cell.fg == color::DIM && !free_cell.modifier.contains(Modifier::BOLD),
+            "free-space readout must stay grayed, got: {last}"
+        );
+    }
+
+    /// `showcmd` keeps the pending command at the right edge even on a row too
+    /// narrow to hold it alongside the free-space readout, which yields.
+    #[test]
+    fn narrow_row_keeps_pending_and_drops_free_space() {
+        let mut app = App::new(std::env::temp_dir());
+        crate::vim::handle_key_event(
+            &mut app,
+            ratatui::crossterm::event::KeyEvent::new(
+                ratatui::crossterm::event::KeyCode::Char('5'),
+                ratatui::crossterm::event::KeyModifiers::NONE,
+            ),
+        );
+        crate::vim::handle_key_event(
+            &mut app,
+            ratatui::crossterm::event::KeyEvent::new(
+                ratatui::crossterm::event::KeyCode::Char('z'),
+                ratatui::crossterm::event::KeyModifiers::NONE,
+            ),
+        );
+        assert_eq!(app.pending_command(), "5z");
+
+        // Width 12 holds `5z` but not "  X free of Y".
+        let mut term = Terminal::new(TestBackend::new(12, 30)).unwrap();
+        term.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let pending: String = (8..12)
+            .map(|x| buf.cell((x, 29)).unwrap().symbol())
+            .collect();
+        assert!(
+            pending.ends_with("5z"),
+            "pending must survive a narrow row: {pending}"
+        );
+        // The free-space readout is dropped rather than squeezing the command.
+        assert!(
+            (0..12).all(|x| buf.cell((x, 29)).unwrap().fg != color::DIM),
+            "free space must yield on a narrow row"
+        );
+
+        app.count = "123456789012345".into();
+        term.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let clipped: String = (0..12)
+            .map(|x| buf.cell((x, 29)).unwrap().symbol())
+            .collect();
+        assert!(
+            clipped.starts_with('\u{2026}') && clipped.ends_with('z'),
+            "a long command must keep its distinguishing suffix: {clipped}"
+        );
     }
 
     #[test]

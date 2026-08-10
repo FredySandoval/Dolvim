@@ -704,9 +704,10 @@ pub struct App {
     /// Pending vim state: count prefix and chord leader (`g`, `z`, `c`).
     pub count: String,
     pub pending_chord_leader: Option<char>,
-    /// A `d` waiting for its motion, holding the count typed before it (`3dd`).
-    /// One operator exists, so this is that count and not an enum of operators.
-    pub pending_delete: Option<usize>,
+    /// A `d` waiting for its motion, holding the exact count typed before it
+    /// (`3d` -> `"3"`, a bare `d` -> `""`) so showcmd can echo the literal
+    /// prefix. The count typed after the `d` still accumulates in `count`.
+    pub pending_delete: Option<String>,
     /// An `m` or `'` waiting for the letter that names the mark.
     pub pending_mark: Option<MarkPending>,
     /// Vim's marks, at the granularity a file manager has: `ma` remembers where
@@ -1442,6 +1443,48 @@ impl App {
                 return;
             }
         }
+    }
+
+    /// The incomplete Normal-mode command the user has half-typed, like Vim's
+    /// `showcmd`. Everything still waiting on a further key joins the string:
+    /// the count prefix, a `d` awaiting its motion, a chord leader (`g`, `z`,
+    /// `c`) awaiting a follower, or a mark operator (`m`, `'`) awaiting its
+    /// name. Empty when no key is pending, so the status bar falls through to
+    /// the disk-free readout.
+    pub fn pending_command(&self) -> String {
+        let mut s = String::new();
+        // A `d` armed with the literal count typed before it (`` for a bare
+        // `d`, `"1"` for `1d`, `"3"` for `3d`), echoed verbatim; the trailing
+        // count typed after the operator joins it as `d5` does.
+        if let Some(before) = &self.pending_delete {
+            s.push_str(before);
+            s.push('d');
+            s.push_str(&self.count);
+            return s;
+        }
+        // A chord leader (`g`, `z`, `c`, Space) awaiting its follower; the
+        // count typed before it stays in `count`. A Space leader is literal
+        // whitespace, so it reads as `<Space>` rather than invisible.
+        if let Some(leader) = self.pending_chord_leader {
+            s.push_str(&self.count);
+            if leader == ' ' {
+                s.push_str("<Space>");
+            } else {
+                s.push(leader);
+            }
+            return s;
+        }
+        // A mark operator (`m`, `'`) awaiting its name, with the count that
+        // preceded it — marks never consume it, so it reads as `5m`.
+        if let Some(mark) = self.pending_mark {
+            s.push_str(&self.count);
+            s.push(match mark {
+                MarkPending::Set => 'm',
+                MarkPending::Jump => '\'',
+            });
+            return s;
+        }
+        self.count.clone()
     }
 
     // -- view controls -----------------------------------------------------
