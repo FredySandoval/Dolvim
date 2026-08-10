@@ -941,16 +941,26 @@ impl App {
         }
     }
 
-    /// Consume selection state in the pane that owns a completed operation,
-    /// rather than whichever split happens to be active in the reducer.
-    pub fn remove_selection_keys(&mut self, pane_id: u64, keys: &HashSet<PathBuf>) {
+    /// Consume state for completed recursive operands in the pane that started
+    /// the operation, rather than whichever split is active when it finishes.
+    pub fn remove_operation_paths(
+        &mut self,
+        pane_id: u64,
+        paths: &HashSet<PathBuf>,
+        sources_removed: bool,
+    ) {
         if let Some(pane) = self
             .tabs
             .iter_mut()
             .flat_map(|tab| tab.panes.iter_mut())
             .find(|pane| pane.id == pane_id)
         {
-            pane.selected.retain(|key| !keys.contains(key));
+            pane.selected
+                .retain(|key| !paths.iter().any(|path| key.starts_with(path)));
+            if sources_removed {
+                pane.expanded
+                    .retain(|key| !paths.iter().any(|path| key.starts_with(path)));
+            }
         }
     }
 
@@ -2004,5 +2014,25 @@ mod tests {
         assert!(app.pane().entries.iter().all(|entry| entry.depth == 0));
 
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn completed_recursive_operand_clears_descendant_ui_state() {
+        let mut app = App::new(PathBuf::from("/tmp"));
+        let pane_id = app.pane().id;
+        let root = PathBuf::from("/tmp/tree");
+        let child = root.join("child");
+        let sibling = PathBuf::from("/tmp/sibling");
+        app.pane_mut()
+            .selected
+            .extend([root.clone(), child.clone(), sibling.clone()]);
+        app.pane_mut()
+            .expanded
+            .extend([root.clone(), child.clone(), sibling.clone()]);
+
+        app.remove_operation_paths(pane_id, &HashSet::from([root]), true);
+
+        assert_eq!(app.pane().selected, HashSet::from([sibling.clone()]));
+        assert_eq!(app.pane().expanded, HashSet::from([sibling]));
     }
 }

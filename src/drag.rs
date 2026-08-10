@@ -74,7 +74,7 @@ fn cell_origin(col: u16, row: u16) -> Option<(i32, i32)> {
 /// Hand the selection to an external drag helper. `D` in Normal mode, or a
 /// mouse drag that leaves the terminal's business and enters the WM's.
 pub fn drag_out(app: &mut App) {
-    let paths = app.pane().selected_paths();
+    let paths = ops::normalize_operands(app.pane().selected_paths());
     if paths.is_empty() {
         return;
     }

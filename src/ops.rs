@@ -13,6 +13,23 @@ use std::thread;
 use crate::config;
 use crate::fs::{Entry, Kind};
 
+/// Remove duplicate operands and descendants already covered by an earlier
+/// ancestor. Recursive filesystem operations must act on each tree only once.
+pub fn normalize_operands(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut normalized = Vec::with_capacity(paths.len());
+    for path in paths {
+        if normalized
+            .iter()
+            .any(|ancestor: &PathBuf| path.starts_with(ancestor))
+        {
+            continue;
+        }
+        normalized.retain(|descendant| !descendant.starts_with(&path));
+        normalized.push(path);
+    }
+    normalized
+}
+
 // ---------------------------------------------------------------------------
 // Clipboard
 // ---------------------------------------------------------------------------
@@ -447,7 +464,7 @@ impl TrashOutcome {
 pub fn trash(paths: &[PathBuf]) -> TrashOutcome {
     let _guard = trash_lock();
     let mut outcome = TrashOutcome::default();
-    for path in paths {
+    for path in normalize_operands(paths.to_vec()) {
         let before = trash::os_limited::list()
             .map(|items| {
                 items
@@ -456,7 +473,7 @@ pub fn trash(paths: &[PathBuf]) -> TrashOutcome {
                     .collect::<std::collections::HashSet<_>>()
             })
             .unwrap_or_default();
-        if let Err(error) = trash::delete(path) {
+        if let Err(error) = trash::delete(&path) {
             outcome.failed.push(ItemFailure {
                 path: path.clone(),
                 message: trash_error(error),
@@ -465,7 +482,7 @@ pub fn trash(paths: &[PathBuf]) -> TrashOutcome {
         }
         let found = trash::os_limited::list().ok().and_then(|items| {
             items.into_iter().find(|item| {
-                !before.contains(&item.id) && item.original_parent.join(&item.name) == *path
+                !before.contains(&item.id) && item.original_parent.join(&item.name) == path
             })
         });
         match found {
@@ -797,6 +814,7 @@ pub enum TransferKind {
 /// Start a copy or move in the background. Returns immediately.
 pub fn start_transfer(sources: Vec<PathBuf>, dest: PathBuf, kind: TransferKind) -> Progress {
     debug_assert!(kind != TransferKind::Restore);
+    let sources = normalize_operands(sources);
     let transfer_progress = new_progress(
         kind,
         format!(
@@ -1108,12 +1126,12 @@ pub struct DeleteOutcome {
 
 pub fn delete_permanently(paths: &[PathBuf]) -> DeleteOutcome {
     let mut outcome = DeleteOutcome::default();
-    for path in paths {
-        match remove_tree(path) {
+    for path in normalize_operands(paths.to_vec()) {
+        match remove_tree(&path) {
             Ok(()) => outcome.committed.push(path.clone()),
             Err(error) => outcome.failed.push(ItemFailure {
                 path: path.clone(),
-                message: format!("{}: {error}", file_name_of(path)),
+                message: format!("{}: {error}", file_name_of(&path)),
             }),
         }
     }
@@ -1174,6 +1192,22 @@ mod tests {
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir).unwrap();
         temp_dir
+    }
+
+    #[test]
+    fn recursive_operands_keep_only_the_outermost_selected_paths() {
+        let root = PathBuf::from("/tmp/tree");
+        let sibling = PathBuf::from("/tmp/sibling");
+        assert_eq!(
+            normalize_operands(vec![
+                root.join("child/grandchild"),
+                sibling.clone(),
+                root.join("child"),
+                root.clone(),
+                sibling.clone(),
+            ]),
+            vec![sibling, root]
+        );
     }
 
     #[test]

@@ -267,19 +267,20 @@ fn delete_motion(app: &mut App, key_event: KeyEvent, count_before_operator: usiz
 /// `count` rows from the cursor down. Every destructive action follows this
 /// rule.
 fn operand_paths(app: &App, count: usize) -> Vec<PathBuf> {
-    if app.pane().selected.is_empty() {
+    let paths = if app.pane().selected.is_empty() {
         let c = app.pane().cursor;
         app.pane().paths_in(c, c + count - 1)
     } else {
         app.pane().selected_paths()
-    }
+    };
+    ops::normalize_operands(paths)
 }
 
 /// Write live paths to the unnamed register and desktop clipboard through one
 /// transaction. An empty request is rejected so a failed yank cannot erase an
 /// existing register. A visual range is consumed only after the write commits.
 fn write_live_register(app: &mut App, cut: bool, verb: &str, empty_message: &str) {
-    let paths = app.pane().selected_paths();
+    let paths = ops::normalize_operands(app.pane().selected_paths());
     if paths.is_empty() {
         app.error(empty_message);
         return;
@@ -326,9 +327,8 @@ fn move_to_trash(app: &mut App, paths: Vec<PathBuf>) -> Vec<ops::TrashRef> {
     app.undo.push(ops::UndoOp::Trash {
         items: outcome.committed.clone(),
     });
-    app.pane_mut()
-        .selected
-        .retain(|path| !committed_paths.contains(path));
+    let pane_id = app.pane().id;
+    app.remove_operation_paths(pane_id, &committed_paths, true);
     app.refresh_in_place();
     if outcome.is_complete() {
         app.info(format!(
@@ -959,10 +959,13 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
         }
         Action::Rename => start_rename(app),
         Action::NewFolder => {
-            let parent = if app.pane().view == ViewMode::Compact {
+            let pane = app.pane();
+            let parent = if pane.view == ViewMode::Compact
+                || pane.current().is_some_and(|entry| !entry.path.is_dir())
+            {
                 current_folder_or_cwd(app)
             } else {
-                app.pane().cwd.clone()
+                pane.cwd.clone()
             };
             if let Some(intent) = creation_intent(app, parent) {
                 enter_text(app, Mode::NewFolder(intent), String::new());
@@ -1240,6 +1243,7 @@ fn paste_clipboard(app: &mut App) {
     if paths.is_empty() {
         paths = ops::import_uris();
     }
+    paths = ops::normalize_operands(paths);
     if paths.is_empty() {
         app.info("Clipboard is empty");
         return;
@@ -1571,9 +1575,8 @@ fn handle_confirm_key(app: &mut App, key_event: KeyEvent, pending_confirm: Confi
             let outcome = ops::delete_permanently(&paths);
             let committed: std::collections::HashSet<_> =
                 outcome.committed.iter().cloned().collect();
-            app.pane_mut()
-                .selected
-                .retain(|key| !committed.contains(key));
+            let pane_id = app.pane().id;
+            app.remove_operation_paths(pane_id, &committed, true);
             if !outcome.committed.is_empty() {
                 app.refresh_in_place();
             }
@@ -3309,6 +3312,50 @@ mod tests {
         handle_key_event(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.mode, Mode::Normal);
         assert_eq!(current_focus_region(&app), FocusRegion::View(0));
+    }
+
+    #[test]
+    fn icons_new_folder_uses_expanded_child_containing_directory() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "dolvim-icons-new-folder-{}-{unique}",
+            std::process::id()
+        ));
+        let folder = root.join("folder");
+        let child = folder.join("child.txt");
+        let created = folder.join("nested");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(&child, b"child").unwrap();
+
+        let mut app = App::new(root.clone());
+        app.pane_mut().view = ViewMode::Icons;
+        app.pane_mut().expanded.insert(folder.clone());
+        app.pane_mut()
+            .set_entries(crate::fs::read_dir(&root, 0).unwrap());
+        let cursor = app
+            .pane()
+            .visible
+            .iter()
+            .position(|&i| app.pane().entries[i].path == child)
+            .unwrap();
+        app.pane_mut().cursor = cursor;
+
+        press_char(&mut app, 'O');
+        assert!(matches!(
+            &app.mode,
+            Mode::NewFolder(intent) if intent.directory == folder
+        ));
+        for character in "nested".chars() {
+            press_char(&mut app, character);
+        }
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(created.is_dir());
+        assert!(!root.join("nested").exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

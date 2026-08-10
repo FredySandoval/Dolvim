@@ -451,7 +451,11 @@ fn finish_transfer(app: &mut App) {
                 .map_or_else(|| effect.source.clone(), ops::TrashRef::selection_key)
         })
         .collect();
-    app.remove_selection_keys(selection_pane_id, &committed_selection_keys);
+    app.remove_operation_paths(
+        selection_pane_id,
+        &committed_selection_keys,
+        progress.kind == ops::TransferKind::Move,
+    );
 
     let committed = outcome.committed.len();
     let failed = outcome.failed.len();
