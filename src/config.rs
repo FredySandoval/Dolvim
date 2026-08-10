@@ -83,7 +83,10 @@ pub const TICK_MS             :  u64 =   40; /* event loop tick; listing/thumbna
 pub const DRAG_THRESHOLD      :  u16 =    1; /* cells of movement before a drag begins          */
 
 /* MIME types without an OS association that should use the editor role */
-pub const EDITOR_MIME_TYPES   :&[&str] = &["application/javascript", "application/json", "application/sql", "application/toml", "application/xml", "application/x-perl", "application/x-shellscript", "application/x-yaml", "application/yaml", "inode/x-empty"];
+pub const EDITOR_MIME_TYPES   :&[&str] = &[
+    "application/javascript", "application/json"         , "application/sql"   , "application/toml", "application/xml", 
+    "application/x-perl"    , "application/x-shellscript", "application/x-yaml", "application/yaml", "inode/x-empty"
+];
 pub const EDITOR_MIME_SUFFIXES:&[&str] = &["+json", "+xml"];
 
 /* thumbnails and file view */
@@ -168,28 +171,29 @@ const CTRL      : KeyModifiers = KeyModifiers::CONTROL;
 const SHIFT     : KeyModifiers = KeyModifiers::SHIFT;
 const CTRL_SHIFT: KeyModifiers = KeyModifiers::CONTROL.union(KeyModifiers::SHIFT);
 
-const NORMAL      : BindMode = BindMode::Normal;
-const VISUAL      : BindMode = BindMode::Visual;
-const VISUAL_LINE : BindMode = BindMode::VisualLine;
-const VISUAL_BLOCK: BindMode = BindMode::VisualBlock;
+const NORMAL      : BindMode   = BindMode::Normal;
+const VISUAL      : BindMode   = BindMode::Visual;
+const VISUAL_LINE : BindMode   = BindMode::VisualLine;
+const VISUAL_BLOCK: BindMode   = BindMode::VisualBlock;
 const VIEW_MODES  :&[BindMode] = &[NORMAL, VISUAL, VISUAL_LINE, VISUAL_BLOCK];
 const VISUAL_MODES:&[BindMode] = &[VISUAL, VISUAL_LINE, VISUAL_BLOCK];
-const PLACES      : BindMode = BindMode::Places;
-const TABS        : BindMode = BindMode::Tabs;
-const COMMAND     : BindMode = BindMode::Command;
-const SEARCH      : BindMode = BindMode::Search;
-const FILTER      : BindMode = BindMode::Filter;
-const PATH_EDIT   : BindMode = BindMode::PathEdit;
-const RENAME      : BindMode = BindMode::Rename;
-const BATCH_RENAME: BindMode = BindMode::BatchRename;
-const NEW_FOLDER  : BindMode = BindMode::NewFolder;
-const NEW_FILE    : BindMode = BindMode::NewFile;
-const CONFIRM     : BindMode = BindMode::Confirm;
-const PROPERTIES  : BindMode = BindMode::Properties;
-const HELP        : BindMode = BindMode::Help;
-const CRUMB_MENU  : BindMode = BindMode::CrumbMenu;
-const BUTTONS     : BindMode = BindMode::Buttons;
-const MENU        : BindMode = BindMode::Menu;
+const TEXT_ENTRY  :&[BindMode] = &[COMMAND, SEARCH, FILTER, PATH_EDIT, RENAME, BATCH_RENAME, NEW_FOLDER, NEW_FILE];
+const PLACES      : BindMode   = BindMode::Places;
+const TABS        : BindMode   = BindMode::Tabs;
+const COMMAND     : BindMode   = BindMode::Command;
+const SEARCH      : BindMode   = BindMode::Search;
+const FILTER      : BindMode   = BindMode::Filter;
+const PATH_EDIT   : BindMode   = BindMode::PathEdit;
+const RENAME      : BindMode   = BindMode::Rename;
+const BATCH_RENAME: BindMode   = BindMode::BatchRename;
+const NEW_FOLDER  : BindMode   = BindMode::NewFolder;
+const NEW_FILE    : BindMode   = BindMode::NewFile;
+const CONFIRM     : BindMode   = BindMode::Confirm;
+const PROPERTIES  : BindMode   = BindMode::Properties;
+const HELP        : BindMode   = BindMode::Help;
+const CRUMB_MENU  : BindMode   = BindMode::CrumbMenu;
+const BUTTONS     : BindMode   = BindMode::Buttons;
+const MENU        : BindMode   = BindMode::Menu;
 
 /* Unified mode-aware keybindings. Origins are comments, not precedence. */
 pub const KEY_BINDINGS: &[Bind] = &[
@@ -272,7 +276,7 @@ pub const KEY_BINDINGS: &[Bind] = &[
     bind(CTRL      , Char('q')   , VIEW_MODES   , Action::QuitAll         ),
 
     /* Vim-like bindings */
-    /* modifier   key           modes                                   action                   */
+    /* modifier        key           modes                   action */
     bind(NONE      , Char('h')   , VIEW_MODES         , Action::MoveLeft       ),
     bind(NONE      , Char('j')   , VIEW_MODES         , Action::MoveDown       ),
     bind(NONE      , Char('k')   , VIEW_MODES         , Action::MoveUp         ),
@@ -288,9 +292,9 @@ pub const KEY_BINDINGS: &[Bind] = &[
     bind(NONE      , Char('$')   , VIEW_MODES         , Action::RowEnd         ),
     bind(NONE      , Char('v')   , VIEW_MODES         , Action::EnterVisual    ),
     bind(SHIFT     , Char('V')   , VIEW_MODES         , Action::EnterVisualLine),
-    bind(NONE      , Char('y')   , VISUAL_MODES                 , Action::Yank           ),
-    bind(NONE      , Char('d')   , &[NORMAL]                              , Action::DeleteOp       ),
-    bind(NONE      , Char('d')   , VISUAL_MODES                 , Action::DeleteSelection),
+    bind(NONE      , Char('y')   , VISUAL_MODES       , Action::Yank           ),
+    bind(NONE      , Char('d')   , &[NORMAL]          , Action::DeleteOp       ),
+    bind(NONE      , Char('d')   , VISUAL_MODES       , Action::DeleteSelection),
     bind(NONE      , Char('p')   , VIEW_MODES         , Action::Paste          ),
     bind(NONE      , Char('x')   , VIEW_MODES         , Action::Trash          ),
     bind(NONE      , Char('o')   , VIEW_MODES         , Action::NewFile        ),
@@ -309,17 +313,17 @@ pub const KEY_BINDINGS: &[Bind] = &[
     bind(CTRL      , Char('k')   , VIEW_MODES         , Action::Focus(Direction::Up)   ),
 
     /* Text-entry bindings */
-    bind(NONE      , Esc         , &[COMMAND, SEARCH, FILTER, PATH_EDIT, RENAME, BATCH_RENAME, NEW_FOLDER, NEW_FILE]   , Action::Cancel         ),
-    bind(NONE      , Enter       , &[COMMAND, SEARCH, FILTER, PATH_EDIT, RENAME, BATCH_RENAME, NEW_FOLDER, NEW_FILE]   , Action::CommitInput    ),
-    bind(NONE      , Backspace   , &[COMMAND, SEARCH, FILTER, PATH_EDIT, RENAME, BATCH_RENAME, NEW_FOLDER, NEW_FILE]   , Action::InputBackspace ),
-    bind(NONE      , Delete      , &[COMMAND, SEARCH, FILTER, PATH_EDIT, RENAME, BATCH_RENAME, NEW_FOLDER, NEW_FILE]   , Action::InputDelete    ),
-    bind(NONE      , Left        , &[COMMAND, SEARCH, FILTER, PATH_EDIT, RENAME, BATCH_RENAME, NEW_FOLDER, NEW_FILE]   , Action::InputLeft      ),
-    bind(NONE      , Right       , &[COMMAND, SEARCH, FILTER, PATH_EDIT, RENAME, BATCH_RENAME, NEW_FOLDER, NEW_FILE]   , Action::InputRight     ),
-    bind(NONE      , Home        , &[COMMAND, SEARCH, FILTER, PATH_EDIT, RENAME, BATCH_RENAME, NEW_FOLDER, NEW_FILE]   , Action::InputHome      ),
-    bind(NONE      , End         , &[COMMAND, SEARCH, FILTER, PATH_EDIT, RENAME, BATCH_RENAME, NEW_FOLDER, NEW_FILE]   , Action::InputEnd       ),
-    bind(CTRL      , Char('u')   , &[COMMAND, SEARCH, FILTER, PATH_EDIT, RENAME, BATCH_RENAME, NEW_FOLDER, NEW_FILE]   , Action::InputClear     ),
-    bind(CTRL      , Char('w')   , &[COMMAND, SEARCH, FILTER, PATH_EDIT, RENAME, BATCH_RENAME, NEW_FOLDER, NEW_FILE]   , Action::InputDeleteWord),
-    bind(NONE      , Tab         , &[PATH_EDIT]                                                                        , Action::CompletePath   ),
+    bind(NONE      , Esc         , TEXT_ENTRY   , Action::Cancel         ),
+    bind(NONE      , Enter       , TEXT_ENTRY   , Action::CommitInput    ),
+    bind(NONE      , Backspace   , TEXT_ENTRY   , Action::InputBackspace ),
+    bind(NONE      , Delete      , TEXT_ENTRY   , Action::InputDelete    ),
+    bind(NONE      , Left        , TEXT_ENTRY   , Action::InputLeft      ),
+    bind(NONE      , Right       , TEXT_ENTRY   , Action::InputRight     ),
+    bind(NONE      , Home        , TEXT_ENTRY   , Action::InputHome      ),
+    bind(NONE      , End         , TEXT_ENTRY   , Action::InputEnd       ),
+    bind(CTRL      , Char('u')   , TEXT_ENTRY   , Action::InputClear     ),
+    bind(CTRL      , Char('w')   , TEXT_ENTRY   , Action::InputDeleteWord),
+    bind(NONE      , Tab         , &[PATH_EDIT] , Action::CompletePath   ),
 
     /* Confirmation and overlay bindings */
     bind(NONE      , Char('y')   , &[CONFIRM]                      , Action::ConfirmAccept),
@@ -368,23 +372,23 @@ pub const RIGHT_BUTTONS: &[Action] = &[
 
 /* chord keybindings */
 pub const CHORDS: &[Chord] = &[
-     /* leader  follower  modes                              action               */
-    chord('g'  , 'g'     , VIEW_MODES  , Action::Top         ),
-    chord('g'  , 'h'     , VIEW_MODES  , Action::GoHome      ),
-    chord('g'  , 't'     , VIEW_MODES  , Action::NextTab     ),
-    chord('g'  , 'T'     , VIEW_MODES  , Action::PrevTab     ),
-    chord('g'  , 'u'     , VIEW_MODES  , Action::GoUp        ),
-    chord('z'  , 'c'     , VIEW_MODES  , Action::CloseFold          ),
-    chord('z'  , 'o'     , VIEW_MODES  , Action::OpenFold           ),
-    chord('z'  , 'a'     , VIEW_MODES  , Action::ToggleExpand       ),
-    chord('z'  , 'C'     , VIEW_MODES  , Action::CloseFoldRecursive ),
-    chord('z'  , 'O'     , VIEW_MODES  , Action::OpenFoldRecursive  ),
-    chord('z'  , 'M'     , VIEW_MODES  , Action::CloseAllFolds      ),
-    chord('z'  , 'R'     , VIEW_MODES  , Action::OpenAllFolds       ),
-    chord('z'  , 'v'     , VIEW_MODES  , Action::CycleView          ),
-    chord('c'  , 'w'     , VIEW_MODES  , Action::Rename      ),
+     /* leader  follower      modes          action               */
+    chord('g'  , 'g'     , VIEW_MODES  , Action::Top               ),
+    chord('g'  , 'h'     , VIEW_MODES  , Action::GoHome            ),
+    chord('g'  , 't'     , VIEW_MODES  , Action::NextTab           ),
+    chord('g'  , 'T'     , VIEW_MODES  , Action::PrevTab           ),
+    chord('g'  , 'u'     , VIEW_MODES  , Action::GoUp              ),
+    chord('z'  , 'c'     , VIEW_MODES  , Action::CloseFold         ),
+    chord('z'  , 'o'     , VIEW_MODES  , Action::OpenFold          ),
+    chord('z'  , 'a'     , VIEW_MODES  , Action::ToggleExpand      ),
+    chord('z'  , 'C'     , VIEW_MODES  , Action::CloseFoldRecursive),
+    chord('z'  , 'O'     , VIEW_MODES  , Action::OpenFoldRecursive ),
+    chord('z'  , 'M'     , VIEW_MODES  , Action::CloseAllFolds     ),
+    chord('z'  , 'R'     , VIEW_MODES  , Action::OpenAllFolds      ),
+    chord('z'  , 'v'     , VIEW_MODES  , Action::CycleView         ),
+    chord('c'  , 'w'     , VIEW_MODES  , Action::Rename            ),
     /* Space leader; selection moved to `v` */
-    chord(' '  , 'h'     , VIEW_MODES  , Action::ToggleHidden),
+    chord(' '  , 'h'     , VIEW_MODES  , Action::ToggleHidden      ),
 ];
 
 /* sanity tests */
