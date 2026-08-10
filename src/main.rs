@@ -9,6 +9,7 @@ mod config;
 mod drag;
 mod fs;
 mod mouse;
+mod observer;
 mod open;
 mod ops;
 mod places;
@@ -36,24 +37,136 @@ use ratatui::Terminal;
 
 use app::{App, Suspend};
 
-fn main() {
-    let start_dir = match std::env::args().nth(1) {
-        Some(first_arg) if first_arg == "-h" || first_arg == "--help" => {
-            println!(
-                "usage: dolvim [DIR]\n\nKDE Dolphin, in the terminal. Press F1 inside for keys."
-            );
-            return;
+#[derive(Debug, PartialEq, Eq)]
+struct Cli {
+    start_dir: Option<PathBuf>,
+    observe_path: Option<PathBuf>,
+    help: bool,
+}
+
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
+    let mut start_dir = None;
+    let mut observe_path = None;
+    let mut help = false;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => help = true,
+            "--test-observe" => {
+                if observe_path.is_some() {
+                    return Err("--test-observe may only be supplied once".into());
+                }
+                let path = args
+                    .next()
+                    .ok_or_else(|| "--test-observe requires a JSONL path".to_string())?;
+                if path.starts_with('-') {
+                    return Err("--test-observe requires a JSONL path".into());
+                }
+                observe_path = Some(PathBuf::from(path));
+            }
+            _ if arg.starts_with('-') => return Err(format!("unknown option: {arg}")),
+            _ if start_dir.is_some() => return Err("more than one start directory supplied".into()),
+            _ => start_dir = Some(PathBuf::from(arg)),
         }
-        Some(first_arg) => PathBuf::from(first_arg),
-        None => std::env::current_dir().unwrap_or_else(|_| places::home()),
+    }
+    if help && (start_dir.is_some() || observe_path.is_some()) {
+        return Err("--help cannot be combined with other arguments".into());
+    }
+    Ok(Cli {
+        start_dir,
+        observe_path,
+        help,
+    })
+}
+
+fn observation_path_inside_root(
+    path: &std::path::Path,
+    root: &std::path::Path,
+) -> io::Result<bool> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
     };
+    let resolved = if absolute.exists() {
+        absolute.canonicalize()?
+    } else {
+        let parent = absolute.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "observation path has no parent",
+            )
+        })?;
+        let name = absolute.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "observation path has no file name",
+            )
+        })?;
+        parent.canonicalize()?.join(name)
+    };
+    Ok(resolved.starts_with(root))
+}
+
+fn print_help() {
+    println!("usage: dolvim [DIR]\n       dolvim --test-observe PATH [DIR]\n\nKDE Dolphin, in the terminal. Press F1 inside for keys.\n\nTesting:\n  --test-observe PATH  append schema-v1 behavioral events to PATH");
+}
+
+fn main() {
+    let cli = match parse_args(std::env::args().skip(1)) {
+        Ok(cli) => cli,
+        Err(error) => {
+            eprintln!("dolvim: {error}\nTry 'dolvim --help' for usage.");
+            std::process::exit(2);
+        }
+    };
+    if cli.help {
+        print_help();
+        return;
+    }
+    let start_dir = cli
+        .start_dir
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| places::home()));
     if !start_dir.is_dir() {
         eprintln!("dolvim: {}: not a directory", start_dir.display());
         std::process::exit(1);
     }
     let start_dir = start_dir.canonicalize().unwrap_or(start_dir);
-
-    if let Err(run_error) = run(start_dir) {
+    // The observation file is opened before raw mode. Setup errors are therefore
+    // ordinary CLI errors and cannot strand the user's terminal.
+    let observer = match cli.observe_path {
+        Some(path) => {
+            match observation_path_inside_root(&path, &start_dir) {
+                Ok(true) => {
+                    eprintln!(
+                        "dolvim: observation file must be outside the start directory: {}",
+                        path.display()
+                    );
+                    std::process::exit(1);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!(
+                        "dolvim: cannot resolve observation file {}: {error}",
+                        path.display()
+                    );
+                    std::process::exit(1);
+                }
+            }
+            match observer::Observer::open(&path, start_dir.clone()) {
+                Ok(observer) => Some(observer),
+                Err(error) => {
+                    eprintln!(
+                        "dolvim: cannot open observation file {}: {error}",
+                        path.display()
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+        None => None,
+    };
+    if let Err(run_error) = run(start_dir, observer) {
         restore_terminal();
         eprintln!("dolvim: {run_error}");
         std::process::exit(1);
@@ -110,7 +223,7 @@ fn restore_terminal() {
     let _ = io::stdout().flush();
 }
 
-fn run(start: PathBuf) -> io::Result<()> {
+fn run(start: PathBuf, mut observer: Option<observer::Observer>) -> io::Result<()> {
     // A panic must not leave the user in a raw-mode alternate screen with no
     // echo. Restore first, then let the default hook print its report.
     let default_hook = std::panic::take_hook();
@@ -121,27 +234,55 @@ fn run(start: PathBuf) -> io::Result<()> {
 
     let mut terminal = setup_terminal()?;
     let mut app = App::new(start);
+    if observer.is_some() {
+        app.enable_observation();
+    }
+    let initial_area = terminal.size()?;
+    if let Some(observer) = &mut observer {
+        observer.started(initial_area.width, initial_area.height)?;
+        observer.observe_state(&app)?;
+    }
     let poll_timeout = Duration::from_millis(config::TICK_MS);
 
     while !app.quit {
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
+        let area = terminal.size()?;
+        if let Some(observer) = &mut observer {
+            observer.rendered(area.width, area.height)?;
+        }
 
         if event::poll(poll_timeout)? {
             match event::read()? {
                 Event::Key(key_event) if key_event.kind != KeyEventKind::Release => {
+                    if let Some(observer) = &mut observer {
+                        observer.input_key(key_event)?;
+                    }
                     app.status.clear();
                     app.status_is_error = false;
                     vim::handle_key_event(&mut app, key_event);
                 }
-                Event::Mouse(mouse_event) => mouse::handle_mouse_event(&mut app, mouse_event),
+                Event::Mouse(mouse_event) => {
+                    if let Some(observer) = &mut observer {
+                        observer.input_mouse(mouse_event)?;
+                    }
+                    mouse::handle_mouse_event(&mut app, mouse_event)
+                }
                 _ => {}
             }
         }
 
+        drain_observations(&mut app, observer.as_mut())?;
         app.pump_fs_events();
         app.pump_external_launches();
         app.thumbs.pump_decoded_thumbs();
         finish_transfer(&mut app);
+        if let Some(observer) = &mut observer {
+            observer.observe_state(&app)?;
+        }
+        drain_observations(&mut app, observer.as_mut())?;
+        if let Some(observer) = &mut observer {
+            observer.maybe_idle(&app, event::poll(Duration::ZERO)?)?;
+        }
 
         if let Some(suspend_request) = app.suspend.take() {
             let open_result = hand_over(&mut terminal, || match suspend_request {
@@ -160,7 +301,38 @@ fn run(start: PathBuf) -> io::Result<()> {
         }
     }
 
+    if let Some(observer) = &mut observer {
+        observer.exiting("quit")?;
+    }
     restore_terminal();
+    Ok(())
+}
+
+fn drain_observations(app: &mut App, observer: Option<&mut observer::Observer>) -> io::Result<()> {
+    let events = app.take_observation_events();
+    let Some(observer) = observer else {
+        return Ok(());
+    };
+    for event in events {
+        match event {
+            app::Observation::PasteCommand {
+                sources,
+                destination,
+            } => observer.paste_command(app, &sources, &destination)?,
+            app::Observation::OperationStarted {
+                id,
+                action,
+                destination,
+                item_count,
+            } => observer.operation_started(id, action, &destination, item_count)?,
+            app::Observation::OperationFinished {
+                id,
+                committed,
+                failed,
+                cancelled,
+            } => observer.operation_finished(id, committed, failed, cancelled)?,
+        }
+    }
     Ok(())
 }
 
@@ -283,6 +455,9 @@ fn finish_transfer(app: &mut App) {
 
     let committed = outcome.committed.len();
     let failed = outcome.failed.len();
+    if let Some(id) = active_transfer.observation_id {
+        app.observation_events_finished(id, committed, failed, outcome.cancelled);
+    }
     if failed > 0 || outcome.cancelled {
         app.error(format!(
             "{} — {committed} committed, {failed} failed{}",
@@ -325,4 +500,43 @@ fn hand_over<T>(
     enter_raw_screen()?;
     terminal.clear()?;
     Ok(result)
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    fn parse(args: &[&str]) -> Result<Cli, String> {
+        parse_args(args.iter().map(|s| s.to_string()))
+    }
+    #[test]
+    fn parses_observer_and_directory() {
+        let cli = parse(&["--test-observe", "/tmp/e.jsonl", "/tmp/root"]).unwrap();
+        assert_eq!(cli.observe_path, Some(PathBuf::from("/tmp/e.jsonl")));
+    }
+    #[test]
+    fn rejects_bad_arguments() {
+        assert!(parse(&["--test-observe"]).is_err());
+        assert!(parse(&["--test-observe", "a", "--test-observe", "b"]).is_err());
+        assert!(parse(&["--wat"]).is_err());
+        assert!(parse(&["a", "b"]).is_err());
+    }
+
+    #[test]
+    fn observation_file_must_be_outside_start_root_even_before_creation() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "dolvim-observation-path-{}-{unique}",
+            std::process::id()
+        ));
+        let root = base.join("fixture");
+        let artifacts = base.join("artifacts");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&artifacts).unwrap();
+        assert!(observation_path_inside_root(&root.join("events.jsonl"), &root).unwrap());
+        assert!(!observation_path_inside_root(&artifacts.join("events.jsonl"), &root).unwrap());
+        std::fs::remove_dir_all(base).unwrap();
+    }
 }

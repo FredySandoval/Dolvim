@@ -91,6 +91,7 @@ pub struct RevealIntent {
 /// pane, destination, and reveal policy belong to the operation.
 pub struct ActiveTransfer {
     pub progress: Progress,
+    pub observation_id: Option<u64>,
     pub reveal: Option<RevealIntent>,
     /// Pane whose selection produced the operation. This is deliberately not
     /// derived from `reveal`: a split-pane drag starts in one pane and is
@@ -659,6 +660,26 @@ pub struct Drag {
     pub started: bool,
 }
 
+#[derive(Clone, Debug)]
+pub enum Observation {
+    PasteCommand {
+        sources: Vec<PathBuf>,
+        destination: PathBuf,
+    },
+    OperationStarted {
+        id: u64,
+        action: &'static str,
+        destination: PathBuf,
+        item_count: usize,
+    },
+    OperationFinished {
+        id: u64,
+        committed: usize,
+        failed: usize,
+        cancelled: bool,
+    },
+}
+
 pub struct App {
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
@@ -711,6 +732,9 @@ pub struct App {
     watcher: Watcher,
     /// Directory listings cached per pane `seq` sequence number, keyed while streaming.
     streaming: HashMap<StreamKey, Vec<Entry>>,
+    observation_enabled: bool,
+    observation_events: Vec<Observation>,
+    next_operation_id: u64,
 }
 
 impl App {
@@ -757,9 +781,61 @@ impl App {
             listing_rx,
             watcher,
             streaming: HashMap::new(),
+            observation_enabled: false,
+            observation_events: Vec::new(),
+            next_operation_id: 1,
         };
         app.reload();
         app
+    }
+
+    pub fn enable_observation(&mut self) {
+        self.observation_enabled = true;
+    }
+
+    pub fn observe_paste(&mut self, sources: Vec<PathBuf>, destination: PathBuf) {
+        if self.observation_enabled {
+            self.observation_events.push(Observation::PasteCommand {
+                sources,
+                destination,
+            });
+        }
+    }
+
+    pub fn take_observation_events(&mut self) -> Vec<Observation> {
+        std::mem::take(&mut self.observation_events)
+    }
+
+    pub fn observation_events_finished(
+        &mut self,
+        id: u64,
+        committed: usize,
+        failed: usize,
+        cancelled: bool,
+    ) {
+        self.observation_events
+            .push(Observation::OperationFinished {
+                id,
+                committed,
+                failed,
+                cancelled,
+            });
+    }
+
+    pub fn pending_listings(&self) -> usize {
+        self.tabs
+            .iter()
+            .flat_map(|tab| &tab.panes)
+            .filter(|pane| pane.loading)
+            .count()
+    }
+
+    pub fn pending_refreshes(&self) -> usize {
+        self.tabs
+            .iter()
+            .flat_map(|tab| &tab.panes)
+            .filter(|pane| pane.pending_focus.is_some())
+            .count()
     }
 
     // -- accessors ---------------------------------------------------------
@@ -796,6 +872,37 @@ impl App {
         self.begin_transfer_from(progress, reveal, selection_pane_id);
     }
 
+    pub fn begin_observed_transfer(
+        &mut self,
+        progress: Progress,
+        reveal: Option<RevealIntent>,
+        destination: PathBuf,
+        item_count: usize,
+    ) {
+        let selection_pane_id = self.pane().id;
+        let id = self.next_operation_id;
+        self.next_operation_id += 1;
+        let action = match progress.kind {
+            ops::TransferKind::Copy => "copy",
+            ops::TransferKind::Move => "move",
+            ops::TransferKind::Restore => "restore",
+        };
+        if self.observation_enabled {
+            self.observation_events.push(Observation::OperationStarted {
+                id,
+                action,
+                destination,
+                item_count,
+            });
+        }
+        self.active_transfer = Some(ActiveTransfer {
+            progress,
+            observation_id: self.observation_enabled.then_some(id),
+            reveal,
+            selection_pane_id,
+        });
+    }
+
     /// Split-pane transfers have two owners: the source owns selection cleanup,
     /// while the destination owns refresh/reveal. Never reconstruct either from
     /// whichever pane happens to be active when the worker finishes.
@@ -808,6 +915,7 @@ impl App {
         debug_assert!(self.active_transfer.is_none());
         self.active_transfer = Some(ActiveTransfer {
             progress,
+            observation_id: None,
             reveal,
             selection_pane_id,
         });
@@ -1016,6 +1124,7 @@ impl App {
             .and_then(|pane| match &pane.target {
                 Target::Dir(directory) => {
                     pane.seq += 1;
+                    pane.loading = true;
                     Some((directory.clone(), pane.seq))
                 }
                 _ => None,
@@ -1031,6 +1140,7 @@ impl App {
         if let Target::Dir(d) = target {
             let seq = self.pane().seq + 1;
             self.pane_mut().seq = seq;
+            self.pane_mut().loading = true;
             self.lister.request(d, seq);
         } else {
             self.reload();

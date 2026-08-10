@@ -2,7 +2,7 @@
 //! a state change.
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1155,10 +1155,24 @@ fn enter_text(app: &mut App, mode: Mode, seed: String) {
 }
 
 fn current_folder_or_cwd(app: &App) -> PathBuf {
-    app.pane()
-        .current()
-        .filter(|entry| entry.path.is_dir())
-        .map_or_else(|| app.pane().cwd.clone(), |entry| entry.path.clone())
+    let pane = app.pane();
+    let Some(entry) = pane.current() else {
+        return pane.cwd.clone();
+    };
+    if entry.path.is_dir() {
+        return entry.path.clone();
+    }
+    // A non-root row in an expanded tree is displayed in its containing
+    // directory. That semantic context, not the view mode, owns creation and
+    // paste destination resolution.
+    if entry.depth > 0 {
+        return entry
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| pane.cwd.clone());
+    }
+    pane.cwd.clone()
 }
 
 fn creation_intent(app: &mut App, directory: PathBuf) -> Option<RevealIntent> {
@@ -1211,8 +1225,10 @@ fn paste_clipboard(app: &mut App) {
     // Deleted generations use the same background completion pipeline as live
     // copies: collision allocation, progress, cancellation and partial effects.
     if let ops::UnnamedRegister::Deleted { items } = app.register.clone() {
-        let progress = ops::start_restore(items, destination);
-        app.begin_transfer(progress, Some(reveal));
+        app.observe_paste(Vec::new(), destination.clone());
+        let item_count = items.len();
+        let progress = ops::start_restore(items, destination.clone());
+        app.begin_observed_transfer(progress, Some(reveal), destination, item_count);
         return;
     }
 
@@ -1233,9 +1249,11 @@ fn paste_clipboard(app: &mut App) {
     } else {
         ops::TransferKind::Copy
     };
-    let mut progress = ops::start_transfer(paths, destination, transfer_kind);
+    app.observe_paste(paths.clone(), destination.clone());
+    let item_count = paths.len();
+    let mut progress = ops::start_transfer(paths, destination.clone(), transfer_kind);
     progress.expected_register = Some(app.register.clone());
-    app.begin_transfer(progress, Some(reveal));
+    app.begin_observed_transfer(progress, Some(reveal), destination, item_count);
     // The completion reducer removes only committed move sources from a cut
     // register; failed and cancelled sources stay retryable.
 }
@@ -3291,5 +3309,32 @@ mod tests {
         handle_key_event(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.mode, Mode::Normal);
         assert_eq!(current_focus_region(&app), FocusRegion::View(0));
+    }
+
+    #[test]
+    fn expanded_child_uses_its_containing_directory_as_operation_context() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("dolvim-context-{}-{unique}", std::process::id()));
+        let folder = root.join("folder");
+        let child = folder.join("child.txt");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(&child, b"child").unwrap();
+        let mut app = App::new(root.clone());
+        app.pane_mut().expanded.insert(folder.clone());
+        app.pane_mut()
+            .set_entries(crate::fs::read_dir(&root, 0).unwrap());
+        let cursor = app
+            .pane()
+            .visible
+            .iter()
+            .position(|&i| app.pane().entries[i].path == child)
+            .unwrap();
+        app.pane_mut().cursor = cursor;
+        assert_eq!(current_folder_or_cwd(&app), folder);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
