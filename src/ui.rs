@@ -904,30 +904,48 @@ fn time_width(p: &crate::app::Pane) -> u16 {
 /// `modified_width` is passed rather than taken from config because the width a
 /// timestamp needs depends on the listing — see `time_width`.
 fn detail_columns(area: Rect, modified_width: u16) -> [Col; 4] {
-    let (size, kind) = (config::SIZE_WIDTH, config::TYPE_WIDTH);
-    let name = area
-        .width
-        .saturating_sub(config::VIEW_MARGIN + size + modified_width + kind + 3 * DETAIL_GAP)
-        .max(8);
+    let margin = config::VIEW_MARGIN.min(area.width);
+    let gap = if area.width.saturating_sub(margin) >= 3 {
+        DETAIL_GAP
+    } else {
+        0
+    };
+    let available = area.width.saturating_sub(margin + 3 * gap);
+    let preferred = [8, config::SIZE_WIDTH, modified_width, config::TYPE_WIDTH];
+    let mut widths = [0; 4];
+
+    // Details may share a narrow body with a second pane and the information
+    // panel. Every column must therefore be derived from the pane's rectangle;
+    // forcing Name to eight cells after allocating the fixed columns lets the
+    // row escape its pane and overwrite its neighbours.
+    let mut remaining = available;
+    for (width, minimum) in widths.iter_mut().zip([8, 1, 1, 1]) {
+        *width = minimum.min(remaining);
+        remaining -= *width;
+    }
+    for i in [1, 2, 3, 0] {
+        let extra = remaining.min(preferred[i].saturating_sub(widths[i]));
+        widths[i] += extra;
+        remaining -= extra;
+    }
+    widths[0] += remaining;
 
     let mut cols = [Col {
         x: 0,
         width: 0,
         right_aligned: false,
     }; 4];
-    let mut x = area.x + config::VIEW_MARGIN;
-    for (col, (width, right_aligned)) in cols.iter_mut().zip([
-        (name, false),
-        (size, true),
-        (modified_width, true),
-        (kind, false),
-    ]) {
+    let mut x = area.x + margin;
+    for (col, (width, right_aligned)) in cols
+        .iter_mut()
+        .zip(widths.into_iter().zip([false, true, true, false]))
+    {
         *col = Col {
             x,
             width,
             right_aligned,
         };
-        x += width + DETAIL_GAP;
+        x += width + gap;
     }
     cols
 }
@@ -1445,7 +1463,7 @@ fn overlays(frame: &mut Frame, app: &mut App, area: Rect) {
                 labelled_row("Full path", &e.path.display().to_string()),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "any key to close",
+                    "Esc / q to close",
                     Style::default().fg(config::THEME.view.secondary),
                 )),
             ];
@@ -1955,6 +1973,23 @@ mod tests {
     }
 
     #[test]
+    fn detail_columns_never_escape_their_pane() {
+        for width in 0..100 {
+            let area = Rect::new(7, 0, width, 10);
+            let columns = detail_columns(area, config::TIME_WIDTH);
+            let right = columns
+                .last()
+                .map(|column| column.x + column.width)
+                .unwrap();
+            assert!(
+                right <= area.right(),
+                "width {width} escaped by {}",
+                right - area.right()
+            );
+        }
+    }
+
+    #[test]
     fn compact_entries_include_their_tree_depth() {
         let entry = fs::Entry {
             name: "child.txt".into(),
@@ -2009,15 +2044,11 @@ mod tests {
         for pane_width in [10u16, 40, 80, 200] {
             let area = Rect::new(3, 0, pane_width, 1);
             let columns = detail_columns(area, config::TIME_WIDTH);
-            assert!(columns[0].width >= 8);
-            assert_eq!(columns[0].x, area.x + config::VIEW_MARGIN);
+            assert_eq!(columns[0].x, area.x + config::VIEW_MARGIN.min(pane_width));
             for pair in columns.windows(2) {
-                assert_eq!(pair[1].x, pair[0].x + pair[0].width + DETAIL_GAP);
+                assert!(pair[1].x >= pair[0].x + pair[0].width);
             }
-            // Only a pane too narrow to hold the fixed columns may overflow.
-            if pane_width >= 200 {
-                assert!(columns[3].x + columns[3].width <= area.right());
-            }
+            assert!(columns[3].x + columns[3].width <= area.right());
         }
     }
 

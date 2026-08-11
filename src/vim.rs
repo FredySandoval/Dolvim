@@ -870,7 +870,9 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
                 count as isize
             };
             if app.pane().view == ViewMode::Compact {
-                app.step_along(cursor_delta, extend);
+                // Dolphin continues at the top of the next column when Down
+                // passes the bottom; Compact's storage is already column-major.
+                app.move_cursor(cursor_delta, extend);
             } else {
                 app.step_across(cursor_delta, extend);
             }
@@ -2461,6 +2463,19 @@ mod tests {
             })
             .collect();
         app.pane_mut().visible = (0..names.len()).collect();
+    }
+
+    #[test]
+    fn compact_down_continues_into_the_next_column() {
+        let mut app = test_app();
+        install_test_entries(&mut app, &["a", "b", "c", "d"]);
+        app.pane_mut().view = ViewMode::Compact;
+        app.pane_mut().grid_rows = 3;
+        app.pane_mut().cursor = 2;
+
+        press_char(&mut app, 'j');
+
+        assert_eq!(app.pane().cursor, 3);
     }
 
     #[test]
