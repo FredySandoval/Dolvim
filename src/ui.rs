@@ -1485,7 +1485,7 @@ fn help_lines() -> Vec<Line<'static>> {
         key_row("Ctrl+T Ctrl+W gt gT", "new, close, next, previous"),
         key_row(":e :cd :sort :view", ":split :q :qa"),
         key_row("/  n  N", "search      Ctrl+k then the menu button"),
-        key_row("ma  'a", "mark this folder / go back to it"),
+        key_row("ma  'a", "mark this item / go back to it"),
     ]
 }
 

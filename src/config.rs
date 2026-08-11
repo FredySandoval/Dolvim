@@ -5,27 +5,35 @@ use ratatui::style::Color;
 
 use crate::fs::TimeStyle;
 
-/* colors: Breeze Light 24-bit samples; see docs/UI_SPEC.md */
+/* Set this to true and recompile to use the Breeze Dark palette. */
+pub const DARK_MODE: bool = false;
+
+/* Breeze 24-bit samples; see docs/UI_SPEC.md. */
 pub mod color {
-    use super::Color;
-    /*        name                           r    g    b       used for                        */
-    pub const TOOLBAR_BG:Color = Color::Rgb(244, 245, 246); /* toolbar, breadcrumb, tab strip  */
-    pub const PANEL_BG  :Color = Color::Rgb(239, 240, 241); /* Places and Information panels   */
-    pub const VIEW_BG   :Color = Color::Rgb(255, 255, 255); /* the file view itself            */
-    pub const HOVER     :Color = Color::Rgb(224, 239, 249); /* item under the active cursor    */
-    pub const SELECTION :Color = Color::Rgb(194, 224, 245); /* selected row / cell fill        */
-    pub const ACCENT    :Color = Color::Rgb( 61, 174, 233); /* focus bar, active tab underline */
-    pub const TEXT      :Color = Color::Rgb( 35,  38,  41); /* default foreground              */
-    pub const DIM       :Color = Color::Rgb(127, 140, 141); /* headings, disabled toolbar keys */
-    pub const SEPARATOR :Color = Color::Rgb(220, 220, 220); /* the 1 px splitter lines         */
-    pub const FOLDER    :Color = Color::Rgb( 61, 174, 233); /* directory entries               */
-    pub const FILE      :Color = Color::Rgb( 99, 104, 109); /* regular file entries            */
-    pub const SYMLINK   :Color = Color::Rgb( 26, 138, 190); /* symbolic links                  */
-    pub const EXEC      :Color = Color::Rgb( 58, 156,  74); /* executables                     */
-    pub const CUT       :Color = Color::Rgb(160, 165, 170); /* cut items, ghosted as in Dolphin*/
-    pub const ERROR     :Color = Color::Rgb(218,  68,  83); /* status bar errors               */
-    pub const GAUGE_FULL:Color = Color::Rgb(200, 205, 210); /* used part of a device capacity  */
-    pub const OFFLINE   :Color = Color::Rgb(246, 116,   0); /* unmounted device, locked folder */
+    use super::{Color, DARK_MODE};
+
+    const fn themed(light: Color, dark: Color) -> Color {
+        if DARK_MODE { dark } else { light }
+    }
+
+    /*        name                    Breeze Light                    Breeze Dark          used for                        */
+    pub const TOOLBAR_BG:Color = themed(Color::Rgb(244, 245, 246), Color::Rgb( 49,  54,  59)); /* toolbar, breadcrumb, tab strip  */
+    pub const PANEL_BG  :Color = themed(Color::Rgb(239, 240, 241), Color::Rgb( 35,  38,  41)); /* Places and Information panels   */
+    pub const VIEW_BG   :Color = themed(Color::Rgb(255, 255, 255), Color::Rgb( 27,  30,  32)); /* the file view itself            */
+    pub const HOVER     :Color = themed(Color::Rgb(224, 239, 249), Color::Rgb( 45,  64,  76)); /* item under the active cursor    */
+    pub const SELECTION :Color = themed(Color::Rgb(194, 224, 245), Color::Rgb( 61, 174, 233)); /* selected row / cell fill        */
+    pub const ACCENT    :Color = themed(Color::Rgb( 61, 174, 233), Color::Rgb( 61, 174, 233)); /* focus bar, active tab underline */
+    pub const TEXT      :Color = themed(Color::Rgb( 35,  38,  41), Color::Rgb(239, 240, 241)); /* default foreground              */
+    pub const DIM       :Color = themed(Color::Rgb(127, 140, 141), Color::Rgb(127, 140, 141)); /* headings, disabled toolbar keys */
+    pub const SEPARATOR :Color = themed(Color::Rgb(220, 220, 220), Color::Rgb( 77,  82,  87)); /* the 1 px splitter lines         */
+    pub const FOLDER    :Color = themed(Color::Rgb( 61, 174, 233), Color::Rgb( 61, 174, 233)); /* directory entries               */
+    pub const FILE      :Color = themed(Color::Rgb( 99, 104, 109), Color::Rgb(189, 195, 199)); /* regular file entries            */
+    pub const SYMLINK   :Color = themed(Color::Rgb( 26, 138, 190), Color::Rgb( 84, 160, 207)); /* symbolic links                  */
+    pub const EXEC      :Color = themed(Color::Rgb( 58, 156,  74), Color::Rgb( 39, 174,  96)); /* executables                     */
+    pub const CUT       :Color = themed(Color::Rgb(160, 165, 170), Color::Rgb(105, 110, 115)); /* cut items, ghosted as in Dolphin*/
+    pub const ERROR     :Color = themed(Color::Rgb(218,  68,  83), Color::Rgb(237,  91, 106)); /* status bar errors               */
+    pub const GAUGE_FULL:Color = themed(Color::Rgb(200, 205, 210), Color::Rgb( 77,  82,  87)); /* used part of a device capacity  */
+    pub const OFFLINE   :Color = themed(Color::Rgb(246, 116,   0), Color::Rgb(246, 116,   0)); /* unmounted device, locked folder */
 }
 
 /* icons / glyphs; private-use glyphs require a Nerd Font */

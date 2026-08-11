@@ -182,6 +182,36 @@ pub enum MarkPending {
     Jump,
 }
 
+/// A stable row to focus after a listing arrives. The path restores expanded
+/// tree context; the selection key distinguishes repeated Trash generations.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct EntryFocus {
+    pub path: PathBuf,
+    pub selection_key: PathBuf,
+    retry_missing: bool,
+}
+
+impl EntryFocus {
+    fn new(entry: &Entry) -> Self {
+        Self {
+            path: entry.path.clone(),
+            selection_key: entry.selection_key(),
+            retry_missing: false,
+        }
+    }
+
+    fn matches(&self, entry: &Entry) -> bool {
+        self.selection_key == entry.selection_key()
+    }
+}
+
+/// A browsable target together with the row under the cursor there.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Location {
+    pub target: Target,
+    pub focus: Option<EntryFocus>,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Confirm {
     DeletePermanently(Vec<PathBuf>),
@@ -209,8 +239,8 @@ pub struct Pane {
     pub show_hidden: bool,
     pub filter: String,
     pub expanded: HashSet<PathBuf>,
-    /// Path that an asynchronous refresh should place under the cursor.
-    pub pending_focus: Option<PathBuf>,
+    /// Stable row that an asynchronous refresh should place under the cursor.
+    pub pending_focus: Option<EntryFocus>,
     pub history: Vec<PathBuf>,
     pub history_pos: usize,
     pub seq: u64,
@@ -366,18 +396,21 @@ impl Pane {
     /// `refilter` — doing it in that order sends the cursor to a random file
     /// on every refresh.
     pub fn set_entries(&mut self, entries: Vec<Entry>) {
-        let keep = self.current().map(|entry| entry.path.clone());
+        let keep = self.current().map(EntryFocus::new);
         self.entries = entries;
         self.refilter_keeping(keep);
         let Some(wanted) = self.pending_focus.clone() else {
             return;
         };
-        let Some(created) = self.entries.iter().find(|entry| entry.path == wanted) else {
-            // A listing that raced the create must not consume the intent. The
-            // watcher-triggered listing that contains it will finish the job.
+        let Some(found) = self.entries.iter().find(|entry| wanted.matches(entry)) else {
+            // Creates may race their first listing; ordinary navigation must
+            // settle even when the remembered row was removed in the meantime.
+            if !wanted.retry_missing {
+                self.pending_focus = None;
+            }
             return;
         };
-        if created.hidden {
+        if found.hidden {
             self.show_hidden = true;
         }
         self.filter.clear();
@@ -388,17 +421,48 @@ impl Pane {
     /// Ask the next listing to focus a path that may not exist in the current
     /// snapshot yet, as after create or rename.
     pub fn focus_after_refresh(&mut self, path: PathBuf) {
-        self.pending_focus = Some(path);
+        self.pending_focus = Some(EntryFocus {
+            selection_key: path.clone(),
+            path,
+            retry_missing: true,
+        });
+    }
+
+    fn reveal_ancestors(&mut self, focus: &EntryFocus) {
+        let Some(mut ancestor) = focus.path.parent() else {
+            return;
+        };
+        while ancestor != self.cwd && ancestor.starts_with(&self.cwd) {
+            self.expanded.insert(ancestor.to_path_buf());
+            let Some(parent) = ancestor.parent() else {
+                break;
+            };
+            ancestor = parent;
+        }
+    }
+
+    fn focus_now(&mut self, focus: EntryFocus) {
+        self.reveal_ancestors(&focus);
+        self.filter.clear();
+        self.refilter_keeping(None);
+        if self
+            .entries
+            .iter()
+            .any(|entry| focus.matches(entry) && entry.hidden)
+        {
+            self.show_hidden = true;
+        }
+        self.refilter_keeping(Some(focus));
     }
 
     /// Recompute `visible` from `entries` honouring hidden, filter and sort,
     /// keeping the cursor on the same file where possible.
     pub fn refilter(&mut self) {
-        let keep = self.current().map(|e| e.path.clone());
+        let keep = self.current().map(EntryFocus::new);
         self.refilter_keeping(keep);
     }
 
-    fn refilter_keeping(&mut self, keep: Option<PathBuf>) {
+    fn refilter_keeping(&mut self, keep: Option<EntryFocus>) {
         // A worker listing contains roots only. Rebuild expanded descendants
         // from the durable path set before filtering; globally sorting the flat
         // tree would separate children from their parents.
@@ -412,10 +476,10 @@ impl Pane {
         self.entries = expanded_listing(roots, &self.expanded, self.sort);
         self.revisible();
         self.cursor = keep
-            .and_then(|p| {
+            .and_then(|wanted| {
                 self.visible
                     .iter()
-                    .position(|&entry_index| self.entries[entry_index].path == p)
+                    .position(|&entry_index| wanted.matches(&self.entries[entry_index]))
             })
             .unwrap_or_else(|| self.cursor.min(self.visible.len().saturating_sub(1)));
         self.clamp();
@@ -710,10 +774,9 @@ pub struct App {
     pub pending_delete: Option<String>,
     /// An `m` or `'` waiting for the letter that names the mark.
     pub pending_mark: Option<MarkPending>,
-    /// Vim's marks, at the granularity a file manager has: `ma` remembers where
-    /// you are, `'a` goes back. Kept for the session only, as vim's lowercase
-    /// marks are kept for the file.
-    pub marks: HashMap<char, Target>,
+    /// Vim's marks remember both the browsable target and its focused row.
+    /// Kept for the session only, as vim's lowercase marks are kept per file.
+    pub marks: HashMap<char, Location>,
     pub search_last: String,
     pub drag: Option<Drag>,
     pub hits: Hitboxes,
@@ -1160,7 +1223,28 @@ impl App {
 
     // -- navigation --------------------------------------------------------
 
+    pub fn location(&self) -> Location {
+        Location {
+            target: self.pane().target.clone(),
+            focus: self.pane().current().map(EntryFocus::new),
+        }
+    }
+
     pub fn goto(&mut self, target: Target, push_history: bool) {
+        self.goto_location(
+            Location {
+                target,
+                focus: None,
+            },
+            push_history,
+        );
+    }
+
+    /// Navigate and restore a stable row as one intent. Listings are
+    /// asynchronous, so the focus must be installed before requesting one.
+    pub fn goto_location(&mut self, location: Location, push_history: bool) {
+        let target = location.target;
+        let focus = location.focus;
         let cwd = match &target {
             Target::Dir(d) => d.clone(),
             Target::Trash => PathBuf::from("trash:/"),
@@ -1171,6 +1255,12 @@ impl App {
         if let Target::Dir(d) = &target {
             if !d.is_dir() {
                 self.error(format!("Not a directory: {}", d.display()));
+                return;
+            }
+        }
+        if self.pane().target == target {
+            if let Some(focus) = focus {
+                self.pane_mut().focus_now(focus);
                 return;
             }
         }
@@ -1188,6 +1278,12 @@ impl App {
             pane.selected.clear();
             pane.filter.clear();
             pane.expanded.clear();
+            if let Some(focus) = focus {
+                pane.reveal_ancestors(&focus);
+                pane.pending_focus = Some(focus);
+            } else {
+                pane.pending_focus = None;
+            }
         }
         if let Some(i) = places::index_of(&self.places, &target) {
             self.places_cursor = i;
@@ -1644,7 +1740,11 @@ impl App {
         };
         let pane = self.pane_mut();
         pane.expanded.remove(&containing_fold);
-        pane.refilter_keeping(Some(containing_fold));
+        pane.refilter_keeping(Some(EntryFocus {
+            selection_key: containing_fold.clone(),
+            path: containing_fold,
+            retry_missing: false,
+        }));
     }
 
     /// Open the folder under the cursor, optionally including every folder
@@ -1872,6 +1972,48 @@ mod tests {
         pane.focus_after_refresh(wanted.clone());
         pane.set_entries(entries_named(&["a", "b"]));
         assert_eq!(pane.current().map(|entry| &entry.path), Some(&wanted));
+        assert!(pane.pending_focus.is_none());
+    }
+
+    #[test]
+    fn a_location_focus_reopens_ancestors_and_finds_the_row() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("dolvim-mark-{unique}"));
+        let folder = base.join("folder");
+        let wanted = folder.join("wanted");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(&wanted, b"wanted").unwrap();
+
+        let mut pane = Pane::new(base.clone());
+        let focus = EntryFocus {
+            path: wanted.clone(),
+            selection_key: wanted.clone(),
+            retry_missing: false,
+        };
+        pane.reveal_ancestors(&focus);
+        pane.pending_focus = Some(focus);
+        pane.set_entries(fs::read_dir(&base, 0).unwrap());
+
+        assert!(pane.expanded.contains(&folder));
+        assert_eq!(pane.current().map(|entry| &entry.path), Some(&wanted));
+        assert!(pane.pending_focus.is_none());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_missing_location_focus_is_consumed_after_one_listing() {
+        let mut pane = pane_with(&["a"]);
+        pane.pending_focus = Some(EntryFocus {
+            path: PathBuf::from("/tmp/missing"),
+            selection_key: PathBuf::from("/tmp/missing"),
+            retry_missing: false,
+        });
+
+        pane.set_entries(entries_named(&["a"]));
+
         assert!(pane.pending_focus.is_none());
     }
 

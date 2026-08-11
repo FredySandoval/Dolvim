@@ -201,12 +201,12 @@ fn handle_normal_key(app: &mut App, key_event: KeyEvent) {
 fn mark_key(app: &mut App, pending_mark: MarkPending, letter: char) {
     match pending_mark {
         MarkPending::Set => {
-            let target = app.pane().target.clone();
-            app.marks.insert(letter, target);
+            let location = app.location();
+            app.marks.insert(letter, location);
             app.info(format!("Marked '{letter}"));
         }
         MarkPending::Jump => match app.marks.get(&letter).cloned() {
-            Some(target) => app.goto(target, true),
+            Some(location) => app.goto_location(location, true),
             None => app.error(format!("No mark '{letter}")),
         },
     }
@@ -2151,7 +2151,7 @@ mod tests {
     #[test]
     fn a_mark_is_written_and_read_by_its_letter() {
         let mut app = test_app();
-        let here = app.pane().target.clone();
+        let here = app.location();
         press_char(&mut app, 'm');
         assert_eq!(app.pending_mark, Some(MarkPending::Set));
         press_char(&mut app, 'd');
@@ -2162,7 +2162,23 @@ mod tests {
         app.goto(Target::Dir(std::path::PathBuf::from("/")), true);
         press_char(&mut app, '\'');
         press_char(&mut app, 'd');
-        assert_eq!(app.pane().target, here);
+        assert_eq!(app.pane().target, here.target);
+    }
+
+    #[test]
+    fn a_mark_restores_the_focused_file() {
+        let mut app = test_app();
+        install_test_entries(&mut app, &["a", "b", "c"]);
+        app.pane_mut().cursor = 1;
+        let marked = app.pane().current().unwrap().path.clone();
+
+        press_char(&mut app, 'm');
+        press_char(&mut app, 'a');
+        app.pane_mut().cursor = 2;
+        press_char(&mut app, '\'');
+        press_char(&mut app, 'a');
+
+        assert_eq!(app.pane().current().map(|entry| &entry.path), Some(&marked));
     }
 
     /// A letter no mark was written to reports rather than silently doing
