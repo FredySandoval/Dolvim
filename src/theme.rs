@@ -55,6 +55,7 @@ const fn rgb(hex: u32) -> Color {
     )
 }
 
+#[allow(dead_code)]
 pub const BREEZE_LIGHT: Theme = Theme {
     name: "Breeze Light",
     toolbar: Surface {

@@ -123,11 +123,7 @@ pub struct XdgDir {
 
 /* XDG key, display name, glyph */
 const fn xdg(env_key: &'static str, name: &'static str, glyph: &'static str) -> XdgDir {
-    XdgDir {
-        env_key,
-        name,
-        glyph,
-    }
+    XdgDir { env_key, name, glyph }
 }
 
 pub const XDG_DIRS: &[XdgDir] = &[
