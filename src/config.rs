@@ -5,7 +5,7 @@ use crate::fs::TimeStyle;
 use crate::theme::{self, Theme};
 
 /* Select a complete palette and recompile. */
-pub const THEME: &Theme = &theme::BREEZE_LIGHT;
+pub const THEME: &Theme = &theme::BREEZE_DARK;
 
 /* icons / glyphs; private-use glyphs require a Nerd Font */
 pub mod glyph {
