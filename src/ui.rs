@@ -12,14 +12,14 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Focus, MenuKind, Mode, Pane, ViewMode};
-use crate::config::{self, color};
+use crate::config;
 use crate::fs::{self, SortKey};
 use crate::places::Row;
 use crate::vim;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    paint(frame, area, color::VIEW_BG);
+    paint(frame, area, config::THEME.view.background);
 
     let filter = if app.filter_bar { 1 } else { 0 };
     let rows = Layout::default()
@@ -74,12 +74,14 @@ fn crumb_label(p: &Path) -> String {
 }
 
 fn toolbar(frame: &mut Frame, app: &mut App, area: Rect) {
-    paint(frame, area, color::TOOLBAR_BG);
+    paint(frame, area, config::THEME.toolbar.background);
     // Where the text cursor should end up, applied once the buffer borrow ends.
     let mut cursor: Option<(u16, u16)> = None;
     let buf = frame.buffer_mut();
-    let base = Style::default().bg(color::TOOLBAR_BG).fg(color::TEXT);
-    let dim = base.fg(color::DIM);
+    let base = Style::default()
+        .bg(config::THEME.toolbar.background)
+        .fg(config::THEME.toolbar.foreground);
+    let dim = base.fg(config::THEME.view.secondary);
     let p = app.pane();
     let can_back = p.history_pos > 0;
     let can_fwd = p.history_pos + 1 < p.history.len();
@@ -92,7 +94,7 @@ fn toolbar(frame: &mut Frame, app: &mut App, area: Rect) {
         _ => None,
     };
     let focused_style = |n: usize, st: Style| match focused {
-        Some(i) if i == n => st.bg(color::SELECTION),
+        Some(i) if i == n => st.bg(config::THEME.selection.background),
         _ => st,
     };
 
@@ -150,7 +152,7 @@ fn toolbar(frame: &mut Frame, app: &mut App, area: Rect) {
             crumb_area.x,
             area.y,
             clip(&text, crumb_area.width as usize),
-            base.bg(color::VIEW_BG),
+            base.bg(config::THEME.view.background),
         );
         cursor = Some((crumb_area.x + 1 + app.input_cursor as u16, area.y));
     } else {
@@ -187,7 +189,7 @@ fn toolbar(frame: &mut Frame, app: &mut App, area: Rect) {
             crumb_x += sep.width() as u16;
             let open = open_seg == Some(seg.path_index);
             let st = if open {
-                base.bg(color::SELECTION)
+                base.bg(config::THEME.selection.background)
             } else if draw_position == last {
                 base.add_modifier(Modifier::BOLD)
             } else {
@@ -241,7 +243,7 @@ fn toolbar(frame: &mut Frame, app: &mut App, area: Rect) {
     let split_style = focused_style(
         3,
         if app.split_on() {
-            base.fg(color::ACCENT)
+            base.fg(config::THEME.accent)
         } else {
             base
         },
@@ -270,7 +272,7 @@ fn total_crumb_width(segs: &[CrumbSeg]) -> u16 {
 }
 
 fn tab_bar(frame: &mut Frame, app: &mut App, area: Rect) {
-    paint(frame, area, color::PANEL_BG);
+    paint(frame, area, config::THEME.panel.background);
     let buf = frame.buffer_mut();
     app.hits.tabs.clear();
     let mut x = area.x;
@@ -283,14 +285,16 @@ fn tab_bar(frame: &mut Frame, app: &mut App, area: Rect) {
         let st = if i == app.active_tab {
             Style::default()
                 .bg(if app.focus == Focus::Tabs {
-                    color::SELECTION
+                    config::THEME.selection.background
                 } else {
-                    color::VIEW_BG
+                    config::THEME.view.background
                 })
-                .fg(color::TEXT)
+                .fg(config::THEME.view.foreground)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().bg(color::PANEL_BG).fg(color::DIM)
+            Style::default()
+                .bg(config::THEME.panel.background)
+                .fg(config::THEME.view.secondary)
         };
         buf.set_string(x, area.y, &label, st);
         app.hits.tabs.push(Rect::new(x, area.y, w, 1));
@@ -354,7 +358,7 @@ fn body(frame: &mut Frame, app: &mut App, area: Rect) {
         let x = halves[1].x.saturating_sub(1);
         for y in view_area.y..view_area.bottom() {
             if let Some(c) = frame.buffer_mut().cell_mut((x, y)) {
-                c.set_char('\u{2502}').set_fg(color::SEPARATOR);
+                c.set_char('\u{2502}').set_fg(config::THEME.separator);
             }
         }
     } else {
@@ -367,7 +371,7 @@ fn body(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn places_panel(frame: &mut Frame, app: &mut App, area: Rect) {
-    paint(frame, area, color::PANEL_BG);
+    paint(frame, area, config::THEME.panel.background);
     let focused = app.focus == Focus::Places;
     let buf = frame.buffer_mut();
     // No splitter rule: PANEL_BG against the view's white already reads as an
@@ -386,7 +390,9 @@ fn places_panel(frame: &mut Frame, app: &mut App, area: Rect) {
                     area.x + 1,
                     y,
                     clip(h, w.saturating_sub(1) as usize),
-                    Style::default().bg(color::PANEL_BG).fg(color::DIM),
+                    Style::default()
+                        .bg(config::THEME.panel.background)
+                        .fg(config::THEME.view.secondary),
                 );
             }
             Row::Item {
@@ -399,11 +405,11 @@ fn places_panel(frame: &mut Frame, app: &mut App, area: Rect) {
             } => {
                 let selected = i == app.places_cursor;
                 let bg = if selected {
-                    color::SELECTION
+                    config::THEME.selection.background
                 } else {
-                    color::PANEL_BG
+                    config::THEME.panel.background
                 };
-                let st = Style::default().bg(bg).fg(color::TEXT);
+                let st = Style::default().bg(bg).fg(config::THEME.view.foreground);
                 for x in area.x..area.x + w {
                     if let Some(c) = buf.cell_mut((x, y)) {
                         c.set_char(' ').set_style(st);
@@ -417,9 +423,9 @@ fn places_panel(frame: &mut Frame, app: &mut App, area: Rect) {
                         for x in area.x..area.x + filled.min(w) {
                             if let Some(c) = buf.cell_mut((x, y)) {
                                 c.set_bg(if selected {
-                                    color::SELECTION
+                                    config::THEME.selection.background
                                 } else {
-                                    color::GAUGE_FULL
+                                    config::THEME.gauge_full
                                 });
                             }
                         }
@@ -430,9 +436,9 @@ fn places_panel(frame: &mut Frame, app: &mut App, area: Rect) {
                 // Dolphin badges an unreachable disk on its icon and leaves
                 // the label alone, so the row still reads as ordinary text.
                 let fg = if *offline {
-                    color::OFFLINE
+                    config::THEME.entry.unreachable
                 } else {
-                    color::TEXT
+                    config::THEME.view.foreground
                 };
                 buf.set_string(area.x + 1, y, glyph, Style::default().fg(fg));
                 let gw = glyph.width().max(1) as u16 + 1;
@@ -447,14 +453,14 @@ fn places_panel(frame: &mut Frame, app: &mut App, area: Rect) {
                     area.x + 1 + gw,
                     y,
                     clip(label, w.saturating_sub(2 + gw + ew) as usize),
-                    Style::default().fg(color::TEXT),
+                    Style::default().fg(config::THEME.view.foreground),
                 );
                 if *eject {
                     buf.set_string(
                         area.x + w.saturating_sub(ew),
                         y,
                         config::glyph::EJECT,
-                        Style::default().fg(color::DIM),
+                        Style::default().fg(config::THEME.view.secondary),
                     );
                 }
                 // The row already carries the selection fill; only the block is
@@ -465,6 +471,7 @@ fn places_panel(frame: &mut Frame, app: &mut App, area: Rect) {
                         icon_cell(area.x + 1, y, glyph),
                         Rect::new(area.x, y, w, 1),
                         true,
+                        Some(Rect::new(area.x, y, w, 1)),
                     );
                 }
             }
@@ -478,7 +485,7 @@ fn places_panel(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_pane(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
     let is_active = pane_index == app.tab().active && app.focus == Focus::View;
-    paint(frame, area, color::VIEW_BG);
+    paint(frame, area, config::THEME.view.background);
     {
         let p = app.pane_at_mut(pane_index);
         p.area = area;
@@ -497,7 +504,9 @@ fn draw_pane(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
             frame.buffer_mut(),
             area,
             "Loading…",
-            Style::default().fg(color::DIM).bg(color::VIEW_BG),
+            Style::default()
+                .fg(config::THEME.view.secondary)
+                .bg(config::THEME.view.background),
         );
     } else if let Some(e) = &p.error {
         let msg = e.clone();
@@ -505,7 +514,9 @@ fn draw_pane(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
             frame.buffer_mut(),
             area,
             &msg,
-            Style::default().fg(color::ERROR).bg(color::VIEW_BG),
+            Style::default()
+                .fg(config::THEME.error)
+                .bg(config::THEME.view.background),
         );
     } else if p.is_empty() {
         let msg = if p.filter.is_empty() {
@@ -517,33 +528,41 @@ fn draw_pane(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
             frame.buffer_mut(),
             area,
             msg,
-            Style::default().fg(color::DIM).bg(color::VIEW_BG),
+            Style::default()
+                .fg(config::THEME.view.secondary)
+                .bg(config::THEME.view.background),
         );
     }
+}
+
+fn entry_selected(pane: &Pane, visible_index: usize) -> bool {
+    let entry = &pane.entries[pane.visible[visible_index]];
+    pane.selected.contains(&entry.selection_key())
 }
 
 fn entry_style(pane: &Pane, visible_index: usize, is_cut: bool) -> Style {
     let e = &pane.entries[pane.visible[visible_index]];
     let selected = pane.selected.contains(&e.selection_key());
     let fg = if is_cut {
-        color::CUT
+        config::THEME.entry.cut
     } else if e.is_locked() {
-        color::OFFLINE
+        config::THEME.entry.unreachable
     } else if e.is_dir() {
-        color::FOLDER
+        config::THEME.entry.folder
     } else if e.kind == fs::Kind::Symlink {
-        color::SYMLINK
+        config::THEME.entry.symlink
     } else if e.is_executable() {
-        color::EXEC
+        config::THEME.entry.executable
     } else {
-        color::TEXT
+        config::THEME.view.foreground
     };
-    let bg = if selected {
-        color::SELECTION
+    if selected {
+        Style::default()
+            .fg(config::THEME.selection.foreground)
+            .bg(config::THEME.selection.background)
     } else {
-        color::VIEW_BG
-    };
-    Style::default().fg(fg).bg(bg)
+        Style::default().fg(fg).bg(config::THEME.view.background)
+    }
 }
 
 /// Scroll to the cursor, but only when the cursor is what moved.
@@ -650,8 +669,8 @@ fn draw_icons_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, act
         let st = entry_style(app.pane_at(idx), vis, is_cut);
 
         // Selection fill covers the whole cell.
-        if st.bg == Some(color::SELECTION) {
-            fill(frame.buffer_mut(), cell, color::SELECTION);
+        if entry_selected(app.pane_at(idx), vis) {
+            fill(frame.buffer_mut(), cell, config::THEME.selection.background);
         }
 
         // Thumbnail, or the glyph stand-in while one is being decoded.
@@ -762,8 +781,8 @@ fn draw_compact_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, a
             let st = entry_style(app.pane_at(idx), vis, is_cut);
             let w = (*cw).min(area.right() - x);
             let cell = Rect::new(x, y, w, 1);
-            if st.bg == Some(color::SELECTION) {
-                fill(frame.buffer_mut(), cell, color::SELECTION);
+            if entry_selected(app.pane_at(idx), vis) {
+                fill(frame.buffer_mut(), cell, config::THEME.selection.background);
             }
             let text = compact_entry_text(&e);
             frame
@@ -771,7 +790,13 @@ fn draw_compact_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, a
                 .set_string(x, y, clip(&text, w.saturating_sub(1) as usize), st);
             if vis == app.pane_at(idx).cursor {
                 let icon = icon_cell(x, y, e.glyph());
-                cursor_block(frame.buffer_mut(), icon, cell, active);
+                cursor_block(
+                    frame.buffer_mut(),
+                    icon,
+                    cell,
+                    active,
+                    entry_selected(app.pane_at(idx), vis).then_some(cell),
+                );
             }
         }
         x += cw;
@@ -932,11 +957,13 @@ fn draw_details_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, a
     }
 
     // Header, clickable, with the sort arrow on the active column.
-    let hst = Style::default().bg(color::TOOLBAR_BG).fg(color::DIM);
+    let hst = Style::default()
+        .bg(config::THEME.toolbar.background)
+        .fg(config::THEME.view.secondary);
     fill(
         frame.buffer_mut(),
         Rect::new(area.x, head, area.width, 1),
-        color::TOOLBAR_BG,
+        config::THEME.toolbar.background,
     );
     app.hits.headers.clear();
     let keys = [SortKey::Name, SortKey::Size, SortKey::Date, SortKey::Type];
@@ -984,8 +1011,8 @@ fn draw_details_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, a
         let is_cut = cut && cut_set.contains(&e.path);
         let st = entry_style(app.pane_at(idx), vis, is_cut);
         let row = Rect::new(area.x, y, area.width, 1);
-        if st.bg == Some(color::SELECTION) {
-            fill(frame.buffer_mut(), row, color::SELECTION);
+        if entry_selected(app.pane_at(idx), vis) {
+            fill(frame.buffer_mut(), row, config::THEME.selection.background);
         }
 
         // Expandable-folder arrow plus indent, Dolphin's tree column.
@@ -1014,7 +1041,13 @@ fn draw_details_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, a
         if vis == app.pane_at(idx).cursor {
             // The tree column pushes the icon right: indent, arrow, one blank.
             let ix = cols[0].x + indent + arrow.width().max(1) as u16 + 1;
-            cursor_block(frame.buffer_mut(), icon_cell(ix, y, e.glyph()), row, active);
+            cursor_block(
+                frame.buffer_mut(),
+                icon_cell(ix, y, e.glyph()),
+                row,
+                active,
+                entry_selected(app.pane_at(idx), vis).then_some(row),
+            );
         }
     }
 }
@@ -1024,7 +1057,7 @@ fn draw_details_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, a
 // ---------------------------------------------------------------------------
 
 fn info_panel(frame: &mut Frame, app: &mut App, area: Rect) {
-    paint(frame, area, color::PANEL_BG);
+    paint(frame, area, config::THEME.panel.background);
     let Some(e) = app.pane().current().cloned() else {
         return;
     };
@@ -1035,12 +1068,14 @@ fn info_panel(frame: &mut Frame, app: &mut App, area: Rect) {
             preview,
             e.glyph(),
             Style::default()
-                .bg(color::PANEL_BG)
+                .bg(config::THEME.panel.background)
                 .fg(icon_color(&e, false)),
         );
     }
-    let st = Style::default().bg(color::PANEL_BG).fg(color::TEXT);
-    let dim = st.fg(color::DIM);
+    let st = Style::default()
+        .bg(config::THEME.panel.background)
+        .fg(config::THEME.view.foreground);
+    let dim = st.fg(config::THEME.view.secondary);
     let mut y = preview.bottom() + 1;
     let w = area.width.saturating_sub(2) as usize;
     let draw_info_line = |frame: &mut Frame, s: String, style: Style, y: &mut u16| {
@@ -1101,8 +1136,10 @@ fn perms(mode: u32) -> String {
 // ---------------------------------------------------------------------------
 
 fn filter_bar(frame: &mut Frame, app: &mut App, area: Rect) {
-    fill(frame.buffer_mut(), area, color::TOOLBAR_BG);
-    let st = Style::default().bg(color::TOOLBAR_BG).fg(color::TEXT);
+    fill(frame.buffer_mut(), area, config::THEME.toolbar.background);
+    let st = Style::default()
+        .bg(config::THEME.toolbar.background)
+        .fg(config::THEME.toolbar.foreground);
     let shown = if app.mode == Mode::Filter {
         &app.input
     } else {
@@ -1123,8 +1160,10 @@ fn status_bar(frame: &mut Frame, app: &mut App, area: Rect) {
     if area.height == 0 || area.width == 0 {
         return;
     }
-    fill(frame.buffer_mut(), area, color::TOOLBAR_BG);
-    let st = Style::default().bg(color::TOOLBAR_BG).fg(color::TEXT);
+    fill(frame.buffer_mut(), area, config::THEME.toolbar.background);
+    let st = Style::default()
+        .bg(config::THEME.toolbar.background)
+        .fg(config::THEME.toolbar.foreground);
 
     // Command and search lines take over the status bar, as in vim.
     if matches!(app.mode, Mode::Command | Mode::Search) {
@@ -1148,7 +1187,7 @@ fn status_bar(frame: &mut Frame, app: &mut App, area: Rect) {
             area.x,
             area.y,
             clip(&text, area.width as usize),
-            st.fg(color::ACCENT),
+            st.fg(config::THEME.accent),
         );
         frame.set_cursor_position((
             area.x + 2 + label.width() as u16 + app.input_cursor as u16,
@@ -1189,7 +1228,7 @@ fn status_bar(frame: &mut Frame, app: &mut App, area: Rect) {
         s
     };
     let style = if app.status_is_error {
-        st.fg(color::ERROR)
+        st.fg(config::THEME.error)
     } else {
         st
     };
@@ -1227,9 +1266,12 @@ fn status_bar(frame: &mut Frame, app: &mut App, area: Rect) {
     if !pending.is_empty() && pending_w <= avail {
         if free_w > 0 && pending_w.saturating_add(free_w).saturating_add(1) <= avail {
             let free_x = area.right() - free_w as u16 - 1;
-            frame
-                .buffer_mut()
-                .set_string(free_x, area.y, &free, st.fg(color::DIM));
+            frame.buffer_mut().set_string(
+                free_x,
+                area.y,
+                &free,
+                st.fg(config::THEME.view.secondary),
+            );
             frame.buffer_mut().set_string(
                 free_x - pending_w as u16,
                 area.y,
@@ -1249,7 +1291,7 @@ fn status_bar(frame: &mut Frame, app: &mut App, area: Rect) {
             area.right() - free_w as u16 - 1,
             area.y,
             &free,
-            st.fg(color::DIM),
+            st.fg(config::THEME.view.secondary),
         );
     }
 }
@@ -1278,9 +1320,15 @@ fn overlays(frame: &mut Frame, app: &mut App, area: Rect) {
             .unwrap_or_default();
         let body = vec![
             Line::from(active_transfer.progress.label.clone()),
-            Line::from(Span::styled(current_file, Style::default().fg(color::DIM))),
+            Line::from(Span::styled(
+                current_file,
+                Style::default().fg(config::THEME.view.secondary),
+            )),
             Line::from(progress_bar(fraction, config::PROGRESS_BAR_WIDTH)),
-            Line::from(Span::styled("Esc cancel", Style::default().fg(color::DIM))),
+            Line::from(Span::styled(
+                "Esc cancel",
+                Style::default().fg(config::THEME.view.secondary),
+            )),
         ];
         popup(frame, r, "Progress", body);
         return;
@@ -1367,7 +1415,7 @@ fn overlays(frame: &mut Frame, app: &mut App, area: Rect) {
                     Line::from(""),
                     Line::from(Span::styled(
                         "y / Enter  confirm      n / Esc  cancel",
-                        Style::default().fg(color::DIM),
+                        Style::default().fg(config::THEME.view.secondary),
                     )),
                 ],
             );
@@ -1398,7 +1446,7 @@ fn overlays(frame: &mut Frame, app: &mut App, area: Rect) {
                 Line::from(""),
                 Line::from(Span::styled(
                     "any key to close",
-                    Style::default().fg(color::DIM),
+                    Style::default().fg(config::THEME.view.secondary),
                 )),
             ];
             popup(frame, r, "Properties", body);
@@ -1421,7 +1469,9 @@ fn overlays(frame: &mut Frame, app: &mut App, area: Rect) {
                 x,
                 y,
                 &label,
-                Style::default().bg(color::ACCENT).fg(color::VIEW_BG),
+                Style::default()
+                    .bg(config::THEME.accent)
+                    .fg(config::THEME.active_cursor.foreground),
             );
         }
     }
@@ -1429,7 +1479,10 @@ fn overlays(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn labelled_row(label: &str, value: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{label:<13}"), Style::default().fg(color::DIM)),
+        Span::styled(
+            format!("{label:<13}"),
+            Style::default().fg(config::THEME.view.secondary),
+        ),
         Span::raw(value.to_string()),
     ])
 }
@@ -1439,14 +1492,20 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from(Span::styled(
             s.to_string(),
             Style::default()
-                .fg(color::ACCENT)
+                .fg(config::THEME.accent)
                 .add_modifier(Modifier::BOLD),
         ))
     };
     let key_row = |keys: &str, description: &str| {
         Line::from(vec![
-            Span::styled(format!("  {keys:<22}"), Style::default().fg(color::TEXT)),
-            Span::styled(description.to_string(), Style::default().fg(color::DIM)),
+            Span::styled(
+                format!("  {keys:<22}"),
+                Style::default().fg(config::THEME.view.foreground),
+            ),
+            Span::styled(
+                description.to_string(),
+                Style::default().fg(config::THEME.view.secondary),
+            ),
         ])
     };
     vec![
@@ -1504,8 +1563,12 @@ fn popup(frame: &mut Frame, r: Rect, title: &str, body: Vec<Line<'static>>) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .title(format!(" {title} "))
-        .style(Style::default().bg(color::PANEL_BG).fg(color::TEXT))
-        .border_style(Style::default().fg(color::ACCENT));
+        .style(
+            Style::default()
+                .bg(config::THEME.panel.background)
+                .fg(config::THEME.panel.foreground),
+        )
+        .border_style(Style::default().fg(config::THEME.accent));
     let inner = block.inner(r);
     frame.render_widget(block, r);
     frame.render_widget(Paragraph::new(body), inner);
@@ -1526,8 +1589,12 @@ fn menu_popup(frame: &mut Frame, r: Rect, selected_row: usize, items: &[String])
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .style(Style::default().bg(color::PANEL_BG).fg(color::TEXT))
-        .border_style(Style::default().fg(color::SEPARATOR));
+        .style(
+            Style::default()
+                .bg(config::THEME.panel.background)
+                .fg(config::THEME.panel.foreground),
+        )
+        .border_style(Style::default().fg(config::THEME.separator));
     let inner = block.inner(r);
     frame.render_widget(block, r);
     let buf = frame.buffer_mut();
@@ -1537,9 +1604,13 @@ fn menu_popup(frame: &mut Frame, r: Rect, selected_row: usize, items: &[String])
     for (i, s) in items.iter().enumerate().skip(first).take(h) {
         let y = inner.y + (i - first) as u16;
         let st = if i == selected_row {
-            Style::default().bg(color::SELECTION).fg(color::TEXT)
+            Style::default()
+                .bg(config::THEME.selection.background)
+                .fg(config::THEME.selection.foreground)
         } else {
-            Style::default().bg(color::PANEL_BG).fg(color::TEXT)
+            Style::default()
+                .bg(config::THEME.panel.background)
+                .fg(config::THEME.panel.foreground)
         };
         fill(buf, Rect::new(inner.x, y, inner.width, 1), st.bg.unwrap());
         buf.set_string(
@@ -1584,13 +1655,13 @@ fn centred(buf: &mut Buffer, r: Rect, s: &str, st: Style) {
 /// Dolphin's focus rectangle: an outline, not a fill.
 fn outline(buf: &mut Buffer, rect: Rect, active: bool) {
     if rect.width < 2 || rect.height < 2 {
-        cursor_block(buf, Rect::new(rect.x, rect.y, 1, 1), rect, active);
+        cursor_block(buf, Rect::new(rect.x, rect.y, 1, 1), rect, active, None);
         return;
     }
     let c = if active {
-        color::ACCENT
+        config::THEME.accent
     } else {
-        color::SEPARATOR
+        config::THEME.separator
     };
     let (left, top, right, bottom) = (rect.x, rect.y, rect.right() - 1, rect.bottom() - 1);
     for x in left..=right {
@@ -1630,24 +1701,31 @@ fn outline(buf: &mut Buffer, rect: Rect, active: bool) {
 /// a fifth kind of line; the icon is already there and already means "this one".
 /// An unselected cursor row gets the configurable hover fill. Selection wins
 /// where the two overlap, while the accent icon still identifies the cursor.
-fn cursor_block(buf: &mut Buffer, icon: Rect, row: Rect, active: bool) {
+fn cursor_block(buf: &mut Buffer, icon: Rect, row: Rect, active: bool, selection: Option<Rect>) {
     if active {
         for y in row.y..row.bottom() {
             for x in row.x..row.right() {
-                if let Some(cell) = buf.cell_mut((x, y)) {
-                    if cell.bg != color::SELECTION {
-                        cell.set_bg(color::HOVER);
+                let selected = selection.is_some_and(|area| {
+                    x >= area.x && x < area.right() && y >= area.y && y < area.bottom()
+                });
+                if !selected {
+                    if let Some(cell) = buf.cell_mut((x, y)) {
+                        cell.set_bg(config::THEME.hover.background);
                     }
                 }
             }
         }
     }
     // ACCENT identifies the active cursor; the unfocused pane gets DIM.
-    let bg = if active { color::ACCENT } else { color::DIM };
+    let cursor = if active {
+        config::THEME.active_cursor
+    } else {
+        config::THEME.inactive_cursor
+    };
     for y in icon.y..icon.bottom() {
         for x in icon.x..icon.right() {
             if let Some(cell) = buf.cell_mut((x, y)) {
-                cell.set_bg(bg).set_fg(color::VIEW_BG);
+                cell.set_bg(cursor.background).set_fg(cursor.foreground);
             }
         }
     }
@@ -1661,13 +1739,13 @@ fn icon_cell(x: u16, y: u16, glyph: &str) -> Rect {
 /// The icon's colour says what the entry *is*, not whether it is selected.
 fn icon_color(e: &fs::Entry, cut: bool) -> ratatui::style::Color {
     if cut {
-        color::CUT
+        config::THEME.entry.cut
     } else if e.is_locked() {
-        color::OFFLINE
+        config::THEME.entry.unreachable
     } else if e.is_dir() {
-        color::FOLDER
+        config::THEME.entry.folder
     } else {
-        color::FILE
+        config::THEME.entry.file
     }
 }
 
@@ -1898,16 +1976,32 @@ mod tests {
 
     #[test]
     fn cursor_hover_does_not_hide_selection() {
-        assert_ne!(color::HOVER, color::SELECTION);
+        assert_ne!(
+            config::THEME.hover.background,
+            config::THEME.selection.background
+        );
         let area = Rect::new(0, 0, 3, 1);
         let mut buf = Buffer::empty(area);
-        buf.cell_mut((0, 0)).unwrap().set_bg(color::VIEW_BG);
-        buf.cell_mut((1, 0)).unwrap().set_bg(color::SELECTION);
-        cursor_block(&mut buf, Rect::new(2, 0, 1, 1), area, true);
+        buf.cell_mut((0, 0))
+            .unwrap()
+            .set_bg(config::THEME.view.background);
+        buf.cell_mut((1, 0))
+            .unwrap()
+            .set_bg(config::THEME.selection.background);
+        cursor_block(
+            &mut buf,
+            Rect::new(2, 0, 1, 1),
+            area,
+            true,
+            Some(Rect::new(1, 0, 1, 1)),
+        );
 
-        assert_eq!(buf.cell((0, 0)).unwrap().bg, color::HOVER);
-        assert_eq!(buf.cell((1, 0)).unwrap().bg, color::SELECTION);
-        assert_eq!(buf.cell((2, 0)).unwrap().bg, color::ACCENT);
+        assert_eq!(buf.cell((0, 0)).unwrap().bg, config::THEME.hover.background);
+        assert_eq!(
+            buf.cell((1, 0)).unwrap().bg,
+            config::THEME.selection.background
+        );
+        assert_eq!(buf.cell((2, 0)).unwrap().bg, config::THEME.accent);
     }
 
     #[test]
@@ -1950,7 +2044,10 @@ mod tests {
         term.draw(|frame| draw(frame, &mut app)).unwrap();
         let buf = term.backend().buffer().clone();
         // The toolbar row must carry the Breeze toolbar background.
-        assert_eq!(buf.cell((0, 0)).unwrap().bg, color::TOOLBAR_BG);
+        assert_eq!(
+            buf.cell((0, 0)).unwrap().bg,
+            config::THEME.toolbar.background
+        );
         // The status bar must report a count.
         let last: String = (0..100)
             .map(|x| buf.cell((x, 29)).unwrap().symbol().to_string())
@@ -1993,7 +2090,7 @@ mod tests {
         // one immediately before the dim readout starts.
         let pending_end = pos.unwrap() + 2;
         let dim_start = (0..100)
-            .position(|x| buf.cell((x, 29)).unwrap().fg == color::DIM)
+            .position(|x| buf.cell((x, 29)).unwrap().fg == config::THEME.view.secondary)
             .expect("free-space readout must stay grayed");
         assert_eq!(
             pending_end, dim_start,
@@ -2004,11 +2101,13 @@ mod tests {
         let pending_cell = buf.cell((pos.unwrap() as u16, 29)).unwrap();
         let free_cell = buf.cell((dim_start as u16, 29)).unwrap();
         assert!(
-            pending_cell.modifier.contains(Modifier::BOLD) && pending_cell.fg != color::DIM,
+            pending_cell.modifier.contains(Modifier::BOLD)
+                && pending_cell.fg != config::THEME.view.secondary,
             "pending command must be high contrast, got: {last}"
         );
         assert!(
-            free_cell.fg == color::DIM && !free_cell.modifier.contains(Modifier::BOLD),
+            free_cell.fg == config::THEME.view.secondary
+                && !free_cell.modifier.contains(Modifier::BOLD),
             "free-space readout must stay grayed, got: {last}"
         );
     }
@@ -2047,7 +2146,7 @@ mod tests {
         );
         // The free-space readout is dropped rather than squeezing the command.
         assert!(
-            (0..12).all(|x| buf.cell((x, 29)).unwrap().fg != color::DIM),
+            (0..12).all(|x| buf.cell((x, 29)).unwrap().fg != config::THEME.view.secondary),
             "free space must yield on a narrow row"
         );
 

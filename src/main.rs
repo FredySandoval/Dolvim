@@ -13,6 +13,7 @@ mod observer;
 mod open;
 mod ops;
 mod places;
+mod theme;
 mod thumbs;
 mod ui;
 mod vim;
