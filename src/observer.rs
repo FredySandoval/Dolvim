@@ -234,7 +234,7 @@ impl Snapshot {
                 expanded_paths.sort_by_key(|p| serde_json::to_string(p).unwrap_or_default());
                 PaneSnapshot {
                     id: pane.id,
-                    cwd: observed_path(root, &pane.cwd),
+                    cwd: observed_path(root, pane.display_path()),
                     cursor_path: pane.current().map(|e| observed_path(root, &e.path)),
                     selected_paths,
                     expanded_paths,

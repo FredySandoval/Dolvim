@@ -500,6 +500,24 @@ pub fn trash(paths: &[PathBuf]) -> TrashOutcome {
     outcome
 }
 
+/// Resolve Freedesktop's data entry from the backend's exact `.trashinfo` ID.
+/// The ID, rather than the original name, preserves collision suffixes and the
+/// trash can location chosen for another mount.
+#[cfg(target_os = "linux")]
+fn trash_backing_path(id: &std::ffi::OsStr) -> Option<PathBuf> {
+    let info = Path::new(id);
+    let info_dir = info.parent()?;
+    if info_dir.file_name()? != "info" || info.extension()? != "trashinfo" {
+        return None;
+    }
+    Some(info_dir.parent()?.join("files").join(info.file_stem()?))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn trash_backing_path(_: &std::ffi::OsStr) -> Option<PathBuf> {
+    None
+}
+
 /// Trash contents as view entries, so the Trash place browses like a folder.
 pub fn list_trash() -> Vec<Entry> {
     let Ok(items) = trash::os_limited::list() else {
@@ -509,18 +527,29 @@ pub fn list_trash() -> Vec<Entry> {
         .into_iter()
         .map(|trash_item| {
             let original = trash_item.original_parent.join(&trash_item.name);
-            let meta = fs::symlink_metadata(&original).ok();
+            let metadata = trash::os_limited::metadata(&trash_item).ok();
+            let backing_path = trash_backing_path(&trash_item.id)
+                .filter(|path| fs::symlink_metadata(path).is_ok());
+            let backing_metadata = backing_path
+                .as_ref()
+                .and_then(|path| fs::symlink_metadata(path).ok());
+            let (kind, size) = match metadata.map(|metadata| metadata.size) {
+                Some(trash::TrashItemSize::Entries(count)) => (Kind::Dir, count as u64),
+                Some(trash::TrashItemSize::Bytes(bytes)) => (Kind::File, bytes),
+                None => (Kind::File, 0),
+            };
             Entry {
                 name: trash_item.name.to_string_lossy().into_owned(),
                 path: original,
-                kind: match meta.as_ref().map(|m| m.is_dir()) {
-                    Some(true) => Kind::Dir,
-                    _ => Kind::File,
-                },
-                size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                backing_path,
+                kind,
+                size,
                 mtime: trash_item.time_deleted,
-                mode: 0o644,
-                readable: true,
+                mode: backing_metadata
+                    .as_ref()
+                    .map(std::os::unix::fs::MetadataExt::mode)
+                    .unwrap_or(0),
+                readable: kind != Kind::Dir || backing_metadata.is_some(),
                 hidden: false,
                 trash_id: Some(trash_item.id),
                 depth: 0,
@@ -1192,6 +1221,16 @@ mod tests {
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir).unwrap();
         temp_dir
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn trash_backing_path_uses_the_exact_collision_suffixed_generation() {
+        let info = Path::new("/mnt/.Trash-1000/info/herdr.2.trashinfo");
+        assert_eq!(
+            trash_backing_path(info.as_os_str()),
+            Some(PathBuf::from("/mnt/.Trash-1000/files/herdr.2"))
+        );
     }
 
     #[test]

@@ -313,7 +313,7 @@ fn move_to_trash(app: &mut App, paths: Vec<PathBuf>) -> Vec<ops::TrashRef> {
     // In the Trash there is no further "away" to move something to, so `x`
     // means purge, as it does in Dolphin. It goes behind the Shift+Del
     // confirmation: this is the one place the key is not undoable.
-    if app.pane().target == Target::Trash {
+    if app.pane().target.is_trash() {
         let items = app.pane().selected_trash_refs();
         if !items.is_empty() {
             app.mode = Mode::Confirm(Confirm::PurgeFromTrash(items));
@@ -977,7 +977,7 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
         Action::DeletePerm => {
             let perm_delete_paths = operand_paths(app, count);
             if !perm_delete_paths.is_empty() {
-                app.mode = Mode::Confirm(if app.pane().target == Target::Trash {
+                app.mode = Mode::Confirm(if app.pane().target.is_trash() {
                     Confirm::PurgeFromTrash(app.pane().selected_trash_refs())
                 } else {
                     Confirm::DeletePermanently(perm_delete_paths)
@@ -1132,7 +1132,7 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
         Action::SearchNext => search_step(app, 1),
         Action::SearchPrev => search_step(app, -1),
         Action::EnterPathEdit => {
-            let p = app.pane().cwd.to_string_lossy().into_owned();
+            let p = app.pane().display_path().to_string_lossy().into_owned();
             enter_text(app, Mode::PathEdit, p);
         }
 
@@ -1980,7 +1980,7 @@ fn accept_crumb(app: &mut App, items: &[PathBuf]) {
         return;
     };
     leave_toolbar(app);
-    app.goto(Target::Dir(crumb_dir), true);
+    app.open_breadcrumb(crumb_dir);
 }
 
 #[cfg(test)]
@@ -2451,6 +2451,7 @@ mod tests {
             .map(|name| crate::fs::Entry {
                 name: (*name).into(),
                 path: PathBuf::from("/tmp").join(name),
+                backing_path: None,
                 kind: crate::fs::Kind::File,
                 size: 0,
                 mtime: 0,
@@ -2832,6 +2833,22 @@ mod tests {
         app.close_tab();
         assert_eq!(app.focus, Focus::View);
         assert!(matches!(app.toolbar_return, FocusRegion::View(_)));
+    }
+
+    #[test]
+    fn path_edit_uses_the_virtual_trash_location() {
+        let mut app = test_app();
+        app.pane_mut().target = Target::TrashDir {
+            display: PathBuf::from("trash:/File"),
+            original: PathBuf::from("/gone/File"),
+            backing: PathBuf::from("/trash/files/File"),
+        };
+        app.pane_mut().cwd = PathBuf::from("/gone/File");
+
+        run_action(&mut app, Action::EnterPathEdit, 1);
+
+        assert_eq!(app.mode, Mode::PathEdit);
+        assert_eq!(app.input, "trash:/File");
     }
 
     #[test]

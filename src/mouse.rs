@@ -177,7 +177,7 @@ fn handle_left_press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
     }
     for (rect, crumb_path) in &hitboxes.crumbs {
         if rect_contains(*rect, x, y) {
-            return app.goto(Target::Dir(crumb_path.clone()), true);
+            return app.open_breadcrumb(crumb_path.clone());
         }
     }
     // Clicking the empty part of the location bar edits it, as in Dolphin.
@@ -519,6 +519,7 @@ mod tests {
         let make_entry = |depth: u16, kind: Kind| Entry {
             name: "d".into(),
             path: "/d".into(),
+            backing_path: None,
             kind,
             size: 0,
             mtime: 0,
@@ -592,6 +593,7 @@ mod tests {
             pane.entries = vec![Entry {
                 name: "hovered".into(),
                 path: hovered_folder.clone(),
+                backing_path: None,
                 kind: Kind::Dir,
                 size: 0,
                 mtime: 0,

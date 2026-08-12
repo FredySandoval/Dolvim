@@ -241,7 +241,7 @@ pub struct Pane {
     pub expanded: HashSet<PathBuf>,
     /// Stable row that an asynchronous refresh should place under the cursor.
     pub pending_focus: Option<EntryFocus>,
-    pub history: Vec<PathBuf>,
+    pub history: Vec<Target>,
     pub history_pos: usize,
     pub seq: u64,
     pub loading: bool,
@@ -280,12 +280,16 @@ fn expanded_listing(roots: Vec<Entry>, expanded: &HashSet<PathBuf>, sort: Sort) 
         entry.depth = depth;
         entry.expanded = entry.is_dir() && expanded.contains(&entry.path);
         let path = entry.path.clone();
+        let backing_path = entry.backing_path.clone();
         let is_expanded = entry.expanded;
         output.push(entry);
         if !is_expanded {
             return;
         }
-        if let Ok(mut children) = fs::read_dir(&path, depth + 1) {
+        let physical = backing_path.as_deref().unwrap_or(&path);
+        if let Ok(mut children) =
+            fs::read_dir_as(physical, &path, depth + 1, backing_path.is_some())
+        {
             fs::sort_entries(&mut children, sort);
             for child in children {
                 append(child, depth + 1, expanded, sort, output);
@@ -302,28 +306,29 @@ fn expanded_listing(roots: Vec<Entry>, expanded: &HashSet<PathBuf>, sort: Sort) 
 
 /// Collect folders below `roots`, guarding against directory symlink cycles.
 /// The paths themselves (rather than canonical paths) remain the fold keys.
-fn recursive_folders(roots: Vec<PathBuf>) -> (HashSet<PathBuf>, Option<(PathBuf, std::io::Error)>) {
+fn recursive_folders(roots: Vec<Entry>) -> (HashSet<PathBuf>, Option<(PathBuf, std::io::Error)>) {
     let mut folders = HashSet::new();
     let mut visited = HashSet::new();
     let mut pending = roots;
     let mut first_error = None;
 
-    while let Some(path) = pending.pop() {
-        folders.insert(path.clone());
-        let identity = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+    while let Some(entry) = pending.pop() {
+        folders.insert(entry.path.clone());
+        let physical = entry.filesystem_path();
+        let identity = std::fs::canonicalize(physical).unwrap_or_else(|_| physical.to_path_buf());
         if !visited.insert(identity) {
             continue;
         }
-        match fs::read_dir(&path, 0) {
-            Ok(entries) => pending.extend(
-                entries
-                    .into_iter()
-                    .filter(Entry::is_dir)
-                    .map(|entry| entry.path),
-            ),
+        match fs::read_dir_as(
+            physical,
+            &entry.path,
+            entry.depth + 1,
+            entry.backing_path.is_some(),
+        ) {
+            Ok(entries) => pending.extend(entries.into_iter().filter(Entry::is_dir)),
             Err(error) => {
                 if first_error.is_none() {
-                    first_error = Some((path, error));
+                    first_error = Some((entry.path, error));
                 }
             }
         }
@@ -334,11 +339,20 @@ fn recursive_folders(roots: Vec<PathBuf>) -> (HashSet<PathBuf>, Option<(PathBuf,
 static NEXT_PANE_ID: AtomicU64 = AtomicU64::new(1);
 
 impl Pane {
+    /// User-facing location. Virtual targets must never expose their backing
+    /// storage or vanished original filesystem path as the current location.
+    pub fn display_path(&self) -> &Path {
+        match &self.target {
+            Target::TrashDir { display, .. } => display,
+            _ => &self.cwd,
+        }
+    }
+
     pub fn new(cwd: PathBuf) -> Pane {
         Pane {
             id: NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed),
             target: Target::Dir(cwd.clone()),
-            history: vec![cwd.clone()],
+            history: vec![Target::Dir(cwd.clone())],
             cwd,
             entries: Vec::new(),
             visible: Vec::new(),
@@ -594,7 +608,15 @@ impl Pane {
             .filter_map(|&index| self.entries.get(index))
             .filter(|entry| self.selected.contains(&entry.selection_key()))
             .filter_map(to_ref)
-            .collect()
+            .fold(Vec::new(), |mut items, item| {
+                if !items
+                    .iter()
+                    .any(|existing: &ops::TrashRef| existing.id == item.id)
+                {
+                    items.push(item);
+                }
+                items
+            })
     }
 
     /// Visible items `a..=b`, clamped to the listing. The linewise range a vim
@@ -1104,6 +1126,17 @@ impl App {
                 let entries = ops::list_trash();
                 self.apply_listing(seq, entries, None);
             }
+            Target::TrashDir {
+                ref original,
+                ref backing,
+                ..
+            } => {
+                let (entries, error) = match fs::read_dir_as(backing, original, 0, true) {
+                    Ok(entries) => (entries, None),
+                    Err(error) => (Vec::new(), Some(error.to_string())),
+                };
+                self.apply_listing(seq, entries, error);
+            }
             Target::Network => {
                 self.apply_listing(
                     seq,
@@ -1248,6 +1281,7 @@ impl App {
         let cwd = match &target {
             Target::Dir(d) => d.clone(),
             Target::Trash => PathBuf::from("trash:/"),
+            Target::TrashDir { original, .. } => original.clone(),
             Target::Network => PathBuf::from("remote:/"),
             Target::RecentDays(1) => PathBuf::from("recent:/today"),
             Target::RecentDays(_) => PathBuf::from("recent:/yesterday"),
@@ -1266,9 +1300,9 @@ impl App {
         }
         {
             let pane = self.pane_mut();
-            if push_history && pane.cwd != cwd {
+            if push_history && pane.target != target {
                 pane.history.truncate(pane.history_pos + 1);
-                pane.history.push(cwd.clone());
+                pane.history.push(target.clone());
                 pane.history_pos = pane.history.len() - 1;
             }
             pane.cwd = cwd;
@@ -1295,7 +1329,49 @@ impl App {
         self.goto(Target::Dir(d), true);
     }
 
+    /// Navigate a rendered breadcrumb without turning a virtual Trash path
+    /// into a live filesystem directory.
+    pub fn open_breadcrumb(&mut self, path: PathBuf) {
+        let Target::TrashDir {
+            display,
+            original,
+            backing,
+        } = self.pane().target.clone()
+        else {
+            self.goto(Target::Dir(path), true);
+            return;
+        };
+
+        if path.as_os_str().is_empty() || path == Path::new("trash:") {
+            self.goto(Target::Trash, true);
+            return;
+        }
+        let Ok(suffix) = display.strip_prefix(&path) else {
+            self.error("Invalid Trash breadcrumb");
+            return;
+        };
+        let levels = suffix.components().count();
+        let ancestor = |mut path: PathBuf| {
+            for _ in 0..levels {
+                path.pop();
+            }
+            path
+        };
+        self.goto(
+            Target::TrashDir {
+                display: path,
+                original: ancestor(original),
+                backing: ancestor(backing),
+            },
+            true,
+        );
+    }
+
     pub fn go_up(&mut self) {
+        if matches!(self.pane().target, Target::TrashDir { .. }) {
+            self.back();
+            return;
+        }
         let cwd = self.pane().cwd.clone();
         if let Some(parent) = cwd.parent().map(Path::to_path_buf) {
             self.open_dir(parent.clone());
@@ -1310,9 +1386,9 @@ impl App {
             return;
         }
         let pos = pane.history_pos - 1;
-        let d = pane.history[pos].clone();
+        let target = pane.history[pos].clone();
         self.pane_mut().history_pos = pos;
-        self.goto(Target::Dir(d), false);
+        self.goto(target, false);
     }
 
     pub fn forward(&mut self) {
@@ -1321,9 +1397,9 @@ impl App {
             return;
         }
         let pos = pane.history_pos + 1;
-        let d = pane.history[pos].clone();
+        let target = pane.history[pos].clone();
         self.pane_mut().history_pos = pos;
-        self.goto(Target::Dir(d), false);
+        self.goto(target, false);
     }
 
     /// Put the cursor on `path` once it appears; used after `go_up` and rename.
@@ -1343,7 +1419,25 @@ impl App {
         let Some(entry) = self.pane().current().cloned() else {
             return;
         };
-        if entry.is_dir() {
+        if matches!(self.pane().target, Target::Trash | Target::TrashDir { .. }) {
+            if entry.is_dir() {
+                let Some(backing) = entry.backing_path else {
+                    self.error(format!("Cannot browse {} in Trash", entry.name));
+                    return;
+                };
+                let display = self.pane().display_path().join(&entry.name);
+                self.goto(
+                    Target::TrashDir {
+                        display,
+                        original: entry.path,
+                        backing,
+                    },
+                    true,
+                );
+            } else {
+                self.open_external(entry.filesystem_path());
+            }
+        } else if entry.is_dir() {
             self.open_dir(entry.path);
         } else {
             self.open_external(&entry.path);
@@ -1758,7 +1852,7 @@ impl App {
         }
 
         if recursive {
-            let (folders, first_error) = recursive_folders(vec![entry.path.clone()]);
+            let (folders, first_error) = recursive_folders(vec![entry.clone()]);
             let pane = self.pane_mut();
             pane.expanded.extend(folders);
             pane.refilter();
@@ -1766,7 +1860,12 @@ impl App {
                 self.error(format!("Cannot read {}: {error}", path.display()));
             }
         } else {
-            if let Err(error) = fs::read_dir(&entry.path, entry.depth + 1) {
+            if let Err(error) = fs::read_dir_as(
+                entry.filesystem_path(),
+                &entry.path,
+                entry.depth + 1,
+                entry.backing_path.is_some(),
+            ) {
                 self.error(format!("Cannot read {}: {error}", entry.name));
                 return;
             }
@@ -1810,7 +1909,7 @@ impl App {
             .entries
             .iter()
             .filter(|entry| entry.depth == 0 && entry.is_dir())
-            .map(|entry| entry.path.clone())
+            .cloned()
             .collect();
         let (folders, first_error) = recursive_folders(roots);
         let pane = self.pane_mut();
@@ -1868,6 +1967,7 @@ mod tests {
             .map(|name| Entry {
                 name: (*name).into(),
                 path: PathBuf::from("/tmp").join(name),
+                backing_path: None,
                 kind: fs::Kind::File,
                 size: 0,
                 mtime: 0,
@@ -1963,6 +2063,36 @@ mod tests {
         let selected = pane.selected_trash_refs();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].id, std::ffi::OsString::from("generation-1"));
+    }
+
+    #[test]
+    fn trash_children_are_not_independent_trash_generations() {
+        let original = PathBuf::from("/gone/herdr");
+        let mut root = entries_named(&["herdr"]).remove(0);
+        root.path = original.clone();
+        root.kind = fs::Kind::Dir;
+        root.trash_id = Some("herdr.2.trashinfo".into());
+        let mut child = entries_named(&["SKILL.md"]).remove(0);
+        child.path = original.join("SKILL.md");
+        child.depth = 1;
+
+        let mut pane = Pane::new(PathBuf::from("trash:/"));
+        pane.entries = vec![root.clone(), child.clone()];
+        pane.visible = vec![0, 1];
+        pane.selected.insert(root.selection_key());
+        pane.selected.insert(child.selection_key());
+
+        let selected = pane.selected_trash_refs();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0].id,
+            std::ffi::OsString::from("herdr.2.trashinfo")
+        );
+        assert_eq!(selected[0].original_path, original);
+
+        pane.selected.clear();
+        pane.selected.insert(child.selection_key());
+        assert!(pane.selected_trash_refs().is_empty());
     }
 
     #[test]

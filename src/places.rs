@@ -10,9 +10,22 @@ use crate::fs;
 pub enum Target {
     Dir(PathBuf),
     Trash,
+    /// A directory inside one top-level Trash generation. These paths have
+    /// distinct jobs and must not be substituted for one another.
+    TrashDir {
+        display: PathBuf,
+        original: PathBuf,
+        backing: PathBuf,
+    },
     Network,
     /// A saved search: entries under `home` modified within N days.
     RecentDays(u32),
+}
+
+impl Target {
+    pub fn is_trash(&self) -> bool {
+        matches!(self, Self::Trash | Self::TrashDir { .. })
+    }
 }
 
 /// How much of a device is in use, for the Places free-space gauge.

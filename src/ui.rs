@@ -156,7 +156,7 @@ fn toolbar(frame: &mut Frame, app: &mut App, area: Rect) {
         );
         cursor = Some((crumb_area.x + 1 + app.input_cursor as u16, area.y));
     } else {
-        let paths = crumb_paths(&app.pane().cwd);
+        let paths = crumb_paths(app.pane().display_path());
         // Dolphin elides from the left when the trail does not fit.
         let mut segs: Vec<CrumbSeg> = paths
             .iter()
@@ -1454,13 +1454,24 @@ fn overlays(frame: &mut Frame, app: &mut App, area: Rect) {
                 labelled_row("Modified", &fs::format_time(e.mtime)),
                 labelled_row("Permissions", &perms(e.mode)),
                 labelled_row(
-                    "Location",
+                    if e.backing_path.is_some() || e.trash_id.is_some() {
+                        "Original location"
+                    } else {
+                        "Location"
+                    },
                     &e.path
                         .parent()
                         .map(|p| p.display().to_string())
                         .unwrap_or_default(),
                 ),
-                labelled_row("Full path", &e.path.display().to_string()),
+                labelled_row(
+                    if e.backing_path.is_some() || e.trash_id.is_some() {
+                        "Original path"
+                    } else {
+                        "Full path"
+                    },
+                    &e.path.display().to_string(),
+                ),
                 Line::from(""),
                 Line::from(Span::styled(
                     "Esc / q to close",
@@ -1994,6 +2005,7 @@ mod tests {
         let entry = fs::Entry {
             name: "child.txt".into(),
             path: PathBuf::from("parent/child.txt"),
+            backing_path: None,
             kind: fs::Kind::File,
             size: 0,
             mtime: 0,

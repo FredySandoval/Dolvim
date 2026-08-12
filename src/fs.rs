@@ -23,6 +23,9 @@ pub enum Kind {
 pub struct Entry {
     pub name: String,
     pub path: PathBuf,
+    /// Accessible bytes when a row's logical path is not its filesystem path.
+    /// Currently used by Trash browsing; live entries leave this unset.
+    pub backing_path: Option<PathBuf>,
     pub kind: Kind,
     /// Byte size for files; for directories Dolphin shows a child count, which
     /// we store here too and disambiguate with `kind`.
@@ -41,6 +44,12 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// Filesystem location containing this row's bytes. Trash rows retain
+    /// their original path for display and restore semantics.
+    pub fn filesystem_path(&self) -> &Path {
+        self.backing_path.as_deref().unwrap_or(&self.path)
+    }
+
     pub fn is_dir(&self) -> bool {
         self.kind == Kind::Dir
     }
@@ -273,18 +282,30 @@ pub fn sort_entries(entries: &mut [Entry], sort: Sort) {
 /// Read one directory. Unreadable entries are skipped, not fatal — Dolphin
 /// shows what it can and complains in the status bar.
 pub fn read_dir(path: &Path, depth: u16) -> std::io::Result<Vec<Entry>> {
+    read_dir_as(path, path, depth, false)
+}
+
+/// Read physical directory contents while assigning paths below a logical root.
+/// This keeps ordinary path semantics out of virtual filesystem traversal.
+pub fn read_dir_as(
+    physical: &Path,
+    logical: &Path,
+    depth: u16,
+    backed: bool,
+) -> std::io::Result<Vec<Entry>> {
     let mut entries = Vec::new();
-    for dir_entry in fs::read_dir(path)? {
+    for dir_entry in fs::read_dir(physical)? {
         let Ok(dir_entry) = dir_entry else { continue };
         let name = dir_entry.file_name().to_string_lossy().into_owned();
-        let entry_path = dir_entry.path();
-        let Ok(link_metadata) = fs::symlink_metadata(&entry_path) else {
+        let physical_path = dir_entry.path();
+        let entry_path = logical.join(dir_entry.file_name());
+        let Ok(link_metadata) = fs::symlink_metadata(&physical_path) else {
             continue;
         };
         let is_link = link_metadata.file_type().is_symlink();
         // Dolphin follows links for the type shown, but keeps the link marker.
         let metadata = if is_link {
-            fs::metadata(&entry_path).unwrap_or(link_metadata)
+            fs::metadata(&physical_path).unwrap_or(link_metadata)
         } else {
             link_metadata
         };
@@ -297,11 +318,12 @@ pub fn read_dir(path: &Path, depth: u16) -> std::io::Result<Vec<Entry>> {
         };
         // One `read_dir` answers both "how many children" and "can we get in",
         // so the lock state costs no extra syscall.
-        let child_count = (kind == Kind::Dir).then(|| dir_child_count(&entry_path));
+        let child_count = (kind == Kind::Dir).then(|| dir_child_count(&physical_path));
         entries.push(Entry {
             hidden: name.starts_with('.'),
             name,
             path: entry_path,
+            backing_path: backed.then_some(physical_path),
             kind,
             size: match child_count {
                 Some(count) => count.unwrap_or(0),
@@ -757,6 +779,7 @@ mod tests {
         let make_entry = |name: &str, kind: Kind| Entry {
             name: name.into(),
             path: PathBuf::from(name),
+            backing_path: None,
             kind,
             size: 0,
             mtime: 0,
