@@ -2452,6 +2452,7 @@ mod tests {
                 name: (*name).into(),
                 path: PathBuf::from("/tmp").join(name),
                 backing_path: None,
+                link_target: None,
                 kind: crate::fs::Kind::File,
                 size: 0,
                 mtime: 0,

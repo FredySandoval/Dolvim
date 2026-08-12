@@ -1442,14 +1442,19 @@ fn overlays(frame: &mut Frame, app: &mut App, area: Rect) {
             let Some(e) = app.pane().current().cloned() else {
                 return;
             };
-            let r = centre_rect(area, 64, 12);
-            let body = vec![
+            let r = centre_rect(area, 64, 12 + u16::from(e.link_target.is_some()));
+            let mut body = vec![
                 Line::from(Span::styled(
                     e.name.clone(),
                     Style::default().add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
                 labelled_row("Type", &e.type_name()),
+            ];
+            if let Some(target) = &e.link_target {
+                body.push(labelled_row("Link target", &target.display().to_string()));
+            }
+            body.extend([
                 labelled_row("Size", &fs::format_entry_size(&e)),
                 labelled_row("Modified", &fs::format_time(e.mtime)),
                 labelled_row("Permissions", &perms(e.mode)),
@@ -1477,7 +1482,7 @@ fn overlays(frame: &mut Frame, app: &mut App, area: Rect) {
                     "Esc / q to close",
                     Style::default().fg(config::THEME.view.secondary),
                 )),
-            ];
+            ]);
             popup(frame, r, "Properties", body);
         }
         Mode::Help => {
@@ -2006,6 +2011,7 @@ mod tests {
             name: "child.txt".into(),
             path: PathBuf::from("parent/child.txt"),
             backing_path: None,
+            link_target: None,
             kind: fs::Kind::File,
             size: 0,
             mtime: 0,

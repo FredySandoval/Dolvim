@@ -9,6 +9,7 @@ use std::time::Instant;
 use ratatui::layout::Rect;
 
 use crate::config;
+pub use crate::config::ViewMode;
 use crate::fs::{self, Entry, Lister, Sort, SortKey};
 use crate::open;
 use crate::ops::{self, Progress, UndoOp, UnnamedRegister};
@@ -23,13 +24,6 @@ pub enum Suspend {
     Shell(PathBuf),
     /// A resolved command whose handler needs exclusive use of the terminal.
     Open(open::Plan),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ViewMode {
-    Icons,
-    Compact,
-    Details,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -360,7 +354,7 @@ impl Pane {
             anchor: 0,
             offset: 0,
             selected: HashSet::new(),
-            view: ViewMode::Icons,
+            view: config::DEFAULT_VIEW,
             sort: Sort::default(),
             show_hidden: false,
             filter: String::new(),
@@ -377,7 +371,7 @@ impl Pane {
             cell_height: 1,
             column_widths: Vec::new(),
             grid_x: 0,
-            last_reveal: (0, ViewMode::Icons),
+            last_reveal: (0, config::DEFAULT_VIEW),
             crumb_focus: None,
             crumb_pick: None,
         }
@@ -1968,6 +1962,7 @@ mod tests {
                 name: (*name).into(),
                 path: PathBuf::from("/tmp").join(name),
                 backing_path: None,
+                link_target: None,
                 kind: fs::Kind::File,
                 size: 0,
                 mtime: 0,

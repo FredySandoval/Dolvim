@@ -26,6 +26,9 @@ pub struct Entry {
     /// Accessible bytes when a row's logical path is not its filesystem path.
     /// Currently used by Trash browsing; live entries leave this unset.
     pub backing_path: Option<PathBuf>,
+    /// Target exactly as stored in the directory entry. Kept relative because
+    /// resolving it would hide both useful link text and broken links.
+    pub link_target: Option<PathBuf>,
     pub kind: Kind,
     /// Byte size for files; for directories Dolphin shows a child count, which
     /// we store here too and disambiguate with `kind`.
@@ -303,6 +306,9 @@ pub fn read_dir_as(
             continue;
         };
         let is_link = link_metadata.file_type().is_symlink();
+        let link_target = is_link
+            .then(|| fs::read_link(&physical_path).ok())
+            .flatten();
         // Dolphin follows links for the type shown, but keeps the link marker.
         let metadata = if is_link {
             fs::metadata(&physical_path).unwrap_or(link_metadata)
@@ -324,6 +330,7 @@ pub fn read_dir_as(
             name,
             path: entry_path,
             backing_path: backed.then_some(physical_path),
+            link_target,
             kind,
             size: match child_count {
                 Some(count) => count.unwrap_or(0),
@@ -775,11 +782,29 @@ mod tests {
     }
 
     #[test]
+    fn directory_entries_retain_relative_symlink_targets() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("dolvim-symlink-target-{unique}"));
+        fs::create_dir(&dir).unwrap();
+        let target = PathBuf::from("../../.agents/skills/herdr");
+        std::os::unix::fs::symlink(&target, dir.join("herdr")).unwrap();
+
+        let entries = read_dir(&dir, 0).unwrap();
+
+        assert_eq!(entries[0].link_target.as_ref(), Some(&target));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn dirs_sort_before_files_when_asked() {
         let make_entry = |name: &str, kind: Kind| Entry {
             name: name.into(),
             path: PathBuf::from(name),
             backing_path: None,
+            link_target: None,
             kind,
             size: 0,
             mtime: 0,

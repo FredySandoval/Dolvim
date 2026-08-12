@@ -542,6 +542,7 @@ pub fn list_trash() -> Vec<Entry> {
                 name: trash_item.name.to_string_lossy().into_owned(),
                 path: original,
                 backing_path,
+                link_target: None,
                 kind,
                 size,
                 mtime: trash_item.time_deleted,

@@ -4,6 +4,16 @@
 use crate::fs::TimeStyle;
 use crate::theme::{self, Theme};
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ViewMode {
+    Icons  ,
+    Compact,
+    Details,
+}
+
+/* Select the initial file view and recompile. */
+pub const DEFAULT_VIEW: ViewMode = ViewMode::Details;
+
 /* Select a complete palette and recompile. */
 pub const THEME: &Theme = &theme::BREEZE_DARK;
 
