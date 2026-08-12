@@ -10,21 +10,8 @@ permissions:
 
 jobs:
   build:
-    name: Build ${{ matrix.name }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Linux x86_64
-            os: ubuntu-latest
-            archive: dolvim-linux-x86_64.tar.gz
-          - name: macOS x86_64
-            os: macos-15-intel
-            archive: dolvim-macos-x86_64.tar.gz
-          - name: macOS aarch64
-            os: macos-latest
-            archive: dolvim-macos-aarch64.tar.gz
-    runs-on: ${{ matrix.os }}
+    name: Build Linux x86_64
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -34,12 +21,11 @@ jobs:
       - name: Build
         run: cargo build --release --locked
       - name: Package
-        shell: bash
-        run: tar -czf "${{ matrix.archive }}" -C target/release dolvim -C ../.. README.md LICENSE
+        run: tar -czf dolvim-linux-x86_64.tar.gz -C target/release dolvim -C ../.. README.md LICENSE
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.archive }}
-          path: ${{ matrix.archive }}
+          name: dolvim-linux-x86_64.tar.gz
+          path: dolvim-linux-x86_64.tar.gz
           if-no-files-found: error
 
   release:
