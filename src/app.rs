@@ -249,6 +249,11 @@ pub struct Pane {
     /// Compact sizes each column to its own longest name, so the one cell width
     /// above cannot describe it. Widths of the rendered columns, left to right.
     pub column_widths: Vec<u16>,
+    /// All Compact column widths. Unlike `column_widths`, this survives redraws
+    /// and scrolling; its dimensions identify the layout it was measured for.
+    pub compact_widths: Vec<u16>,
+    pub compact_width_rows: u16,
+    pub compact_width_avail: u16,
     /// Left edge of the icon grid, which floats inside the pane as the leftover
     /// columns are split into margin.
     pub grid_x: u16,
@@ -370,6 +375,9 @@ impl Pane {
             cell_width: 1,
             cell_height: 1,
             column_widths: Vec::new(),
+            compact_widths: Vec::new(),
+            compact_width_rows: 0,
+            compact_width_avail: 0,
             grid_x: 0,
             last_reveal: (0, config::DEFAULT_VIEW),
             crumb_focus: None,
@@ -496,6 +504,7 @@ impl Pane {
     /// Rebuild `visible` only. Kept separate from `refilter` because the
     /// Details tree is ordered positionally and must not be re-sorted.
     fn revisible(&mut self) {
+        self.compact_widths.clear();
         let filter_lower = self.filter.to_lowercase();
         let hidden_ok = self.show_hidden;
         let visible_indices: Vec<usize> = self

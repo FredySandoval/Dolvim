@@ -728,7 +728,8 @@ fn draw_compact_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, a
     // The margin is the pane's, not each column's: columns are already held
     // apart by the blank `compact_widths` leaves on the right.
     let avail = area.width.saturating_sub(config::VIEW_MARGIN);
-    let widths = compact_widths(app.pane_at(idx), rows, avail);
+    ensure_compact_widths(app.pane_at_mut(idx), rows, avail);
+    let widths = app.pane_at(idx).compact_widths.clone();
     {
         let p = app.pane_at_mut(idx);
         p.grid_rows = rows;
@@ -817,18 +818,31 @@ fn compact_entry_text(e: &fs::Entry) -> String {
     )
 }
 
-fn compact_widths(p: &crate::app::Pane, rows: u16, avail: u16) -> Vec<u16> {
-    let mut out = Vec::new();
-    for col in p.visible.chunks(rows as usize) {
-        let max_item_width = col
-            .iter()
-            .map(|&i| compact_entry_text(&p.entries[i]).width())
-            .max()
-            .unwrap_or(1);
-        // One trailing blank keeps neighbouring columns from touching.
-        out.push(((max_item_width + 1) as u16).min(avail.max(1)));
+fn ensure_compact_widths(p: &mut crate::app::Pane, rows: u16, avail: u16) {
+    if !p.compact_widths.is_empty()
+        && p.compact_width_rows == rows
+        && p.compact_width_avail == avail
+    {
+        return;
     }
-    out
+    p.compact_width_rows = rows;
+    p.compact_width_avail = avail;
+    p.compact_widths = p
+        .visible
+        .chunks(rows as usize)
+        .map(|col| {
+            let max_item_width = col
+                .iter()
+                .map(|&i| {
+                    let entry = &p.entries[i];
+                    entry.depth as usize * 2 + entry.glyph().width() + 1 + entry.name.width()
+                })
+                .max()
+                .unwrap_or(1);
+            // One trailing blank keeps neighbouring columns from touching.
+            ((max_item_width + 1) as u16).min(avail.max(1))
+        })
+        .collect();
 }
 
 /// Scroll the least that brings column `col` on screen. Ragged widths mean the
