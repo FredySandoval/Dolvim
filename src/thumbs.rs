@@ -94,8 +94,10 @@ impl Thumbs {
     }
 
     /// Collect finished work. Called once per tick.
-    pub fn pump_decoded_thumbs(&mut self) {
+    pub fn pump_decoded_thumbs(&mut self) -> bool {
+        let mut changed = false;
         while let Ok(result) = self.rx.try_recv() {
+            changed = true;
             let cache_key = ThumbKey {
                 path: result.path,
                 cell_width: result.cell_width,
@@ -114,6 +116,7 @@ impl Thumbs {
             let evicted_key = self.order.remove(0);
             self.cache.remove(&evicted_key);
         }
+        changed
     }
 
     /// Thumbnail for `path` at `w x h` cells, requesting one if absent.
@@ -174,7 +177,16 @@ fn decode(path: &Path, w: u16, h: u16) -> Option<Thumb> {
         .ok()?
         .with_guessed_format()
         .ok()?;
-    let decoded_image = image_reader.decode().ok()?;
+    let (source_width, source_height) = image_reader.into_dimensions().ok()?;
+    if !dimensions_allowed(source_width, source_height) {
+        return None;
+    }
+    let decoded_image = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()?;
     let rgb_thumbnail = decoded_image
         .thumbnail(target_width_px, target_height_px)
         .to_rgb8();
@@ -202,6 +214,14 @@ fn decode(path: &Path, w: u16, h: u16) -> Option<Thumb> {
     })
 }
 
+fn dimensions_allowed(width: u32, height: u32) -> bool {
+    width != 0
+        && height != 0
+        && u64::from(width)
+            .checked_mul(u64::from(height))
+            .is_some_and(|pixels| pixels <= config::THUMB_MAX_PIXELS)
+}
+
 fn pixel_or_white(img: &image::RgbImage, x: u32, y: u32) -> [u8; 3] {
     if x >= img.width() || y >= img.height() {
         return [255, 255, 255];
@@ -212,6 +232,14 @@ fn pixel_or_white(img: &image::RgbImage, x: u32, y: u32) -> [u8; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_or_empty_images_are_rejected_before_decode() {
+        assert!(!dimensions_allowed(0, 100));
+        assert!(!dimensions_allowed(u32::MAX, u32::MAX));
+        assert!(!dimensions_allowed(config::THUMB_MAX_PIXELS as u32 + 1, 1));
+        assert!(dimensions_allowed(100, 100));
+    }
 
     #[test]
     fn a_decoded_thumb_has_one_cell_per_two_pixel_rows() {

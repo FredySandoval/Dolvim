@@ -564,13 +564,12 @@ fn move_places_cursor(app: &mut App, direction: isize) {
 }
 
 fn open_place(app: &mut App, leave_panel: bool) {
-    let target = app
+    if app
         .places
         .get(app.places_cursor)
-        .and_then(|place| place.target())
-        .cloned();
-    if let Some(target) = target {
-        app.goto(target, true);
+        .is_some_and(|place| place.is_selectable())
+    {
+        app.open_place_index(app.places_cursor);
         if leave_panel {
             app.focus = Focus::View;
         }
@@ -588,15 +587,12 @@ fn open_place(app: &mut App, leave_panel: bool) {
 pub enum Action {
     /* navigation */
     Back,
+    /// Vimium-style `H`: history back, or the parent folder when history is empty.
+    BackOrUp,
     Forward,
     GoUp,
     GoHome,
     Open,
-    /// `H`/`L`: out of the folder and into the one under the cursor, the pair
-    /// Vimium spells the same way. Only the list views have them — Icons uses
-    /// its horizontal axis for the grid.
-    NavigateUp,
-    NavigateInto,
     OpenInNewTab,
     Refresh,
     /* cursor */
@@ -612,6 +608,7 @@ pub enum Action {
     PageUp,
     RowStart,
     RowEnd,
+    CenterCursor,
     /* selection */
     /// Unbound for now: Space, the key that used to say this, is the leader.
     #[allow(dead_code)]
@@ -637,9 +634,7 @@ pub enum Action {
     NewFile,
     Undo,
     Properties,
-    Extract,
     EmptyTrash,
-    Restore,
     /* view */
     ViewIcons,
     ViewCompact,
@@ -833,20 +828,11 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
     match action {
         // navigation
         Action::Back => app.back(),
+        Action::BackOrUp => app.back_or_up(),
         Action::Forward => app.forward(),
         Action::GoUp => app.go_up(),
         Action::GoHome => app.goto(Target::Dir(places::home()), true),
         Action::Open => app.activate(),
-        // `H`/`L` walk the directory tree independently of how the current
-        // view lays its items out. Lowercase `h`/`l` remain grid movement in
-        // Icons, while the distinct uppercase actions leave or enter a folder.
-        Action::NavigateUp | Action::NavigateInto => {
-            if action == Action::NavigateUp {
-                app.go_up();
-            } else {
-                app.activate();
-            }
-        }
         Action::OpenInNewTab => {
             if let Some(e) = app.pane().current().cloned() {
                 if e.is_dir() {
@@ -913,6 +899,7 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
             let s = stride.max(1);
             app.move_cursor(s - 1 - (c % s), extend);
         }
+        Action::CenterCursor => app.pane_mut().center_cursor(),
 
         // selection
         Action::ToggleSelect => {
@@ -1028,34 +1015,7 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
                 app.mode = Mode::Properties;
             }
         }
-        Action::Extract => {
-            let Some(e) = app.pane().current().cloned() else {
-                return;
-            };
-            if !e.is_archive() {
-                app.error(format!("{} is not an archive", e.name));
-                return;
-            }
-            let into = app.pane().cwd.clone();
-            match ops::extract(&e.path, &into) {
-                Ok(m) => {
-                    app.info(m);
-                    app.refresh_in_place();
-                }
-                Err(err) => app.error(err),
-            }
-        }
         Action::EmptyTrash => app.mode = Mode::Confirm(Confirm::EmptyTrash),
-        Action::Restore => {
-            let items = app.pane().selected_trash_refs();
-            match ops::restore_from_trash(&items) {
-                Ok(restored_count) => {
-                    app.info(format!("Restored {restored_count} item(s)"));
-                    app.reload();
-                }
-                Err(e) => app.error(e),
-            }
-        }
 
         // view
         Action::ViewIcons => app.set_view(ViewMode::Icons),
@@ -1144,9 +1104,10 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
         Action::JumpMark => app.pending_mark = Some(MarkPending::Jump),
 
         // misc
-        Action::TerminalPanel | Action::TerminalHere => {
+        Action::TerminalPanel => {
             app.suspend = Some(crate::app::Suspend::Shell(app.pane().cwd.clone()));
         }
+        Action::TerminalHere => app.open_terminal_here(),
         Action::DragOut => crate::drag::drag_out(app),
         Action::DropIn => crate::drag::drop_in(app),
         Action::OpenMenu => open_menu(app, MenuKind::Hamburger),
@@ -1687,21 +1648,17 @@ pub fn menu_items(kind: &MenuKind) -> Vec<MenuItem> {
             menu_item("Cut                    Ctrl+X", Action::Cut),
             menu_item("Copy                   Ctrl+C", Action::Copy),
             menu_item("Paste                       p", Action::Paste),
-            menu_item("Restore from Trash           ", Action::Restore),
             menu_item("Empty Trash                  ", Action::EmptyTrash),
-            menu_item("Extract here                 ", Action::Extract),
             menu_item("Select All             Ctrl+A", Action::SelectAll),
             menu_item("Show Hidden Files     <Space>h", Action::ToggleHidden),
             menu_item("Filter                 Ctrl+I", Action::ToggleFilterBar),
             menu_item("Sort by…                     ", Action::OpenSortMenu),
-            menu_item("View mode…                   ", Action::OpenViewMenu),
-            menu_item("Split View                 F3", Action::ToggleSplit),
             menu_item("Places Panel               F9", Action::TogglePlaces),
             menu_item("Information Panel         F11", Action::ToggleInfo),
-            menu_item("Open Terminal Here         F4", Action::TerminalHere),
+            menu_item("Open Terminal Here   Shift+F4", Action::TerminalHere),
             menu_item("Properties          Alt+Enter", Action::Properties),
             menu_item("Help                       F1", Action::Help),
-            menu_item("Quit                   Ctrl+Q", Action::QuitAll),
+            menu_item("Quit                   Ctrl+q", Action::QuitAll),
         ],
         MenuKind::ViewMode => vec![
             menu_item("Icons                  Ctrl+1", Action::ViewIcons),
@@ -2322,6 +2279,18 @@ mod tests {
     }
 
     #[test]
+    fn vimium_j_and_k_cycle_tabs() {
+        let mut app = test_app();
+        app.tabs
+            .push(crate::app::Tab::new(std::env::temp_dir().join("other")));
+
+        press_char(&mut app, 'J');
+        assert_eq!(app.active_tab, 1);
+        press_char(&mut app, 'K');
+        assert_eq!(app.active_tab, 0);
+    }
+
+    #[test]
     fn configured_overlay_and_confirm_keys_are_authoritative() {
         let mut app = test_app();
         app.mode = Mode::Help;
@@ -2627,13 +2596,13 @@ mod tests {
     }
 
     #[test]
-    fn shift_h_and_l_navigate_directories_in_every_view() {
+    fn vimium_history_and_enter_keys_work_in_every_view() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let base = std::env::temp_dir().join(format!(
-            "dolvim-shift-hl-navigation-{}-{unique}",
+            "dolvim-vimium-navigation-{}-{unique}",
             std::process::id()
         ));
         let child = base.join("child");
@@ -2645,13 +2614,34 @@ mod tests {
             app.pane_mut()
                 .set_entries(crate::fs::read_dir(&base, 0).unwrap());
 
-            press_char(&mut app, 'L');
-            assert_eq!(app.pane().cwd, child, "L failed in {view:?}");
+            handle_key_event(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert_eq!(app.pane().cwd, child, "Enter failed in {view:?}");
 
             press_char(&mut app, 'H');
             assert_eq!(app.pane().cwd, base, "H failed in {view:?}");
+            press_char(&mut app, 'L');
+            assert_eq!(app.pane().cwd, child, "L failed in {view:?}");
         }
 
+        let mut app = App::new(child);
+        press_char(&mut app, 'H');
+        assert_eq!(app.pane().cwd, base, "H did not fall back to the parent");
+        press_char(&mut app, 'H');
+        assert_eq!(
+            app.pane().cwd,
+            base.parent().unwrap(),
+            "repeated H returned to the child"
+        );
+        press_char(&mut app, 'L');
+        assert_eq!(app.pane().cwd, base, "L did not move forward to the parent");
+        press_char(&mut app, 'L');
+        assert_eq!(
+            app.pane().cwd,
+            base.join("child"),
+            "L did not return to the child"
+        );
+
+        drop(app);
         std::fs::remove_dir_all(base).unwrap();
     }
 

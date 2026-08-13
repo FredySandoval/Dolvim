@@ -29,13 +29,13 @@ impl Target {
 }
 
 /// How much of a device is in use, for the Places free-space gauge.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct DiskUsage {
     pub used_bytes: u64,
     pub total_bytes: u64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Row {
     /// Blank line above a heading. Dolphin separates its sections with space,
     /// and a row of nothing is cheaper than a margin every renderer must know.
@@ -53,6 +53,8 @@ pub enum Row {
         /// Mounted removable media, which Dolphin gives an eject affordance
         /// at the right edge of the row.
         eject: bool,
+        /// Block-device node for mount and eject actions.
+        device: Option<PathBuf>,
     },
 }
 
@@ -167,6 +169,7 @@ fn place_row(label: &str, glyph: &'static str, target: Target) -> Row {
         gauge: None,
         offline: false,
         eject: false,
+        device: None,
     }
 }
 
@@ -184,7 +187,12 @@ fn device_rows() -> DeviceRows {
         // Dolphin names a partition by its label and falls back to its size,
         // which is the only name an unlabelled disk has.
         let label = if device.label.is_empty() {
-            format!("{} Internal Drive", fs::format_size(device.size))
+            let kind = if device.removable {
+                "Removable Drive"
+            } else {
+                "Internal Drive"
+            };
+            format!("{} {kind}", fs::format_size(device.size))
         } else {
             device.label.clone()
         };
@@ -211,6 +219,7 @@ fn device_rows() -> DeviceRows {
             gauge,
             offline: device.mount.is_none(),
             eject: device.removable && device.mount.is_some(),
+            device: Some(device.path),
         };
         if device.removable {
             removable.push(row);

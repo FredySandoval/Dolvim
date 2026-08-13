@@ -22,6 +22,27 @@ pub struct Plan {
     terminal: bool,
 }
 
+/// Start the configured graphical terminal in `dir` without giving it Dolvim's
+/// controlling terminal. The waiter only reaps the process; closing Dolvim does
+/// not close the terminal window.
+pub fn spawn_terminal(dir: &Path) -> Result<(), String> {
+    let Some((program, args)) = config::TERMINAL_COMMAND.split_first() else {
+        return Err("No terminal command configured".into());
+    };
+    let mut child = Command::new(program)
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("Could not start {program}: {error}"))?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
 impl Plan {
     pub fn needs_terminal(&self) -> bool {
         self.terminal

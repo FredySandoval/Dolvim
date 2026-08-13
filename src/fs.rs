@@ -90,11 +90,6 @@ impl Entry {
             .is_some_and(|extension| config::IMAGE_EXTS.contains(&extension.as_str()))
     }
 
-    pub fn is_archive(&self) -> bool {
-        self.ext()
-            .is_some_and(|extension| config::ARCHIVE_EXTS.contains(&extension.as_str()))
-    }
-
     /// The "Type" column, Dolphin-style plain-English descriptions.
     pub fn type_name(&self) -> String {
         match self.kind {
@@ -296,55 +291,61 @@ pub fn read_dir_as(
     depth: u16,
     backed: bool,
 ) -> std::io::Result<Vec<Entry>> {
-    let mut entries = Vec::new();
-    for dir_entry in fs::read_dir(physical)? {
-        let Ok(dir_entry) = dir_entry else { continue };
-        let name = dir_entry.file_name().to_string_lossy().into_owned();
-        let physical_path = dir_entry.path();
-        let entry_path = logical.join(dir_entry.file_name());
-        let Ok(link_metadata) = fs::symlink_metadata(&physical_path) else {
-            continue;
-        };
-        let is_link = link_metadata.file_type().is_symlink();
-        let link_target = is_link
-            .then(|| fs::read_link(&physical_path).ok())
-            .flatten();
-        // Dolphin follows links for the type shown, but keeps the link marker.
-        let metadata = if is_link {
-            fs::metadata(&physical_path).unwrap_or(link_metadata)
-        } else {
-            link_metadata
-        };
-        let kind = if metadata.is_dir() {
-            Kind::Dir
-        } else if is_link {
-            Kind::Symlink
-        } else {
-            Kind::File
-        };
-        // One `read_dir` answers both "how many children" and "can we get in",
-        // so the lock state costs no extra syscall.
-        let child_count = (kind == Kind::Dir).then(|| dir_child_count(&physical_path));
-        entries.push(Entry {
-            hidden: name.starts_with('.'),
-            name,
-            path: entry_path,
-            backing_path: backed.then_some(physical_path),
-            link_target,
-            kind,
-            size: match child_count {
-                Some(count) => count.unwrap_or(0),
-                None => metadata.len(),
-            },
-            mtime: metadata.mtime(),
-            mode: metadata.permissions().mode(),
-            readable: child_count.map(|count| count.is_some()).unwrap_or(true),
-            trash_id: None,
-            depth,
-            expanded: false,
-        });
-    }
+    let entries = fs::read_dir(physical)?
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry_from_dir_entry(entry, logical, depth, backed))
+        .collect();
     Ok(entries)
+}
+
+fn entry_from_dir_entry(
+    dir_entry: fs::DirEntry,
+    logical: &Path,
+    depth: u16,
+    backed: bool,
+) -> Option<Entry> {
+    let name = dir_entry.file_name().to_string_lossy().into_owned();
+    let physical_path = dir_entry.path();
+    let entry_path = logical.join(dir_entry.file_name());
+    let link_metadata = fs::symlink_metadata(&physical_path).ok()?;
+    let is_link = link_metadata.file_type().is_symlink();
+    let link_target = is_link
+        .then(|| fs::read_link(&physical_path).ok())
+        .flatten();
+    // Dolphin follows links for the type shown, but keeps the link marker.
+    let metadata = if is_link {
+        fs::metadata(&physical_path).unwrap_or(link_metadata)
+    } else {
+        link_metadata
+    };
+    let kind = if metadata.is_dir() {
+        Kind::Dir
+    } else if is_link {
+        Kind::Symlink
+    } else {
+        Kind::File
+    };
+    // One `read_dir` answers both "how many children" and "can we get in",
+    // so the lock state costs no extra syscall.
+    let child_count = (kind == Kind::Dir).then(|| dir_child_count(&physical_path));
+    Some(Entry {
+        hidden: name.starts_with('.'),
+        name,
+        path: entry_path,
+        backing_path: backed.then_some(physical_path),
+        link_target,
+        kind,
+        size: match child_count {
+            Some(count) => count.unwrap_or(0),
+            None => metadata.len(),
+        },
+        mtime: metadata.mtime(),
+        mode: metadata.permissions().mode(),
+        readable: child_count.map(|count| count.is_some()).unwrap_or(true),
+        trash_id: None,
+        depth,
+        expanded: false,
+    })
 }
 
 /// `None` when the directory cannot be opened at all.
@@ -529,6 +530,8 @@ pub fn now_epoch() -> i64 {
 /// mounted, and only `lsblk` knows a partition's type, label and whether its
 /// bus is hotpluggable. It ships with util-linux, same as `mount` itself.
 pub struct Device {
+    /// Block-device node passed to udisksctl for mounting.
+    pub path: PathBuf,
     /// Filesystem label; empty when the partition has none.
     pub label: String,
     pub size: u64,
@@ -544,7 +547,8 @@ const COL_LABEL: usize = 2;
 const COL_MOUNTPOINT: usize = 3;
 const COL_HOTPLUG: usize = 4;
 const COL_PARTTYPENAME: usize = 5;
-const LSBLK_COLUMNS: &str = "SIZE,FSTYPE,LABEL,MOUNTPOINT,HOTPLUG,PARTTYPENAME";
+const COL_PATH: usize = 6;
+const LSBLK_COLUMNS: &str = "SIZE,FSTYPE,LABEL,MOUNTPOINT,HOTPLUG,PARTTYPENAME,PATH";
 
 pub fn devices() -> Vec<Device> {
     let Ok(out) = std::process::Command::new("lsblk")
@@ -563,7 +567,7 @@ fn parse_device(line: &str) -> Option<Device> {
     // Raw mode separates with single spaces and escapes real ones as \x20, so
     // empty columns must survive the split. `split_whitespace` eats them.
     let fields: Vec<&str> = line.split(' ').collect();
-    if fields.len() < 6 {
+    if fields.len() < 7 {
         return None;
     }
     // No filesystem, swap, or the EFI system partition: Dolphin shows none of
@@ -575,6 +579,7 @@ fn parse_device(line: &str) -> Option<Device> {
         return None;
     }
     Some(Device {
+        path: PathBuf::from(unescape_lsblk(fields[COL_PATH])),
         label: unescape_lsblk(fields[COL_LABEL]),
         size: fields[COL_SIZE].parse().unwrap_or(0),
         mount: (!fields[COL_MOUNTPOINT].is_empty())
@@ -586,6 +591,37 @@ fn parse_device(line: &str) -> Option<Device> {
 /// `lsblk -r` escapes the bytes that would otherwise break the column split.
 fn unescape_lsblk(s: &str) -> String {
     s.replace("\\x20", " ")
+}
+
+/// Ask the desktop storage service to mount a filesystem and return its path.
+pub fn mount_device(path: &Path) -> Result<PathBuf, String> {
+    let output = Command::new("udisksctl")
+        .args(["mount", "--block-device"])
+        .arg(path)
+        .output()
+        .map_err(|error| format!("Could not run udisksctl: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    devices()
+        .into_iter()
+        .find(|device| device.path == path)
+        .and_then(|device| device.mount)
+        .ok_or_else(|| "Device mounted without a mount point".into())
+}
+
+/// Ask the desktop storage service to unmount a filesystem.
+pub fn unmount_device(path: &Path) -> Result<(), String> {
+    let output = Command::new("udisksctl")
+        .args(["unmount", "--block-device"])
+        .arg(path)
+        .output()
+        .map_err(|error| format!("Could not run udisksctl: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
 }
 
 /// Free/total bytes for the filesystem holding `path`.
@@ -679,7 +715,8 @@ impl Lister {
                     request = newer_request;
                 }
                 let ListingRequest { path, seq } = request;
-                match read_dir(&path, 0) {
+                let read_dir = match fs::read_dir(&path) {
+                    Ok(read_dir) => read_dir,
                     Err(read_error) => {
                         let _ = tx.send(ListingMsg::Listed(Listing {
                             path,
@@ -687,36 +724,42 @@ impl Lister {
                             entries: Vec::new(),
                             error: Some(read_error.to_string()),
                         }));
+                        continue;
                     }
-                    Ok(all_entries) => {
-                        // Stream in batches so the first screenful appears at once.
-                        let mut sent = false;
-                        for chunk in all_entries.chunks(2000) {
-                            // A newer request supersedes this one; abandon it,
-                            // keeping the request for the next turn.
-                            while let Ok(newer_request) = rx.try_recv() {
-                                pending = Some(newer_request);
-                            }
-                            if pending.is_some() {
-                                break;
-                            }
-                            let _ = tx.send(ListingMsg::Batch {
-                                path: path.clone(),
-                                seq,
-                                entries: chunk.to_vec(),
-                            });
-                            sent = true;
-                        }
-                        if !sent {
-                            let _ = tx.send(ListingMsg::Batch {
-                                path: path.clone(),
-                                seq,
-                                entries: Vec::new(),
-                            });
-                        }
-                        let _ = tx.send(ListingMsg::Done { path, seq });
+                };
+                let mut batch = Vec::with_capacity(2000);
+                for dir_entry in read_dir {
+                    while let Ok(newer_request) = rx.try_recv() {
+                        pending = Some(newer_request);
+                    }
+                    if pending.is_some() {
+                        break;
+                    }
+                    let Some(entry) = dir_entry
+                        .ok()
+                        .and_then(|entry| entry_from_dir_entry(entry, &path, 0, false))
+                    else {
+                        continue;
+                    };
+                    batch.push(entry);
+                    if batch.len() == 2000 {
+                        let _ = tx.send(ListingMsg::Batch {
+                            path: path.clone(),
+                            seq,
+                            entries: std::mem::take(&mut batch),
+                        });
+                        batch.reserve(2000);
                     }
                 }
+                if pending.is_some() {
+                    continue;
+                }
+                let _ = tx.send(ListingMsg::Batch {
+                    path: path.clone(),
+                    seq,
+                    entries: batch,
+                });
+                let _ = tx.send(ListingMsg::Done { path, seq });
             }
         });
         Lister { jobs }
@@ -824,19 +867,22 @@ mod tests {
     /// with no label and no mount point still emits its separators.
     #[test]
     fn lsblk_rows_parse_with_columns_missing() {
-        let esp = "1073741824 vfat   0 EFI\\x20System";
+        let esp = "1073741824 vfat   0 EFI\\x20System /dev/nvme0n1p1";
         assert!(parse_device(esp).is_none());
-        assert!(parse_device("17179869184 swap  [SWAP] 0 Linux\\x20swap").is_none());
+        assert!(parse_device("17179869184 swap  [SWAP] 0 Linux\\x20swap /dev/sda3").is_none());
 
-        let unmounted = parse_device("498754322432 ext4   0 Linux\\x20root\\x20(x86-64)").unwrap();
+        let unmounted =
+            parse_device("498754322432 ext4   0 Linux\\x20root\\x20(x86-64) /dev/nvme0n1p2")
+                .unwrap();
         assert_eq!(unmounted.label, "");
         assert_eq!(unmounted.size, 498754322432);
         assert!(unmounted.mount.is_none());
         assert!(!unmounted.removable);
 
-        let usb =
-            parse_device("220675866624 ext4 my\\x20disk /run/media/fredy/d 1 Linux\\x20filesystem")
-                .unwrap();
+        let usb = parse_device(
+            "220675866624 ext4 my\\x20disk /run/media/fredy/d 1 Linux\\x20filesystem /dev/sdc1",
+        )
+        .unwrap();
         assert_eq!(usb.label, "my disk");
         assert_eq!(usb.mount.unwrap(), PathBuf::from("/run/media/fredy/d"));
         assert!(usb.removable);

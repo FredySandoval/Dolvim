@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
 
@@ -24,6 +24,10 @@ pub enum Suspend {
     Shell(PathBuf),
     /// A resolved command whose handler needs exclusive use of the terminal.
     Open(open::Plan),
+    /// An offline block device whose authorization prompt needs a normal tty.
+    Mount(PathBuf),
+    /// A mounted block device whose authorization prompt needs a normal tty.
+    Unmount(PathBuf),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -237,6 +241,8 @@ pub struct Pane {
     pub pending_focus: Option<EntryFocus>,
     pub history: Vec<Target>,
     pub history_pos: usize,
+    place: Target,
+    place_histories: Vec<(Target, Vec<Target>, usize)>,
     pub seq: u64,
     pub loading: bool,
     pub error: Option<String>,
@@ -352,6 +358,8 @@ impl Pane {
             id: NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed),
             target: Target::Dir(cwd.clone()),
             history: vec![Target::Dir(cwd.clone())],
+            place: Target::Dir(cwd.clone()),
+            place_histories: Vec::new(),
             cwd,
             entries: Vec::new(),
             visible: Vec::new(),
@@ -527,6 +535,31 @@ impl Pane {
             return;
         }
         self.cursor = self.cursor.min(self.visible.len() - 1);
+    }
+
+    /// Put the navigation line containing the cursor halfway down (or across)
+    /// the viewport, as Vim's `zz` does. Near the start there is no preceding
+    /// content with which to fill the first half, so the offset saturates at zero.
+    pub fn center_cursor(&mut self) {
+        let rows = self.grid_rows.max(1) as usize;
+        self.offset = match self.view {
+            ViewMode::Icons => {
+                (self.cursor / self.grid_cols.max(1) as usize).saturating_sub(rows / 2)
+            }
+            ViewMode::Details => self.cursor.saturating_sub(rows / 2),
+            ViewMode::Compact => {
+                let column = self.cursor / rows;
+                let half = self.compact_width_avail as usize / 2;
+                let mut offset = column;
+                let mut width = self.compact_widths.get(column).copied().unwrap_or(0) as usize / 2;
+                while offset > 0 && width < half {
+                    offset -= 1;
+                    width += self.compact_widths.get(offset).copied().unwrap_or(0) as usize;
+                }
+                offset
+            }
+        };
+        self.last_reveal = (self.cursor, self.view);
     }
 
     /// Furthest the viewport may scroll: the last screenful, not the last item.
@@ -775,6 +808,7 @@ pub struct App {
     pub places: Vec<Row>,
     pub places_cursor: usize,
     pub places_visible: bool,
+    places_checked_at: Instant,
     pub info_visible: bool,
     pub filter_bar: bool,
     pub focus: Focus,
@@ -837,6 +871,7 @@ impl App {
             places: places::build(),
             places_cursor: 1,
             places_visible: true,
+            places_checked_at: Instant::now(),
             info_visible: false,
             filter_bar: false,
             focus: Focus::View,
@@ -1166,8 +1201,9 @@ impl App {
     }
 
     /// Drain worker messages. Called once per event-loop tick.
-    pub fn pump_fs_events(&mut self) {
+    pub fn pump_fs_events(&mut self) -> bool {
         let listing_messages: Vec<fs::ListingMsg> = self.listing_rx.try_iter().collect();
+        let mut changed = !listing_messages.is_empty();
         for message in listing_messages {
             match message {
                 fs::ListingMsg::Batch { path, seq, entries } => {
@@ -1199,6 +1235,7 @@ impl App {
         }
         if self.watcher.take_dirty() {
             self.refresh_in_place();
+            changed = true;
         }
         let live_seqs: HashSet<u64> = self
             .tabs
@@ -1207,6 +1244,7 @@ impl App {
             .map(|pane| pane.seq)
             .collect();
         self.streaming.retain(|key, _| live_seqs.contains(&key.seq));
+        changed
     }
 
     fn deliver_listing(&mut self, path: &Path, seq: u64, entries: Vec<Entry>, err: Option<String>) {
@@ -1332,6 +1370,87 @@ impl App {
         self.goto(Target::Dir(d), true);
     }
 
+    /// Open a Places row, mounting an offline block device first.
+    pub fn open_place_index(&mut self, index: usize) {
+        let Some(Row::Item {
+            target,
+            offline,
+            device,
+            ..
+        }) = self.places.get(index).cloned()
+        else {
+            return;
+        };
+        if offline {
+            let Some(device) = device else { return };
+            self.suspend = Some(Suspend::Mount(device));
+        } else {
+            self.open_place(target);
+        }
+    }
+
+    /// Unmount a removable device from its Places-row affordance.
+    pub fn eject_place_index(&mut self, index: usize) {
+        let Some(Row::Item {
+            eject: true,
+            device: Some(device),
+            ..
+        }) = self.places.get(index).cloned()
+        else {
+            return;
+        };
+        self.suspend = Some(Suspend::Unmount(device));
+    }
+
+    /// Poll lsblk sparingly so hotplugged and removed media update live.
+    pub fn refresh_places(&mut self) -> bool {
+        if self.places_checked_at.elapsed() < Duration::from_secs(1) {
+            return false;
+        }
+        self.places_checked_at = Instant::now();
+        let rows = places::build();
+        if rows == self.places {
+            return false;
+        }
+        self.places = rows;
+        self.places_cursor = self.places_cursor.min(self.places.len().saturating_sub(1));
+        true
+    }
+
+    pub fn open_place(&mut self, target: Target) {
+        let pane = self.pane_mut();
+        if pane.place == target {
+            self.goto(target, true);
+            return;
+        }
+
+        if let Some(saved) = pane
+            .place_histories
+            .iter_mut()
+            .find(|(place, _, _)| *place == pane.place)
+        {
+            saved.1 = pane.history.clone();
+            saved.2 = pane.history_pos;
+        } else {
+            pane.place_histories
+                .push((pane.place.clone(), pane.history.clone(), pane.history_pos));
+        }
+        let restored = pane
+            .place_histories
+            .iter()
+            .find(|(place, _, _)| *place == target)
+            .map(|(_, history, pos)| (history.clone(), *pos));
+        pane.place = target.clone();
+        if let Some((history, pos)) = restored {
+            pane.history = history;
+            pane.history_pos = pos;
+        } else {
+            pane.history = vec![target.clone()];
+            pane.history_pos = 0;
+        }
+        self.goto(target, true);
+    }
+
     /// Navigate a rendered breadcrumb without turning a virtual Trash path
     /// into a live filesystem directory.
     pub fn open_breadcrumb(&mut self, path: PathBuf) {
@@ -1381,6 +1500,27 @@ impl App {
             // Dolphin leaves the cursor on the directory you came out of.
             self.select_by_path(&cwd);
         }
+    }
+
+    pub fn back_or_up(&mut self) {
+        if self.pane().history_pos > 0 {
+            self.back();
+            return;
+        }
+
+        let Target::Dir(cwd) = self.pane().target.clone() else {
+            self.go_up();
+            return;
+        };
+        let Some(parent) = cwd.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        let target = Target::Dir(parent);
+        self.goto(target.clone(), false);
+        self.select_by_path(&cwd);
+        let pane = self.pane_mut();
+        pane.history.insert(0, target);
+        pane.history_pos = 0;
     }
 
     pub fn back(&mut self) {
@@ -1447,6 +1587,14 @@ impl App {
         }
     }
 
+    pub fn open_terminal_here(&mut self) {
+        let dir = self.pane().cwd.clone();
+        match open::spawn_terminal(&dir) {
+            Ok(()) => self.info(format!("Opened terminal in {}", dir.display())),
+            Err(error) => self.error(error),
+        }
+    }
+
     pub fn open_external(&mut self, path: &Path) {
         let plan = match open::resolve(path) {
             Ok(plan) => plan,
@@ -1473,7 +1621,7 @@ impl App {
     }
 
     /// Collect failures from detached launchers without blocking the UI.
-    pub fn pump_external_launches(&mut self) {
+    pub fn pump_external_launches(&mut self) -> bool {
         let mut failures = Vec::new();
         self.external_launches
             .retain(|receiver| match receiver.try_recv() {
@@ -1487,6 +1635,9 @@ impl App {
             });
         if let Some(error) = failures.pop() {
             self.error(error);
+            true
+        } else {
+            false
         }
     }
 
@@ -1983,6 +2134,58 @@ mod tests {
                 expanded: false,
             })
             .collect()
+    }
+
+    #[test]
+    fn center_cursor_uses_each_views_scroll_axis() {
+        let mut pane = pane_with(&[]);
+        pane.cursor = 12;
+        pane.grid_rows = 5;
+
+        pane.view = ViewMode::Details;
+        pane.center_cursor();
+        assert_eq!(pane.offset, 10);
+
+        pane.view = ViewMode::Icons;
+        pane.grid_cols = 3;
+        pane.center_cursor();
+        assert_eq!(pane.offset, 2);
+
+        pane.view = ViewMode::Compact;
+        pane.compact_width_avail = 30;
+        pane.compact_widths = vec![10; 6];
+        pane.center_cursor();
+        assert_eq!(pane.offset, 1);
+    }
+
+    #[test]
+    fn places_keep_independent_navigation_histories() {
+        let root = std::env::temp_dir().join(format!(
+            "dolvim-place-history-{}",
+            NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let home = root.join("home");
+        let home_child = home.join("child");
+        let documents = root.join("documents");
+        let documents_child = documents.join("child");
+        std::fs::create_dir_all(&home_child).unwrap();
+        std::fs::create_dir_all(&documents_child).unwrap();
+
+        let mut app = App::new(home.clone());
+        app.open_dir(home_child.clone());
+        app.open_place(Target::Dir(documents.clone()));
+        app.open_dir(documents_child);
+        app.back();
+        assert_eq!(app.pane().cwd, documents);
+        app.back();
+        assert_eq!(app.pane().cwd, documents, "history escaped into Home");
+
+        app.open_place(Target::Dir(home));
+        app.back();
+        assert_eq!(app.pane().cwd, home_child, "Home history was not restored");
+
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// A refresh delivers the listing in readdir order, which is nothing like

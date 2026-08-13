@@ -645,14 +645,6 @@ fn restore_deleted_to(items: &[TrashRef], destination: &Path) -> Result<Vec<Path
     restore_trash_refs(items, Some(destination))
 }
 
-pub fn restore_from_trash(items: &[TrashRef]) -> Result<usize, String> {
-    let _guard = trash_lock();
-    let wanted = exact_trash_items(items)?;
-    let n = wanted.len();
-    trash::os_limited::restore_all(wanted).map_err(trash_error)?;
-    Ok(n)
-}
-
 pub fn purge_from_trash(items: &[TrashRef]) -> Result<usize, String> {
     let _guard = trash_lock();
     let wanted = exact_trash_items(items)?;
@@ -1166,50 +1158,6 @@ pub fn delete_permanently(paths: &[PathBuf]) -> DeleteOutcome {
         }
     }
     outcome
-}
-
-// ---------------------------------------------------------------------------
-// Archive extraction — shelled out and presence-checked
-// ---------------------------------------------------------------------------
-
-pub fn extract(archive: &Path, dest_dir: &Path) -> Result<String, String> {
-    let ext = archive
-        .extension()
-        .map(|e| e.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    let (bin, args): (&str, Vec<String>) = match ext.as_str() {
-        "zip" => (
-            "unzip",
-            vec![
-                "-o".into(),
-                archive.to_string_lossy().into(),
-                "-d".into(),
-                dest_dir.to_string_lossy().into(),
-            ],
-        ),
-        "tar" | "gz" | "tgz" | "bz2" | "xz" | "zst" => (
-            "tar",
-            vec![
-                "-xaf".into(),
-                archive.to_string_lossy().into(),
-                "-C".into(),
-                dest_dir.to_string_lossy().into(),
-            ],
-        ),
-        _ => return Err(format!("Cannot extract .{ext}")),
-    };
-    if which(bin).is_none() {
-        return Err(format!("{bin} is not installed"));
-    }
-    let out = std::process::Command::new(bin)
-        .args(&args)
-        .output()
-        .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(format!("Extracted {}", file_name_of(archive)))
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-    }
 }
 
 #[cfg(test)]

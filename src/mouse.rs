@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, CellPos, Drag, Focus, MenuKind, Mode, ViewMode};
 use crate::config;
@@ -200,10 +201,17 @@ fn handle_left_press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
     if app.places_visible && rect_contains(hitboxes.places, x, y) {
         let places_row_index = places_row_at(app, y);
         if let Some(row) = app.places.get(places_row_index) {
-            if let Some(place_target) = row.target().cloned() {
+            if matches!(row, crate::places::Row::Item { eject: true, .. })
+                && x >= hitboxes
+                    .places
+                    .right()
+                    .saturating_sub(config::glyph::EJECT.width().max(1) as u16 + 1)
+            {
+                app.eject_place_index(places_row_index);
+            } else if row.is_selectable() {
                 app.places_cursor = places_row_index;
                 app.focus = Focus::Places;
-                app.goto(place_target, true);
+                app.open_place_index(places_row_index);
                 app.focus = Focus::View;
             }
         }

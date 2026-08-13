@@ -25,6 +25,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crossterm::cursor::Show;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -220,7 +221,12 @@ fn restore_terminal() {
         let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
     }
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+    let _ = execute!(
+        io::stdout(),
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        Show
+    );
     let _ = io::stdout().flush();
 }
 
@@ -244,9 +250,13 @@ fn run(start: PathBuf, mut observer: Option<observer::Observer>) -> io::Result<(
         observer.observe_state(&app)?;
     }
     let poll_timeout = Duration::from_millis(config::TICK_MS);
+    let mut dirty = true;
 
     while !app.quit {
-        terminal.draw(|frame| ui::draw(frame, &mut app))?;
+        if dirty {
+            terminal.draw(|frame| ui::draw(frame, &mut app))?;
+            dirty = false;
+        }
         let area = terminal.size()?;
         if let Some(observer) = &mut observer {
             observer.rendered(area.width, area.height)?;
@@ -261,22 +271,29 @@ fn run(start: PathBuf, mut observer: Option<observer::Observer>) -> io::Result<(
                     app.status.clear();
                     app.status_is_error = false;
                     vim::handle_key_event(&mut app, key_event);
+                    dirty = true;
                 }
                 Event::Mouse(mouse_event) => {
                     if let Some(observer) = &mut observer {
                         observer.input_mouse(mouse_event)?;
                     }
-                    mouse::handle_mouse_event(&mut app, mouse_event)
+                    mouse::handle_mouse_event(&mut app, mouse_event);
+                    dirty = true;
                 }
+                Event::Resize(_, _) => dirty = true,
                 _ => {}
             }
         }
 
         drain_observations(&mut app, observer.as_mut())?;
-        app.pump_fs_events();
-        app.pump_external_launches();
-        app.thumbs.pump_decoded_thumbs();
-        finish_transfer(&mut app);
+        dirty |= app.pump_fs_events();
+        dirty |= app.refresh_places();
+        dirty |= app.pump_external_launches();
+        dirty |= app.thumbs.pump_decoded_thumbs();
+        dirty |= finish_transfer(&mut app);
+        // Transfer counters are shared atomics updated by the worker, so keep
+        // progress responsive without making the quiescent loop redraw.
+        dirty |= app.active_transfer.is_some();
         if let Some(observer) = &mut observer {
             observer.observe_state(&app)?;
         }
@@ -286,19 +303,26 @@ fn run(start: PathBuf, mut observer: Option<observer::Observer>) -> io::Result<(
         }
 
         if let Some(suspend_request) = app.suspend.take() {
-            let open_result = hand_over(&mut terminal, || match suspend_request {
+            let result = hand_over(&mut terminal, || match suspend_request {
                 Suspend::Shell(dir) => {
                     let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
                     println!("dolvim: shell in {} — exit to return", dir.display());
                     let _ = Command::new(shell).current_dir(&dir).status();
-                    None
+                    Ok(None)
                 }
-                Suspend::Open(plan) => Some(plan.run_foreground()),
+                Suspend::Open(plan) => plan.run_foreground().map(|()| None),
+                Suspend::Mount(device) => fs::mount_device(&device).map(Some),
+                Suspend::Unmount(device) => fs::unmount_device(&device).map(|()| None),
             })?;
-            if let Some(Err(error)) = open_result {
-                app.error(error);
+            match result {
+                Ok(Some(mount)) => {
+                    app.places = places::build();
+                    app.goto(places::Target::Dir(mount), true);
+                }
+                Ok(None) => app.refresh_in_place(),
+                Err(error) => app.error(error),
             }
-            app.refresh_in_place();
+            dirty = true;
         }
     }
 
@@ -338,7 +362,7 @@ fn drain_observations(app: &mut App, observer: Option<&mut observer::Observer>) 
 }
 
 /// Collect a finished background transfer: journal it, report it, relist.
-fn finish_transfer(app: &mut App) {
+fn finish_transfer(app: &mut App) -> bool {
     let done = app.active_transfer.as_ref().is_some_and(|transfer| {
         transfer
             .progress
@@ -346,10 +370,10 @@ fn finish_transfer(app: &mut App) {
             .load(std::sync::atomic::Ordering::Relaxed)
     });
     if !done {
-        return;
+        return false;
     }
     let Some(active_transfer) = app.active_transfer.take() else {
-        return;
+        return false;
     };
     let reveal = active_transfer.reveal;
     let selection_pane_id = active_transfer.selection_pane_id;
@@ -362,7 +386,7 @@ fn finish_transfer(app: &mut App) {
     let Some(outcome) = outcome else {
         app.error("Transfer finished without an outcome");
         app.refresh_in_place();
-        return;
+        return true;
     };
 
     let committed_sources: std::collections::HashSet<_> = outcome
@@ -487,6 +511,7 @@ fn finish_transfer(app: &mut App) {
     } else {
         app.refresh_in_place();
     }
+    true
 }
 
 /// Give the terminal to a child that needs all of it — a shell, an editor —

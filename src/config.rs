@@ -19,7 +19,7 @@ pub const THEME: &Theme = &theme::BREEZE_DARK;
 
 /* icons / glyphs; private-use glyphs require a Nerd Font */
 pub mod glyph {
-  /*            Name               Escape             Glyph          Location            */
+  /*            Name               Escape              Glyph         Location            */
     pub const FOLDER        : &str = "\u{ea83}"  ; /*         directory entry            */
     pub const FOLDER_EMPTY  : &str = "\u{eaf7}"  ; /*         directory with no children */
     pub const FOLDER_OPEN   : &str = "\u{f0770}" ; /*    󰝰    expanded in Details        */
@@ -62,6 +62,7 @@ pub mod glyph {
 pub const PLACES_WIDTH        : u16 =   22; /* Places panel width in terminal columns          */
 pub const INFO_WIDTH          : u16 =   30; /* Information panel columns (F11)                 */
 pub const TYPEAHEAD_TIMEOUT_MS: u64 = 1000; /* type-ahead buffer life without a keystroke      */
+pub const TERMINAL_COMMAND: &[&str] = &["alacritty"]; /* Shift+F4: program followed by arguments       */
 
 /* mouse */
 pub const DOUBLE_CLICK_MS     : u64 =  400; /* second click inside this counts as a double     */
@@ -89,6 +90,7 @@ pub const EDITOR_MIME_SUFFIXES: &[&str] = &["+json", "+xml"];
 /* thumbnails and file view */
 pub const THUMB_CACHE_CAP    : usize = 512; /* decoded thumbnails held in memory               */
 pub const THUMB_MAX_INFLIGHT : usize =  32; /* decodes queued at once; the rest wait           */
+pub const THUMB_MAX_PIXELS   :   u64 = 100_000_000; /* reject oversized decoded images before decode   */
 pub const CELL_GAP           :   u16 =   2; /* blank columns between icon-view tiles           */
 pub const VIEW_MARGIN        :   u16 =   1; /* blank columns left of Compact and Details rows  */
 pub const NAME_LINES         :   u16 =   3; /* rows a name may wrap over in the icon view      */
@@ -118,7 +120,7 @@ pub const PROGRESS_POPUP_H: u16 =  6; /* transfer popup, rows                   
 pub const PROGRESS_BAR_WIDTH: usize = PROGRESS_POPUP_W as usize - 4;
 
 /* toolbar: space reserved right of the breadcrumb */
-pub const TOOLBAR_RIGHT_WIDTH: u16 = 22; /* right-hand toolbar controls, columns            */
+pub const TOOLBAR_RIGHT_WIDTH: u16 = 22; /* right-hand toolbar controls, columns     */
 
 /* icon view cell pitch; includes cursor-frame gaps */
 pub const CELL_WIDTH  : u16 = 15; /* icon-view cell pitch, columns                   */
@@ -197,16 +199,16 @@ const TEXT_ENTRY  : &[BindMode] = &[ COMMAND, SEARCH, FILTER, PATH_EDIT, RENAME,
 /* Unified mode-aware keybindings. Origins are comments, not precedence. */
 pub const KEY_BINDINGS: &[Bind] = &[
     /* Places bindings */
-    /*   modifier  key        modes      action                          */
-    bind(NONE,     Char('h'), &[PLACES], Action::NoOp                   ),
-    bind(NONE,     Char('j'), &[PLACES], Action::PlacesDown             ),
-    bind(NONE,     Char('k'), &[PLACES], Action::PlacesUp               ),
-    bind(NONE,     Char('l'), &[PLACES], Action::PlacesOpen             ),
-    bind(NONE,     Left     , &[PLACES], Action::NoOp                   ),
-    bind(NONE,     Down     , &[PLACES], Action::PlacesDown             ),
-    bind(NONE,     Up       , &[PLACES], Action::PlacesUp               ),
-    bind(NONE,     Right    , &[PLACES], Action::PlacesOpen             ),
-    bind(NONE,     Enter    , &[PLACES], Action::PlacesAccept           ),
+    /*   modifier  key        modes      action               */
+    bind(NONE,     Char('h'), &[PLACES], Action::NoOp        ),
+    bind(NONE,     Char('j'), &[PLACES], Action::PlacesDown  ),
+    bind(NONE,     Char('k'), &[PLACES], Action::PlacesUp    ),
+    bind(NONE,     Char('l'), &[PLACES], Action::PlacesOpen  ),
+    bind(NONE,     Left     , &[PLACES], Action::NoOp        ),
+    bind(NONE,     Down     , &[PLACES], Action::PlacesDown  ),
+    bind(NONE,     Up       , &[PLACES], Action::PlacesUp    ),
+    bind(NONE,     Right    , &[PLACES], Action::PlacesOpen  ),
+    bind(NONE,     Enter    , &[PLACES], Action::PlacesAccept),
     bind(NONE,     Tab      , &[PLACES], Action::Focus(Direction::Right)),
     bind(CTRL,     Char('h'), &[PLACES], Action::Focus(Direction::Left )),
     bind(CTRL,     Char('j'), &[PLACES], Action::Focus(Direction::Down )),
@@ -214,14 +216,14 @@ pub const KEY_BINDINGS: &[Bind] = &[
     bind(CTRL,     Char('l'), &[PLACES], Action::Focus(Direction::Right)),
     //
     /* Tabs pane bindings */
-    bind(NONE,     Char('h'), &[TABS], Action::PrevTab                ),
-    bind(NONE,     Char('l'), &[TABS], Action::NextTab                ),
-    bind(NONE,     Char('j'), &[TABS], Action::NoOp                   ),
-    bind(NONE,     Char('k'), &[TABS], Action::NoOp                   ),
-    bind(NONE,     Left     , &[TABS], Action::PrevTab                ),
-    bind(NONE,     Down     , &[TABS], Action::NoOp                   ),
-    bind(NONE,     Up       , &[TABS], Action::NoOp                   ),
-    bind(NONE,     Right    , &[TABS], Action::NextTab                ),
+    bind(NONE,     Char('h'), &[TABS], Action::PrevTab),
+    bind(NONE,     Char('l'), &[TABS], Action::NextTab),
+    bind(NONE,     Char('j'), &[TABS], Action::NoOp   ),
+    bind(NONE,     Char('k'), &[TABS], Action::NoOp   ),
+    bind(NONE,     Left     , &[TABS], Action::PrevTab),
+    bind(NONE,     Down     , &[TABS], Action::NoOp   ),
+    bind(NONE,     Up       , &[TABS], Action::NoOp   ),
+    bind(NONE,     Right    , &[TABS], Action::NextTab),
     bind(CTRL,     Char('h'), &[TABS], Action::Focus(Direction::Left )),
     bind(CTRL,     Char('j'), &[TABS], Action::Focus(Direction::Down )),
     bind(CTRL,     Char('k'), &[TABS], Action::Focus(Direction::Up   )),
@@ -273,37 +275,39 @@ pub const KEY_BINDINGS: &[Bind] = &[
     bind(NONE      , F(1)     , VIEW_MODES, Action::Help            ),
     bind(CTRL      , Char('q'), VIEW_MODES, Action::QuitAll         ),
     /* Vim-like bindings */
-    /* modifier     key          modes                   action              */
-    bind(NONE ,  Char('h') ,  VIEW_MODES  ,   Action::MoveLeft               ),
-    bind(NONE ,  Char('j') ,  VIEW_MODES  ,   Action::MoveDown               ),
-    bind(NONE ,  Char('k') ,  VIEW_MODES  ,   Action::MoveUp                 ),
-    bind(NONE ,  Char('l') ,  VIEW_MODES  ,   Action::MoveRight              ),
-    bind(SHIFT,  Char('G') ,  VIEW_MODES  ,   Action::Bottom                 ),
-    bind(SHIFT,  Char('H') ,  VIEW_MODES  ,   Action::NavigateUp             ),
-    bind(SHIFT,  Char('L') ,  VIEW_MODES  ,   Action::NavigateInto           ),
-    bind(CTRL ,  Char('d') ,  VIEW_MODES  ,   Action::HalfPageDown           ),
-    bind(CTRL ,  Char('u') ,  VIEW_MODES  ,   Action::HalfPageUp             ),
-    bind(CTRL ,  Char('f') ,  VIEW_MODES  ,   Action::PageDown               ),
-    bind(CTRL ,  Char('b') ,  VIEW_MODES  ,   Action::PageUp                 ),
-    bind(NONE ,  Char('0') ,  VIEW_MODES  ,   Action::RowStart               ),
-    bind(NONE ,  Char('$') ,  VIEW_MODES  ,   Action::RowEnd                 ),
-    bind(NONE ,  Char('v') ,  VIEW_MODES  ,   Action::EnterVisual            ),
-    bind(SHIFT,  Char('V') ,  VIEW_MODES  ,   Action::EnterVisualLine        ),
-    bind(NONE ,  Char('y') ,  VISUAL_MODES,   Action::Yank                   ),
-    bind(NONE ,  Char('d') ,  &[NORMAL]   ,   Action::DeleteOp               ),
-    bind(NONE ,  Char('d') ,  VISUAL_MODES,   Action::DeleteSelection        ),
-    bind(NONE ,  Char('p') ,  VIEW_MODES  ,   Action::Paste                  ),
-    bind(NONE ,  Char('x') ,  VIEW_MODES  ,   Action::Trash                  ),
-    bind(NONE ,  Char('o') ,  VIEW_MODES  ,   Action::NewFile                ),
-    bind(SHIFT,  Char('O') ,  VIEW_MODES  ,   Action::NewFolder              ),
-    bind(NONE ,  Char('u') ,  VIEW_MODES  ,   Action::Undo                   ),
-    bind(NONE ,  Char('/') ,  VIEW_MODES  ,   Action::EnterSearch            ),
-    bind(NONE ,  Char('n') ,  VIEW_MODES  ,   Action::SearchNext             ),
-    bind(SHIFT,  Char('N') ,  VIEW_MODES  ,   Action::SearchPrev             ),
-    bind(NONE ,  Char(':') ,  VIEW_MODES  ,   Action::EnterCommand           ),
-    bind(CTRL ,  Enter     ,  VIEW_MODES  ,   Action::OpenInNewTab           ),
-    bind(NONE ,  Char('m') ,  VIEW_MODES  ,   Action::SetMark                ),
-    bind(NONE ,  Char('\''),  VIEW_MODES  ,   Action::JumpMark               ),
+    /* modifier     key          modes                   action      */
+    bind(NONE ,  Char('h') ,  VIEW_MODES  ,   Action::MoveLeft       ),
+    bind(NONE ,  Char('j') ,  VIEW_MODES  ,   Action::MoveDown       ),
+    bind(NONE ,  Char('k') ,  VIEW_MODES  ,   Action::MoveUp         ),
+    bind(NONE ,  Char('l') ,  VIEW_MODES  ,   Action::MoveRight      ),
+    bind(SHIFT,  Char('G') ,  VIEW_MODES  ,   Action::Bottom         ),
+    bind(SHIFT,  Char('H') ,  VIEW_MODES  ,   Action::BackOrUp       ),
+    bind(SHIFT,  Char('L') ,  VIEW_MODES  ,   Action::Forward        ),
+    bind(SHIFT,  Char('J') ,  VIEW_MODES  ,   Action::PrevTab        ),
+    bind(SHIFT,  Char('K') ,  VIEW_MODES  ,   Action::NextTab        ),
+    bind(CTRL ,  Char('d') ,  VIEW_MODES  ,   Action::HalfPageDown   ),
+    bind(CTRL ,  Char('u') ,  VIEW_MODES  ,   Action::HalfPageUp     ),
+    bind(CTRL ,  Char('f') ,  VIEW_MODES  ,   Action::PageDown       ),
+    bind(CTRL ,  Char('b') ,  VIEW_MODES  ,   Action::PageUp         ),
+    bind(NONE ,  Char('0') ,  VIEW_MODES  ,   Action::RowStart       ),
+    bind(NONE ,  Char('$') ,  VIEW_MODES  ,   Action::RowEnd         ),
+    bind(NONE ,  Char('v') ,  VIEW_MODES  ,   Action::EnterVisual    ),
+    bind(SHIFT,  Char('V') ,  VIEW_MODES  ,   Action::EnterVisualLine),
+    bind(NONE ,  Char('y') ,  VISUAL_MODES,   Action::Yank           ),
+    bind(NONE ,  Char('d') ,  &[NORMAL]   ,   Action::DeleteOp       ),
+    bind(NONE ,  Char('d') ,  VISUAL_MODES,   Action::DeleteSelection),
+    bind(NONE ,  Char('p') ,  VIEW_MODES  ,   Action::Paste          ),
+    bind(NONE ,  Char('x') ,  VIEW_MODES  ,   Action::Trash          ),
+    bind(NONE ,  Char('o') ,  VIEW_MODES  ,   Action::NewFile        ),
+    bind(SHIFT,  Char('O') ,  VIEW_MODES  ,   Action::NewFolder      ),
+    bind(NONE ,  Char('u') ,  VIEW_MODES  ,   Action::Undo           ),
+    bind(NONE ,  Char('/') ,  VIEW_MODES  ,   Action::EnterSearch    ),
+    bind(NONE ,  Char('n') ,  VIEW_MODES  ,   Action::SearchNext     ),
+    bind(SHIFT,  Char('N') ,  VIEW_MODES  ,   Action::SearchPrev     ),
+    bind(NONE ,  Char(':') ,  VIEW_MODES  ,   Action::EnterCommand   ),
+    bind(CTRL ,  Enter     ,  VIEW_MODES  ,   Action::OpenInNewTab   ),
+    bind(NONE ,  Char('m') ,  VIEW_MODES  ,   Action::SetMark        ),
+    bind(NONE ,  Char('\''),  VIEW_MODES  ,   Action::JumpMark       ),
     bind(CTRL ,  Char('h') ,  VIEW_MODES  ,   Action::Focus(Direction::Left )),
     bind(CTRL ,  Char('j') ,  VIEW_MODES  ,   Action::Focus(Direction::Down )),
     bind(CTRL ,  Char('l') ,  VIEW_MODES  ,   Action::Focus(Direction::Right)),
@@ -327,25 +331,25 @@ pub const KEY_BINDINGS: &[Bind] = &[
     bind(NONE, Esc      , &[CONFIRM, PROPERTIES, HELP], Action::Cancel       ),
     bind(NONE, Char('q'), &[         PROPERTIES, HELP], Action::Cancel       ),
     /* Menu, breadcrumb, and toolbar bindings */
-    bind(NONE, Esc      , &[MENU,CRUMB_MENU,BUTTONS], Action::Cancel                 ),
-    bind(NONE, Char('q'), &[MENU,CRUMB_MENU,BUTTONS], Action::Cancel                 ),
-    bind(NONE, Down     , &[MENU,CRUMB_MENU        ], Action::InterfaceDown          ),
-    bind(NONE, Char('j'), &[MENU,CRUMB_MENU        ], Action::InterfaceDown          ),
-    bind(CTRL, Char('n'), &[MENU,CRUMB_MENU        ], Action::InterfaceDown          ),
-    bind(NONE, Up       , &[MENU,CRUMB_MENU        ], Action::InterfaceUp            ),
-    bind(NONE, Char('k'), &[MENU,CRUMB_MENU        ], Action::InterfaceUp            ),
-    bind(CTRL, Char('p'), &[MENU,CRUMB_MENU        ], Action::InterfaceUp            ),
-    bind(NONE, Home     , &[MENU                   ], Action::InterfaceFirst         ),
-    bind(NONE, Char('g'), &[MENU                   ], Action::InterfaceFirst         ),
-    bind(NONE, End      , &[MENU                   ], Action::InterfaceLast          ),
-    bind(NONE, Char('G'), &[MENU                   ], Action::InterfaceLast          ),
-    bind(NONE, Left     , &[MENU,CRUMB_MENU,BUTTONS], Action::InterfaceLeft          ),
-    bind(NONE, Char('h'), &[MENU,CRUMB_MENU,BUTTONS], Action::InterfaceLeft          ),
-    bind(NONE, Right    , &[MENU,CRUMB_MENU,BUTTONS], Action::InterfaceRight         ),
-    bind(NONE, Char('l'), &[MENU,CRUMB_MENU,BUTTONS], Action::InterfaceRight         ),
-    bind(NONE, Enter    , &[MENU,CRUMB_MENU,BUTTONS], Action::InterfaceAccept        ),
-    bind(NONE, Tab      , &[MENU,CRUMB_MENU,BUTTONS], Action::InterfaceAccept        ),
-    bind(CTRL, Char('y'), &[MENU,CRUMB_MENU,BUTTONS], Action::InterfaceAccept        ),
+    bind(NONE, Esc      , &[MENU,CRUMB_MENU,BUTTONS], Action::Cancel         ),
+    bind(NONE, Char('q'), &[MENU,CRUMB_MENU,BUTTONS], Action::Cancel         ),
+    bind(NONE, Down     , &[MENU,CRUMB_MENU        ], Action::InterfaceDown  ),
+    bind(NONE, Char('j'), &[MENU,CRUMB_MENU        ], Action::InterfaceDown  ),
+    bind(CTRL, Char('n'), &[MENU,CRUMB_MENU        ], Action::InterfaceDown  ),
+    bind(NONE, Up       , &[MENU,CRUMB_MENU        ], Action::InterfaceUp    ),
+    bind(NONE, Char('k'), &[MENU,CRUMB_MENU        ], Action::InterfaceUp    ),
+    bind(CTRL, Char('p'), &[MENU,CRUMB_MENU        ], Action::InterfaceUp    ),
+    bind(NONE, Home     , &[MENU                   ], Action::InterfaceFirst ),
+    bind(NONE, Char('g'), &[MENU                   ], Action::InterfaceFirst ),
+    bind(NONE, End      , &[MENU                   ], Action::InterfaceLast  ),
+    bind(NONE, Char('G'), &[MENU                   ], Action::InterfaceLast  ),
+    bind(NONE, Left     , &[MENU,CRUMB_MENU,BUTTONS], Action::InterfaceLeft  ),
+    bind(NONE, Char('h'), &[MENU,CRUMB_MENU,BUTTONS], Action::InterfaceLeft  ),
+    bind(NONE, Right    , &[MENU,CRUMB_MENU,BUTTONS], Action::InterfaceRight ),
+    bind(NONE, Char('l'), &[MENU,CRUMB_MENU,BUTTONS], Action::InterfaceRight ),
+    bind(NONE, Enter    , &[MENU,CRUMB_MENU,BUTTONS], Action::InterfaceAccept),
+    bind(NONE, Tab      , &[MENU,CRUMB_MENU,BUTTONS], Action::InterfaceAccept),
+    bind(CTRL, Char('y'), &[MENU,CRUMB_MENU,BUTTONS], Action::InterfaceAccept),
     bind(CTRL, Char('j'), &[MENU,CRUMB_MENU,BUTTONS], Action::Focus(Direction::Down )),
     bind(CTRL, Char('k'), &[MENU,CRUMB_MENU,BUTTONS], Action::Focus(Direction::Up   )),
     bind(CTRL, Char('h'), &[MENU,CRUMB_MENU,BUTTONS], Action::Focus(Direction::Left )),
@@ -364,6 +368,7 @@ pub const CHORDS: &[Chord] = &[
     chord('g',    't',      VIEW_MODES, Action::NextTab           ),
     chord('g',    'T',      VIEW_MODES, Action::PrevTab           ),
     chord('g',    'u',      VIEW_MODES, Action::GoUp              ),
+    chord('z',    'z',      VIEW_MODES, Action::CenterCursor      ),
     chord('z',    'c',      VIEW_MODES, Action::CloseFold         ),
     chord('z',    'o',      VIEW_MODES, Action::OpenFold          ),
     chord('z',    'a',      VIEW_MODES, Action::ToggleExpand      ),

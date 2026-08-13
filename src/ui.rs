@@ -372,7 +372,7 @@ fn body(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn places_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     paint(frame, area, config::THEME.panel.background);
-    let focused = app.focus == Focus::Places;
+    let focused = vim::current_focus_region(app) == crate::app::FocusRegion::Places;
     let buf = frame.buffer_mut();
     // No splitter rule: PANEL_BG against the view's white already reads as an
     // edge, and a drawn line only competes with it. Full width is ours.
@@ -404,12 +404,22 @@ fn places_panel(frame: &mut Frame, app: &mut App, area: Rect) {
                 ..
             } => {
                 let selected = i == app.places_cursor;
+                let selection = if focused {
+                    config::THEME.selection
+                } else {
+                    config::THEME.inactive_selection
+                };
                 let bg = if selected {
-                    config::THEME.selection.background
+                    selection.background
                 } else {
                     config::THEME.panel.background
                 };
-                let st = Style::default().bg(bg).fg(config::THEME.view.foreground);
+                let fg = if selected {
+                    selection.foreground
+                } else {
+                    config::THEME.view.foreground
+                };
+                let st = Style::default().bg(bg).fg(fg);
                 for x in area.x..area.x + w {
                     if let Some(c) = buf.cell_mut((x, y)) {
                         c.set_char(' ').set_style(st);
@@ -423,7 +433,7 @@ fn places_panel(frame: &mut Frame, app: &mut App, area: Rect) {
                         for x in area.x..area.x + filled.min(w) {
                             if let Some(c) = buf.cell_mut((x, y)) {
                                 c.set_bg(if selected {
-                                    config::THEME.selection.background
+                                    selection.background
                                 } else {
                                     config::THEME.gauge_full
                                 });
@@ -453,7 +463,7 @@ fn places_panel(frame: &mut Frame, app: &mut App, area: Rect) {
                     area.x + 1 + gw,
                     y,
                     clip(label, w.saturating_sub(2 + gw + ew) as usize),
-                    Style::default().fg(config::THEME.view.foreground),
+                    Style::default().fg(fg),
                 );
                 if *eject {
                     buf.set_string(
@@ -474,6 +484,13 @@ fn places_panel(frame: &mut Frame, app: &mut App, area: Rect) {
                         Some(Rect::new(area.x, y, w, 1)),
                     );
                 }
+                if selected {
+                    state_marker(
+                        buf,
+                        Rect::new(area.x, y, w, 1),
+                        if focused { '>' } else { '*' },
+                    );
+                }
             }
         }
     }
@@ -484,7 +501,7 @@ fn places_panel(frame: &mut Frame, app: &mut App, area: Rect) {
 // ---------------------------------------------------------------------------
 
 fn draw_pane(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
-    let is_active = pane_index == app.tab().active && app.focus == Focus::View;
+    let is_active = vim::current_focus_region(app) == crate::app::FocusRegion::View(pane_index);
     paint(frame, area, config::THEME.view.background);
     {
         let p = app.pane_at_mut(pane_index);
@@ -540,7 +557,7 @@ fn entry_selected(pane: &Pane, visible_index: usize) -> bool {
     pane.selected.contains(&entry.selection_key())
 }
 
-fn entry_style(pane: &Pane, visible_index: usize, is_cut: bool) -> Style {
+fn entry_style(pane: &Pane, visible_index: usize, is_cut: bool, active: bool) -> Style {
     let e = &pane.entries[pane.visible[visible_index]];
     let selected = pane.selected.contains(&e.selection_key());
     let fg = if is_cut {
@@ -557,9 +574,14 @@ fn entry_style(pane: &Pane, visible_index: usize, is_cut: bool) -> Style {
         config::THEME.view.foreground
     };
     if selected {
+        let selection = if active {
+            config::THEME.selection
+        } else {
+            config::THEME.inactive_selection
+        };
         Style::default()
-            .fg(config::THEME.selection.foreground)
-            .bg(config::THEME.selection.background)
+            .fg(selection.foreground)
+            .bg(selection.background)
     } else {
         Style::default().fg(fg).bg(config::THEME.view.background)
     }
@@ -666,11 +688,16 @@ fn draw_icons_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, act
             p.entries[p.visible[vis]].clone()
         };
         let is_cut = cut && cut_set.contains(&e.path);
-        let st = entry_style(app.pane_at(idx), vis, is_cut);
+        let st = entry_style(app.pane_at(idx), vis, is_cut, active);
 
         // Selection fill covers the whole cell.
         if entry_selected(app.pane_at(idx), vis) {
-            fill(frame.buffer_mut(), cell, config::THEME.selection.background);
+            let selection = if active {
+                config::THEME.selection
+            } else {
+                config::THEME.inactive_selection
+            };
+            fill(frame.buffer_mut(), cell, selection.background);
         }
 
         // Thumbnail, or the glyph stand-in while one is being decoded.
@@ -716,6 +743,18 @@ fn draw_icons_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, act
                 frame.buffer_mut(),
                 Rect::new(cell.x, cell.y, cell.width, h),
                 active,
+            );
+        }
+        let selected = entry_selected(app.pane_at(idx), vis);
+        if selected || (active && vis == app.pane_at(idx).cursor) {
+            state_marker(
+                frame.buffer_mut(),
+                cell,
+                if active && vis == app.pane_at(idx).cursor {
+                    '>'
+                } else {
+                    '*'
+                },
             );
         }
     }
@@ -779,11 +818,16 @@ fn draw_compact_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, a
                 p.entries[p.visible[vis]].clone()
             };
             let is_cut = cut && cut_set.contains(&e.path);
-            let st = entry_style(app.pane_at(idx), vis, is_cut);
+            let st = entry_style(app.pane_at(idx), vis, is_cut, active);
             let w = (*cw).min(area.right() - x);
             let cell = Rect::new(x, y, w, 1);
             if entry_selected(app.pane_at(idx), vis) {
-                fill(frame.buffer_mut(), cell, config::THEME.selection.background);
+                let selection = if active {
+                    config::THEME.selection
+                } else {
+                    config::THEME.inactive_selection
+                };
+                fill(frame.buffer_mut(), cell, selection.background);
             }
             let text = compact_entry_text(&e);
             frame
@@ -797,6 +841,18 @@ fn draw_compact_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, a
                     cell,
                     active,
                     entry_selected(app.pane_at(idx), vis).then_some(cell),
+                );
+            }
+            let selected = entry_selected(app.pane_at(idx), vis);
+            if selected || (active && vis == app.pane_at(idx).cursor) {
+                state_marker(
+                    frame.buffer_mut(),
+                    cell,
+                    if active && vis == app.pane_at(idx).cursor {
+                        '>'
+                    } else {
+                        '*'
+                    },
                 );
             }
         }
@@ -1041,10 +1097,15 @@ fn draw_details_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, a
             p.entries[p.visible[vis]].clone()
         };
         let is_cut = cut && cut_set.contains(&e.path);
-        let st = entry_style(app.pane_at(idx), vis, is_cut);
+        let st = entry_style(app.pane_at(idx), vis, is_cut, active);
         let row = Rect::new(area.x, y, area.width, 1);
         if entry_selected(app.pane_at(idx), vis) {
-            fill(frame.buffer_mut(), row, config::THEME.selection.background);
+            let selection = if active {
+                config::THEME.selection
+            } else {
+                config::THEME.inactive_selection
+            };
+            fill(frame.buffer_mut(), row, selection.background);
         }
 
         // Expandable-folder arrow plus indent, Dolphin's tree column.
@@ -1079,6 +1140,18 @@ fn draw_details_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, a
                 row,
                 active,
                 entry_selected(app.pane_at(idx), vis).then_some(row),
+            );
+        }
+        let selected = entry_selected(app.pane_at(idx), vis);
+        if selected || (active && vis == app.pane_at(idx).cursor) {
+            state_marker(
+                frame.buffer_mut(),
+                row,
+                if active && vis == app.pane_at(idx).cursor {
+                    '>'
+                } else {
+                    '*'
+                },
             );
         }
     }
@@ -1561,7 +1634,8 @@ fn help_lines() -> Vec<Line<'static>> {
         key_row("h j k l", "left / down / up / right (grid-aware)"),
         key_row("gg  G  5j  0  $", "top, bottom, counts, row start/end"),
         key_row("Ctrl+d / Ctrl+u", "half page"),
-        key_row("L / Enter", "open        H / Backspace  up"),
+        key_row("Enter", "open the selected folder or file"),
+        key_row("H / L", "history back / forward (H falls back to up)"),
         key_row("Alt+← / Alt+→", "back / forward in history"),
         section_heading("Selection"),
         key_row("v  V  Ctrl+V", "visual, by row, block (Icons only)"),
@@ -1587,8 +1661,9 @@ fn help_lines() -> Vec<Line<'static>> {
         key_row("h  l", "previous / next item; a menu button opens"),
         key_row("j  k / Ctrl+n  Ctrl+p", "down / up an open menu"),
         key_row("Ctrl+y  Enter  Tab", "accept          Esc  cancel"),
-        key_row("F4", "shell here (suspends Dolvim)"),
+        key_row("F4 / Shift+F4", "shell here / separate terminal"),
         section_heading("Tabs and commands"),
+        key_row("J / K", "previous / next tab"),
         key_row("Ctrl+T Ctrl+W gt gT", "new, close, next, previous"),
         key_row(":e :cd :sort :view", ":split :q :qa"),
         key_row("/  n  N", "search      Ctrl+k then the menu button"),
@@ -1667,6 +1742,9 @@ fn menu_popup(frame: &mut Frame, r: Rect, selected_row: usize, items: &[String])
             clip(s, inner.width.saturating_sub(2) as usize),
             st,
         );
+        if i == selected_row {
+            state_marker(buf, Rect::new(inner.x, y, inner.width, 1), '>');
+        }
     }
 }
 
@@ -1687,6 +1765,13 @@ fn fill(buf: &mut Buffer, r: Rect, bg: ratatui::style::Color) {
                 c.set_char(' ').set_bg(bg);
             }
         }
+    }
+}
+
+fn state_marker(buf: &mut Buffer, area: Rect, marker: char) {
+    if let Some(cell) = buf.cell_mut((area.x, area.y)) {
+        let background = cell.bg;
+        cell.set_char(marker).set_fg(background);
     }
 }
 
