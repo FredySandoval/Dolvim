@@ -10,22 +10,38 @@ permissions:
 
 jobs:
   build:
-    name: Build Linux x86_64
+    name: Build Linux ${{ matrix.arch }}
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            linker: gcc
+          - arch: aarch64
+            target: aarch64-unknown-linux-gnu
+            linker: aarch64-linux-gnu-gcc
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install ARM linker
+        if: matrix.arch == 'aarch64'
+        run: sudo apt-get update && sudo apt-get install --yes gcc-aarch64-linux-gnu
       - name: Verify tag matches package version
         shell: bash
         run: test "${GITHUB_REF_NAME}" = "v$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
       - name: Build
-        run: cargo build --release --locked
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+        run: cargo build --release --locked --target "${{ matrix.target }}"
       - name: Package
-        run: tar -czf dolvim-linux-x86_64.tar.gz -C target/release dolvim -C ../.. README.md LICENSE
+        run: tar -czf "dolvim-linux-${{ matrix.arch }}.tar.gz" -C "target/${{ matrix.target }}/release" dolvim -C ../../.. README.md LICENSE
       - uses: actions/upload-artifact@v4
         with:
-          name: dolvim-linux-x86_64.tar.gz
-          path: dolvim-linux-x86_64.tar.gz
+          name: dolvim-linux-${{ matrix.arch }}.tar.gz
+          path: dolvim-linux-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
 
   release:
