@@ -208,7 +208,7 @@ Drag-out and drop-in still work from the mouse. `Action::DragOut`, `DropIn` and
 ### Still missing
 
 Vim keys a user will reach for and not find: `Ctrl+r` (redo — `u` currently
-undoes with no way back), `.` (repeat), `{` / `}`, `w` / `b`, `zz`, `''`.
+undoes with no way back), `.` (repeat), `{` / `}`, `w` / `b`, `''`.
 
 `H`/`L` are Vimium's, not vim's — vim spells them "cursor to the top / bottom of
 the screen", which leaves `M` stranded with no siblings. `Ctrl+h` / `Ctrl+l` for
