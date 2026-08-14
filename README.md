@@ -2,7 +2,7 @@
 
 KDE Dolphin, recreated in the terminal, with vim bindings, written in rust btw.
 
-![dolvim](assets/Dolvim-2026-08-14_03-49.png)
+![dolvim](assets/Dolvim.png)
 
 A file manager that looks and behaves like Dolphin — Places panel, breadcrumb,
 tabs, Details view, thumbnails, drag and drop, trash — driven by vim keys or the
