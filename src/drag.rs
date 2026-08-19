@@ -106,6 +106,10 @@ pub fn drag_out(app: &mut App) {
 /// Receive a drop from another application: the helper prints the dropped
 /// paths, and we copy them into the current directory.
 pub fn drop_in(app: &mut App) {
+    if app.integrated() {
+        app.error("Background transfers are unavailable in editor integration V1");
+        return;
+    }
     let Some(helper) = find_drag_helper() else {
         app.error("Drop in needs `ripdrag` or `dragon-drop` on PATH — install one");
         return;
@@ -141,6 +145,11 @@ pub fn drop_in(app: &mut App) {
 /// Complete an internal drag onto `dest`. Shift forces a move, Ctrl a copy,
 /// and the default is Dolphin's: move within a filesystem, copy across one.
 pub fn drop_internal(app: &mut App, dest: PathBuf, shift: bool, ctrl: bool, reveal: RevealIntent) {
+    if app.integrated() {
+        app.drag = None;
+        app.error("Background transfers are unavailable in editor integration V1");
+        return;
+    }
     let Some(active_drag) = app.drag.take() else {
         return;
     };

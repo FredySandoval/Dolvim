@@ -823,8 +823,17 @@ pub const fn chord(
 
 pub fn run_action(app: &mut App, action: Action, count: usize) {
     let extend = app.mode.is_visual();
-    let stride = app.pane().stride() as isize;
-    let page = app.pane().page() as isize;
+    let sidebar = app.editor_layout() == Some(crate::editor::Layout::Sidebar);
+    let stride = if sidebar {
+        1
+    } else {
+        app.pane().stride() as isize
+    };
+    let page = if sidebar {
+        app.pane().area.height.max(1) as isize
+    } else {
+        app.pane().page() as isize
+    };
     match action {
         // navigation
         Action::Back => app.back(),
@@ -855,7 +864,7 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
             } else {
                 count as isize
             };
-            if app.pane().view == ViewMode::Compact {
+            if sidebar || app.pane().view == ViewMode::Compact {
                 // Dolphin continues at the top of the next column when Down
                 // passes the bottom; Compact's storage is already column-major.
                 app.move_cursor(cursor_delta, extend);
@@ -870,12 +879,14 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
             } else {
                 count as isize
             };
-            match app.pane().view {
-                // Details is one column wide, so there is nowhere sideways to
-                // go. Walking the tree is `H`/`L`, the same keys as in Compact.
-                ViewMode::Details => {}
-                ViewMode::Compact => app.step_across(cursor_delta, extend),
-                ViewMode::Icons => app.step_along(cursor_delta, extend),
+            if !sidebar {
+                match app.pane().view {
+                    // Details is one column wide, so there is nowhere sideways to
+                    // go. Walking the tree is `H`/`L`, the same keys as in Compact.
+                    ViewMode::Details => {}
+                    ViewMode::Compact => app.step_across(cursor_delta, extend),
+                    ViewMode::Icons => app.step_along(cursor_delta, extend),
+                }
             }
         }
         // `5gg` goes to item 5, like vim's line numbers. `count` is 1 when no count
@@ -899,7 +910,19 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
             let s = stride.max(1);
             app.move_cursor(s - 1 - (c % s), extend);
         }
-        Action::CenterCursor => app.pane_mut().center_cursor(),
+        Action::CenterCursor => {
+            if sidebar {
+                let pane = app.pane_mut();
+                let rows = pane.area.height.max(1) as usize;
+                pane.offset = pane
+                    .cursor
+                    .saturating_sub(rows / 2)
+                    .min(pane.len().saturating_sub(rows));
+                pane.last_reveal = (pane.cursor, pane.view);
+            } else {
+                app.pane_mut().center_cursor();
+            }
+        }
 
         // selection
         Action::ToggleSelect => {
@@ -911,7 +934,7 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
         Action::EnterVisual => enter_visual(app, Mode::Visual),
         Action::EnterVisualLine => enter_visual(app, Mode::VisualLine),
         Action::EnterVisualBlock => {
-            if app.pane().view == ViewMode::Icons {
+            if !sidebar && app.pane().view == ViewMode::Icons {
                 enter_visual(app, Mode::VisualBlock);
             } else {
                 app.error("Visual block selection is only available in Icons mode");
@@ -1208,6 +1231,10 @@ fn start_rename(app: &mut App) {
 }
 
 fn paste_clipboard(app: &mut App) {
+    if app.integrated() {
+        app.error("Background transfers are unavailable in editor integration V1");
+        return;
+    }
     // A folder under the cursor is an explicit paste target in every view. A
     // regular file keeps the displayed directory as the destination.
     let destination = current_folder_or_cwd(app);

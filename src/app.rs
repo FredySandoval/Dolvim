@@ -10,6 +10,7 @@ use ratatui::layout::Rect;
 
 use crate::config;
 pub use crate::config::ViewMode;
+use crate::editor;
 use crate::fs::{self, Entry, Lister, Sort, SortKey};
 use crate::open;
 use crate::ops::{self, Progress, UndoOp, UnnamedRegister};
@@ -802,6 +803,16 @@ pub enum Observation {
     },
 }
 
+pub struct EditorState {
+    pub root: PathBuf,
+    pub layout: editor::Layout,
+    pub selected_path: Option<PathBuf>,
+    pub terminal_focused: bool,
+    handle: editor::Handle,
+    next_request_id: u64,
+    latest_request: Option<(u64, PathBuf)>,
+}
+
 pub struct App {
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
@@ -846,6 +857,7 @@ pub struct App {
     pub last_click: Option<LastClick>,
     pub thumbs: Thumbs,
     pub active_transfer: Option<ActiveTransfer>,
+    pub editor: Option<EditorState>,
     external_launches: Vec<Receiver<Result<(), String>>>,
     pub quit: bool,
     /// Set when something needs the terminal to itself; `main` hands it over.
@@ -898,6 +910,7 @@ impl App {
             last_click: None,
             thumbs: Thumbs::new(),
             active_transfer: None,
+            editor: None,
             external_launches: Vec::new(),
             quit: false,
             suspend: None,
@@ -915,6 +928,133 @@ impl App {
 
     pub fn enable_observation(&mut self) {
         self.observation_enabled = true;
+    }
+
+    pub fn enable_editor(&mut self, root: PathBuf, handle: editor::Handle) {
+        let selected_path = self.pane().current().map(|entry| entry.path.clone());
+        self.editor = Some(EditorState {
+            root,
+            layout: editor::Layout::Full,
+            selected_path,
+            terminal_focused: true,
+            handle,
+            next_request_id: 1,
+            latest_request: None,
+        });
+    }
+
+    pub fn integrated(&self) -> bool {
+        self.editor.is_some()
+    }
+
+    pub fn editor_layout(&self) -> Option<editor::Layout> {
+        self.editor.as_ref().map(|editor| editor.layout)
+    }
+
+    pub fn set_editor_layout(&mut self, layout: editor::Layout) {
+        if let Some(editor) = &mut self.editor {
+            editor.layout = layout;
+        }
+    }
+
+    pub fn set_editor_terminal_focus(&mut self, focused: bool) {
+        if let Some(editor) = &mut self.editor {
+            editor.terminal_focused = focused;
+        }
+    }
+
+    pub fn sync_editor_selection(&mut self) {
+        let current = self.pane().current().map(|entry| entry.path.clone());
+        if let (Some(editor), Some(current)) = (&mut self.editor, current) {
+            editor.selected_path = Some(current);
+        }
+    }
+
+    pub fn editor_opened(&mut self, id: u64) {
+        let path = self.editor.as_mut().and_then(|editor| {
+            if editor.latest_request.as_ref().map(|request| request.0) == Some(id) {
+                editor.latest_request.take().map(|request| request.1)
+            } else {
+                None
+            }
+        });
+        if let Some(path) = path {
+            self.reveal_editor_path(path, true);
+        }
+    }
+
+    pub fn reveal_editor_path(&mut self, path: PathBuf, own_open: bool) {
+        let Some(editor) = &self.editor else { return };
+        let root = editor.root.clone();
+        if !path.starts_with(&root) && !own_open {
+            self.error(format!(
+                "Cannot reveal a path outside the integration root: {}",
+                path.display()
+            ));
+            return;
+        }
+        let browse_root = if path.starts_with(&root) {
+            root
+        } else {
+            path.parent().map(Path::to_path_buf).unwrap_or(root)
+        };
+        if !browse_root.is_dir() {
+            self.error(format!("Cannot reveal {}", path.display()));
+            return;
+        }
+        if let Some(editor) = &mut self.editor {
+            editor.root = browse_root.clone();
+            editor.selected_path = Some(path.clone());
+        }
+        self.goto_location(
+            Location {
+                target: Target::Dir(browse_root),
+                focus: Some(EntryFocus {
+                    selection_key: path.clone(),
+                    path,
+                    retry_missing: false,
+                }),
+            },
+            false,
+        );
+    }
+
+    pub fn reconcile_editor_selection(&mut self) {
+        if self.pane().loading {
+            return;
+        }
+        let Some(wanted) = self
+            .editor
+            .as_ref()
+            .and_then(|editor| editor.selected_path.clone())
+        else {
+            return;
+        };
+        if self
+            .pane()
+            .visible
+            .iter()
+            .any(|&index| self.pane().entries[index].path == wanted)
+        {
+            self.select_by_path(&wanted);
+            return;
+        }
+        let fallback = wanted
+            .ancestors()
+            .skip(1)
+            .find(|ancestor| {
+                self.pane()
+                    .visible
+                    .iter()
+                    .any(|&index| self.pane().entries[index].path == *ancestor)
+            })
+            .map(Path::to_path_buf);
+        if let Some(path) = fallback {
+            self.select_by_path(&path);
+            if let Some(editor) = &mut self.editor {
+                editor.selected_path = Some(path);
+            }
+        }
     }
 
     pub fn observe_paste(&mut self, sources: Vec<PathBuf>, destination: PathBuf) {
@@ -1577,13 +1717,31 @@ impl App {
                     },
                     true,
                 );
+            } else if self.editor.is_some() {
+                self.open_in_editor(entry.filesystem_path().to_path_buf());
             } else {
                 self.open_external(entry.filesystem_path());
             }
         } else if entry.is_dir() {
             self.open_dir(entry.path);
+        } else if self.editor.is_some() {
+            self.open_in_editor(entry.path);
         } else {
             self.open_external(&entry.path);
+        }
+    }
+
+    fn open_in_editor(&mut self, path: PathBuf) {
+        let Some(editor) = &mut self.editor else {
+            return;
+        };
+        editor.selected_path = Some(path.clone());
+        let id = editor.next_request_id;
+        editor.next_request_id += 1;
+        editor.latest_request = Some((id, path.clone()));
+        match editor.handle.open(id, &path) {
+            Ok(()) => self.info(format!("Opening {}", ops::file_name_of(&path))),
+            Err(error) => self.error(error),
         }
     }
 
@@ -2536,6 +2694,70 @@ mod tests {
         assert!(app.pane().entries.iter().all(|entry| entry.depth == 0));
 
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn integrated_file_open_persists_path_without_external_launch() {
+        let root = std::env::temp_dir().join(format!(
+            "dolvim-editor-open-{}",
+            NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let first = root.join("first file.rs");
+        let second = root.join("second.rs");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let mut app = App::new(root.clone());
+        app.pane_mut().set_entries(fs::read_dir(&root, 0).unwrap());
+        app.enable_editor(root.clone(), editor::test_handle());
+        app.select_by_path(&first);
+        app.activate();
+        assert_eq!(
+            app.editor
+                .as_ref()
+                .and_then(|state| state.selected_path.as_ref()),
+            Some(&first)
+        );
+        assert!(app.suspend.is_none());
+        assert!(app.external_launches.is_empty());
+
+        app.select_by_path(&second);
+        app.activate();
+        app.editor_opened(1);
+        assert_eq!(
+            app.editor
+                .as_ref()
+                .and_then(|state| state.selected_path.as_ref()),
+            Some(&second),
+            "a stale acknowledgement displaced the newer selection"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn editor_reveal_expands_ancestors_and_survives_layout_and_refresh() {
+        let root = std::env::temp_dir().join(format!(
+            "dolvim-editor-reveal-{}",
+            NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let nested = root.join("one").join("two");
+        let wanted = nested.join("name with space.rs");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(&wanted, b"wanted").unwrap();
+        let mut app = App::new(root.clone());
+        app.pane_mut().set_entries(fs::read_dir(&root, 0).unwrap());
+        app.enable_editor(root.clone(), editor::test_handle());
+
+        app.reveal_editor_path(wanted.clone(), false);
+        assert!(app.pane().expanded.contains(&root.join("one")));
+        assert!(app.pane().expanded.contains(&nested));
+        assert_eq!(app.pane().current().map(|entry| &entry.path), Some(&wanted));
+        app.set_editor_layout(editor::Layout::Sidebar);
+        app.pane_mut().set_entries(fs::read_dir(&root, 0).unwrap());
+        app.reconcile_editor_selection();
+        assert_eq!(app.pane().current().map(|entry| &entry.path), Some(&wanted));
+        assert_eq!(app.editor_layout(), Some(editor::Layout::Sidebar));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

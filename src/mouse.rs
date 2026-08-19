@@ -102,17 +102,23 @@ fn handle_scroll(app: &mut App, x: u16, y: u16, scroll_delta: isize) {
         return;
     }
     if let Some(i) = pane_at(app, x, y) {
+        let sidebar = app.editor_layout() == Some(crate::editor::Layout::Sidebar);
         let p = app.pane_at_mut(i);
-        let step = match p.view {
-            ViewMode::Details => 3,
-            _ => 1,
+        let step = if sidebar || p.view == ViewMode::Details {
+            3
+        } else {
+            1
         };
         // The selection does not follow the viewport: in Dolphin the wheel
         // moves the view and leaves the current item exactly where it is, off
         // screen if that is where it ends up. Scrolling is looking around, not
         // choosing. The bound is the last screenful, so the wheel cannot run
         // off into blank space.
-        let max = p.max_offset() as isize;
+        let max = if sidebar {
+            p.len().saturating_sub(p.area.height as usize)
+        } else {
+            p.max_offset()
+        } as isize;
         p.offset = (p.offset as isize + scroll_delta * step).clamp(0, max) as usize;
     }
 }
@@ -427,41 +433,45 @@ fn hit_item(app: &App, x: u16, y: u16) -> Option<ItemHit> {
     let idx = pane_at(app, x, y)?;
     let pane = app.pane_at(idx);
     let row_offset_in_pane = y - pane.area.y;
-    let visible_index = match pane.view {
-        ViewMode::Icons => {
-            // The grid is centred, so its left edge is not the pane's.
-            let column = x.saturating_sub(pane.grid_x) / pane.cell_width.max(1);
-            let row = row_offset_in_pane / pane.cell_height.max(1);
-            // The grid rarely fills the pane exactly: past the last row and
-            // right of the last column is empty space, not a phantom item.
-            if x < pane.grid_x || column >= pane.grid_cols || row >= pane.grid_rows {
-                return None;
+    let visible_index = if app.editor_layout() == Some(crate::editor::Layout::Sidebar) {
+        pane.offset + row_offset_in_pane as usize
+    } else {
+        match pane.view {
+            ViewMode::Icons => {
+                // The grid is centred, so its left edge is not the pane's.
+                let column = x.saturating_sub(pane.grid_x) / pane.cell_width.max(1);
+                let row = row_offset_in_pane / pane.cell_height.max(1);
+                // The grid rarely fills the pane exactly: past the last row and
+                // right of the last column is empty space, not a phantom item.
+                if x < pane.grid_x || column >= pane.grid_cols || row >= pane.grid_rows {
+                    return None;
+                }
+                (pane.offset + row as usize) * pane.grid_cols as usize + column as usize
             }
-            (pane.offset + row as usize) * pane.grid_cols as usize + column as usize
-        }
-        ViewMode::Compact => {
-            // Columns are individually sized, so the hit is found by walking
-            // them. Running off either end means margin, which belongs to no
-            // cell — without that the index would run past the last column and
-            // the length check below would wave it through. Rows need no such
-            // guard: a compact row is one line and the grid is the full pane
-            // height.
-            if x < pane.grid_x {
-                return None;
+            ViewMode::Compact => {
+                // Columns are individually sized, so the hit is found by walking
+                // them. Running off either end means margin, which belongs to no
+                // cell — without that the index would run past the last column and
+                // the length check below would wave it through. Rows need no such
+                // guard: a compact row is one line and the grid is the full pane
+                // height.
+                if x < pane.grid_x {
+                    return None;
+                }
+                let x_offset_in_grid = x - pane.grid_x;
+                let mut edge_x = 0;
+                let column = pane.column_widths.iter().position(|column_width| {
+                    edge_x += column_width;
+                    x_offset_in_grid < edge_x
+                })?;
+                (pane.offset + column) * pane.grid_rows as usize + row_offset_in_pane as usize
             }
-            let x_offset_in_grid = x - pane.grid_x;
-            let mut edge_x = 0;
-            let column = pane.column_widths.iter().position(|column_width| {
-                edge_x += column_width;
-                x_offset_in_grid < edge_x
-            })?;
-            (pane.offset + column) * pane.grid_rows as usize + row_offset_in_pane as usize
-        }
-        ViewMode::Details => {
-            if row_offset_in_pane == 0 {
-                return None; // the header row
+            ViewMode::Details => {
+                if row_offset_in_pane == 0 {
+                    return None; // the header row
+                }
+                pane.offset + ((row_offset_in_pane - 1) / pane.cell_height.max(1)) as usize
             }
-            pane.offset + ((row_offset_in_pane - 1) / pane.cell_height.max(1)) as usize
         }
     };
     (visible_index < pane.len()).then_some(ItemHit {
@@ -475,7 +485,7 @@ fn hit_item(app: &App, x: u16, y: u16) -> Option<ItemHit> {
 /// and nothing else claims that cell.
 fn on_expand_arrow(app: &App, x: u16, vis: usize) -> bool {
     let p = app.pane();
-    if p.view != ViewMode::Details {
+    if p.view != ViewMode::Details && app.editor_layout() != Some(crate::editor::Layout::Sidebar) {
         return false;
     }
     let Some(e) = p.entry_at(vis) else {
@@ -483,7 +493,8 @@ fn on_expand_arrow(app: &App, x: u16, vis: usize) -> bool {
     };
     // Mirrors the name column `ui::details_view` writes: one cell of padding,
     // then two per depth level, then the arrow.
-    let arrow = p.area.x + 1 + e.depth * 2;
+    let margin = u16::from(app.editor_layout() != Some(crate::editor::Layout::Sidebar));
+    let arrow = p.area.x + margin + e.depth * 2;
     e.is_dir() && (x == arrow || x + 1 == arrow)
 }
 

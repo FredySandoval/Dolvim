@@ -145,14 +145,29 @@ impl Entry {
                     glyph::FOLDER
                 }
             }
-            Kind::File => match self.ext().as_deref() {
-                Some(extension) if config::IMAGE_EXTS.contains(&extension) => glyph::PICTURE,
-                Some(extension) if config::ARCHIVE_EXTS.contains(&extension) => glyph::ARCHIVE,
-                Some("mp3" | "flac" | "ogg" | "wav" | "m4a") => glyph::MUSIC,
-                Some("mp4" | "mkv" | "webm" | "avi" | "mov") => glyph::VIDEO,
-                Some("txt" | "md" | "pdf" | "doc" | "docx" | "odt") => glyph::DOCUMENT,
-                _ => glyph::FILE,
-            },
+            Kind::File => {
+                let extension = self.ext();
+                if let Some(icon) = extension.as_deref().and_then(|extension| {
+                    config::FILE_ICONS
+                        .iter()
+                        .find_map(|&(candidate, icon)| (candidate == extension).then_some(icon))
+                }) {
+                    icon
+                } else {
+                    match extension.as_deref() {
+                        Some(extension) if config::IMAGE_EXTS.contains(&extension) => {
+                            glyph::PICTURE
+                        }
+                        Some(extension) if config::ARCHIVE_EXTS.contains(&extension) => {
+                            glyph::ARCHIVE
+                        }
+                        Some("mp3" | "flac" | "ogg" | "wav" | "m4a") => glyph::MUSIC,
+                        Some("mp4" | "mkv" | "webm" | "avi" | "mov") => glyph::VIDEO,
+                        Some("txt" | "md" | "pdf" | "doc" | "docx" | "odt") => glyph::DOCUMENT,
+                        _ => glyph::FILE,
+                    }
+                }
+            }
         }
     }
 }
@@ -839,6 +854,31 @@ mod tests {
 
         assert_eq!(entries[0].link_target.as_ref(), Some(&target));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn configured_file_icons_override_generic_file_types() {
+        let file = |name: &str| Entry {
+            name: name.into(),
+            path: PathBuf::from(name),
+            backing_path: None,
+            link_target: None,
+            kind: Kind::File,
+            size: 0,
+            mtime: 0,
+            mode: 0,
+            readable: true,
+            hidden: false,
+            trash_id: None,
+            depth: 0,
+            expanded: false,
+        };
+
+        assert_eq!(file("main.rs").glyph(), "");
+        assert_eq!(file("MAIN.RS").glyph(), "");
+        assert_eq!(file("source.f#").glyph(), "");
+        assert_eq!(file("photo.jpg").glyph(), "");
+        assert_eq!(file("unknown.custom").glyph(), config::glyph::FILE);
     }
 
     #[test]

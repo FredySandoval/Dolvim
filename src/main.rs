@@ -7,6 +7,7 @@
 mod app;
 mod config;
 mod drag;
+mod editor;
 mod fs;
 mod mouse;
 mod observer;
@@ -20,6 +21,7 @@ mod vim;
 mod watch;
 
 use std::io::{self, Write};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,12 +45,16 @@ use app::{App, Suspend};
 struct Cli {
     start_dir: Option<PathBuf>,
     observe_path: Option<PathBuf>,
+    editor_address: Option<SocketAddr>,
+    editor_token: Option<String>,
     help: bool,
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
     let mut start_dir = None;
     let mut observe_path = None;
+    let mut editor_address = None;
+    let mut editor_token = None;
     let mut help = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -66,17 +72,58 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
                 }
                 observe_path = Some(PathBuf::from(path));
             }
+            "--editor-connect" => {
+                if editor_address.is_some() {
+                    return Err("--editor-connect may only be supplied once".into());
+                }
+                let address = args
+                    .next()
+                    .ok_or_else(|| "--editor-connect requires IP:PORT".to_string())?;
+                editor_address = Some(
+                    address
+                        .parse()
+                        .map_err(|_| format!("invalid --editor-connect address: {address}"))?,
+                );
+            }
+            "--editor-token" => {
+                if editor_token.is_some() {
+                    return Err("--editor-token may only be supplied once".into());
+                }
+                let token = args
+                    .next()
+                    .ok_or_else(|| "--editor-token requires a token".to_string())?;
+                if token.is_empty() || token.starts_with('-') {
+                    return Err("--editor-token requires a non-empty token".into());
+                }
+                if token.len() > 1024 {
+                    return Err("--editor-token is too long".into());
+                }
+                editor_token = Some(token);
+            }
             _ if arg.starts_with('-') => return Err(format!("unknown option: {arg}")),
             _ if start_dir.is_some() => return Err("more than one start directory supplied".into()),
             _ => start_dir = Some(PathBuf::from(arg)),
         }
     }
-    if help && (start_dir.is_some() || observe_path.is_some()) {
+    if help
+        && (start_dir.is_some()
+            || observe_path.is_some()
+            || editor_address.is_some()
+            || editor_token.is_some())
+    {
         return Err("--help cannot be combined with other arguments".into());
+    }
+    if editor_address.is_some() != editor_token.is_some() {
+        return Err("--editor-connect and --editor-token must be supplied together".into());
+    }
+    if observe_path.is_some() && editor_address.is_some() {
+        return Err("--test-observe cannot be combined with editor integration".into());
     }
     Ok(Cli {
         start_dir,
         observe_path,
+        editor_address,
+        editor_token,
         help,
     })
 }
@@ -111,7 +158,7 @@ fn observation_path_inside_root(
 }
 
 fn print_help() {
-    println!("usage: dolvim [DIR]\n       dolvim --test-observe PATH [DIR]\n\nKDE Dolphin, in the terminal. Press F1 inside for keys.\n\nTesting:\n  --test-observe PATH  append schema-v1 behavioral events to PATH");
+    println!("usage: dolvim [DIR]\n       dolvim --editor-connect IP:PORT --editor-token TOKEN [DIR]\n       dolvim --test-observe PATH [DIR]\n\nKDE Dolphin, in the terminal. Press F1 inside for keys.\n\nEditor integration:\n  --editor-connect IP:PORT  connect to a parent editor on a loopback address\n  --editor-token TOKEN      authenticate that connection\n\nTesting:\n  --test-observe PATH  append schema-v1 behavioral events to PATH");
 }
 
 fn main() {
@@ -168,7 +215,8 @@ fn main() {
         }
         None => None,
     };
-    if let Err(run_error) = run(start_dir, observer) {
+    let editor_options = cli.editor_address.zip(cli.editor_token);
+    if let Err(run_error) = run(start_dir, observer, editor_options) {
         restore_terminal();
         eprintln!("dolvim: {run_error}");
         std::process::exit(1);
@@ -230,7 +278,11 @@ fn restore_terminal() {
     let _ = io::stdout().flush();
 }
 
-fn run(start: PathBuf, mut observer: Option<observer::Observer>) -> io::Result<()> {
+fn run(
+    start: PathBuf,
+    mut observer: Option<observer::Observer>,
+    editor_options: Option<(SocketAddr, String)>,
+) -> io::Result<()> {
     // A panic must not leave the user in a raw-mode alternate screen with no
     // echo. Restore first, then let the default hook print its report.
     let default_hook = std::panic::take_hook();
@@ -239,8 +291,17 @@ fn run(start: PathBuf, mut observer: Option<observer::Observer>) -> io::Result<(
         default_hook(info);
     }));
 
+    let mut editor_connection = match editor_options {
+        Some((address, token)) => {
+            Some(editor::Connection::connect(address, &token, &start).map_err(io::Error::other)?)
+        }
+        None => None,
+    };
     let mut terminal = setup_terminal()?;
-    let mut app = App::new(start);
+    let mut app = App::new(start.clone());
+    if let Some(connection) = &editor_connection {
+        app.enable_editor(start, connection.handle());
+    }
     if observer.is_some() {
         app.enable_observation();
     }
@@ -271,6 +332,7 @@ fn run(start: PathBuf, mut observer: Option<observer::Observer>) -> io::Result<(
                     app.status.clear();
                     app.status_is_error = false;
                     vim::handle_key_event(&mut app, key_event);
+                    app.sync_editor_selection();
                     dirty = true;
                 }
                 Event::Mouse(mouse_event) => {
@@ -278,6 +340,7 @@ fn run(start: PathBuf, mut observer: Option<observer::Observer>) -> io::Result<(
                         observer.input_mouse(mouse_event)?;
                     }
                     mouse::handle_mouse_event(&mut app, mouse_event);
+                    app.sync_editor_selection();
                     dirty = true;
                 }
                 Event::Resize(_, _) => dirty = true,
@@ -287,6 +350,8 @@ fn run(start: PathBuf, mut observer: Option<observer::Observer>) -> io::Result<(
 
         drain_observations(&mut app, observer.as_mut())?;
         dirty |= app.pump_fs_events();
+        app.reconcile_editor_selection();
+        dirty |= pump_editor(&mut app, editor_connection.as_ref());
         dirty |= app.refresh_places();
         dirty |= app.pump_external_launches();
         dirty |= app.thumbs.pump_decoded_thumbs();
@@ -330,7 +395,51 @@ fn run(start: PathBuf, mut observer: Option<observer::Observer>) -> io::Result<(
         observer.exiting("quit")?;
     }
     restore_terminal();
+    if let Some(connection) = editor_connection.take() {
+        connection.close("user");
+    }
     Ok(())
+}
+
+fn pump_editor(app: &mut App, connection: Option<&editor::Connection>) -> bool {
+    let Some(connection) = connection else {
+        return false;
+    };
+    let mut changed = false;
+    for event in connection.events() {
+        changed = true;
+        match event {
+            editor::Event::Message(editor::Incoming::SetLayout { layout, .. }) => {
+                app.set_editor_layout(if layout == "sidebar" {
+                    editor::Layout::Sidebar
+                } else {
+                    editor::Layout::Full
+                });
+            }
+            editor::Event::Message(editor::Incoming::SetFocus { focused, .. }) => {
+                app.set_editor_terminal_focus(focused);
+            }
+            editor::Event::Message(editor::Incoming::Opened { id, path, .. }) => {
+                match editor::protocol_path(path) {
+                    Ok(_) => app.editor_opened(id),
+                    Err(error) => app.error(error),
+                }
+            }
+            editor::Event::Message(editor::Incoming::Reveal { path, .. }) => {
+                match editor::protocol_path(path) {
+                    Ok(path) => app.reveal_editor_path(path, false),
+                    Err(error) => app.error(error),
+                }
+            }
+            editor::Event::Message(editor::Incoming::Shutdown { .. }) => app.quit = true,
+            editor::Event::Disconnected => app.quit = true,
+            editor::Event::Error(error) => {
+                app.error(error);
+                app.quit = true;
+            }
+        }
+    }
+    changed
 }
 
 fn drain_observations(app: &mut App, observer: Option<&mut observer::Observer>) -> io::Result<()> {
@@ -543,6 +652,31 @@ mod cli_tests {
         let cli = parse(&["--test-observe", "/tmp/e.jsonl", "/tmp/root"]).unwrap();
         assert_eq!(cli.observe_path, Some(PathBuf::from("/tmp/e.jsonl")));
     }
+    #[test]
+    fn parses_editor_connection_only_as_a_complete_pair() {
+        let cli = parse(&[
+            "--editor-connect",
+            "127.0.0.1:4321",
+            "--editor-token",
+            "secret",
+            "/tmp/root",
+        ])
+        .unwrap();
+        assert_eq!(cli.editor_address, Some("127.0.0.1:4321".parse().unwrap()));
+        assert_eq!(cli.editor_token.as_deref(), Some("secret"));
+        assert!(parse(&["--editor-connect", "127.0.0.1:1"]).is_err());
+        assert!(parse(&["--editor-token", "secret"]).is_err());
+        assert!(parse(&[
+            "--editor-connect",
+            "127.0.0.1:1",
+            "--editor-token",
+            "secret",
+            "--test-observe",
+            "/tmp/events"
+        ])
+        .is_err());
+    }
+
     #[test]
     fn rejects_bad_arguments() {
         assert!(parse(&["--test-observe"]).is_err());

@@ -13,6 +13,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Focus, MenuKind, Mode, Pane, ViewMode};
 use crate::config;
+use crate::editor::Layout as EditorLayout;
 use crate::fs::{self, SortKey};
 use crate::places::Row;
 use crate::vim;
@@ -20,6 +21,10 @@ use crate::vim;
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     paint(frame, area, config::THEME.view.background);
+    if app.editor_layout() == Some(EditorLayout::Sidebar) {
+        sidebar(frame, app, area);
+        return;
+    }
 
     let filter = if app.filter_bar { 1 } else { 0 };
     let rows = Layout::default()
@@ -40,6 +45,97 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     status_bar(frame, app, rows[3]);
 
     overlays(frame, app, area);
+}
+
+fn sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
+    app.hits = Default::default();
+    let rows = area.height.max(1);
+    let active = app
+        .editor
+        .as_ref()
+        .is_some_and(|editor| editor.terminal_focused);
+    let selected_path = app
+        .editor
+        .as_ref()
+        .and_then(|editor| editor.selected_path.clone());
+    {
+        let pane = app.pane_mut();
+        pane.area = area;
+        pane.grid_cols = 1;
+        pane.grid_rows = rows;
+        pane.cell_width = area.width.max(1);
+        pane.cell_height = 1;
+        reveal_cursor(pane, pane.cursor, rows as usize);
+    }
+    let offset = app.pane().offset;
+    for row in 0..rows as usize {
+        let visible_index = offset + row;
+        let Some(entry) = app.pane().entry_at(visible_index).cloned() else {
+            break;
+        };
+        let y = area.y + row as u16;
+        if y >= area.bottom() || area.width == 0 {
+            break;
+        }
+        let selected = selected_path.as_deref() == Some(entry.path.as_path());
+        let selection = if active {
+            config::THEME.selection
+        } else {
+            config::THEME.inactive_selection
+        };
+        let style = if selected {
+            Style::default()
+                .fg(selection.foreground)
+                .bg(selection.background)
+        } else {
+            entry_style(app.pane(), visible_index, false, false)
+        };
+        let row_area = Rect::new(area.x, y, area.width, 1);
+        if selected {
+            fill(frame.buffer_mut(), row_area, selection.background);
+        }
+        let marker = if entry.is_dir() {
+            if entry.expanded {
+                config::glyph::EXPAND_OPEN
+            } else {
+                config::glyph::EXPAND_CLOSED
+            }
+        } else {
+            " "
+        };
+        let text = format!(
+            "{}{} {} {}",
+            " ".repeat((entry.depth * 2) as usize),
+            marker,
+            entry.glyph(),
+            entry.name
+        );
+        frame
+            .buffer_mut()
+            .set_string(area.x, y, clip(&text, area.width as usize), style);
+        if visible_index == app.pane().cursor {
+            let icon_x = area
+                .x
+                .saturating_add(entry.depth * 2)
+                .saturating_add(marker.width().max(1) as u16 + 1)
+                .min(area.right().saturating_sub(1));
+            cursor_block(
+                frame.buffer_mut(),
+                Rect::new(icon_x, y, 1, 1),
+                row_area,
+                active,
+                selected.then_some(row_area),
+            );
+        }
+    }
+    if app.pane().loading && app.pane().entries.is_empty() {
+        centred(
+            frame.buffer_mut(),
+            area,
+            "Loading…",
+            Style::default().fg(config::THEME.view.secondary),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2349,6 +2445,20 @@ mod tests {
         for (w, h) in [(1u16, 1u16), (5, 3), (20, 4)] {
             let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
             term.draw(|frame| draw(frame, &mut app)).unwrap();
+        }
+    }
+
+    #[test]
+    fn sidebar_renders_without_chrome_at_tiny_sizes() {
+        let handle = crate::editor::test_handle();
+        let root = std::env::temp_dir();
+        let mut app = App::new(root.clone());
+        app.enable_editor(root, handle);
+        app.set_editor_layout(EditorLayout::Sidebar);
+        for (width, height) in [(1, 1), (4, 2), (18, 4)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            assert_eq!(app.pane().area, Rect::new(0, 0, width, height));
         }
     }
 }
