@@ -50,14 +50,34 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
 fn sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     app.hits = Default::default();
-    let rows = area.height.max(1);
+    // Sidebar layout normally spends every row on files, but text entry and an
+    // incomplete Vim command still need immediate feedback. Borrow the bottom
+    // row only while there is something to show, keeping the idle view clean.
+    let show_feedback = matches!(
+        app.mode,
+        Mode::Command
+            | Mode::Search
+            | Mode::Rename(_)
+            | Mode::BatchRename
+            | Mode::NewFolder(_)
+            | Mode::NewFile(_)
+    ) || !app.pending_command().is_empty();
+    let (view_area, feedback_area) = if show_feedback && area.height > 0 {
+        (
+            Rect::new(area.x, area.y, area.width, area.height - 1),
+            Some(Rect::new(area.x, area.bottom() - 1, area.width, 1)),
+        )
+    } else {
+        (area, None)
+    };
+    let rows = view_area.height;
     let active = app
         .editor
         .as_ref()
         .is_some_and(|editor| editor.terminal_focused);
     {
         let pane = app.pane_mut();
-        pane.area = area;
+        pane.area = view_area;
         pane.grid_cols = 1;
         pane.grid_rows = rows;
         pane.cell_width = area.width.max(1);
@@ -77,8 +97,8 @@ fn sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
         let Some(entry) = pane.entry_at(visible_index) else {
             break;
         };
-        let y = area.y + row as u16;
-        if y >= area.bottom() || area.width == 0 {
+        let y = view_area.y + row as u16;
+        if y >= view_area.bottom() || view_area.width == 0 {
             break;
         }
         let selected = selected_path == Some(entry.path.as_path());
@@ -95,7 +115,7 @@ fn sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
             let is_cut = cut && cut_paths.contains(&entry.path);
             entry_style(entry, entry_selected(pane, entry), is_cut, false)
         };
-        let row_area = Rect::new(area.x, y, area.width, 1);
+        let row_area = Rect::new(view_area.x, y, view_area.width, 1);
         if selected {
             fill(frame.buffer_mut(), row_area, selection.background);
         }
@@ -117,13 +137,13 @@ fn sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
         );
         frame
             .buffer_mut()
-            .set_string(area.x, y, clip(&text, area.width as usize), style);
+            .set_string(view_area.x, y, clip(&text, view_area.width as usize), style);
         if visible_index == pane.cursor {
             let icon_x = area
                 .x
                 .saturating_add(entry.depth * 2)
                 .saturating_add(marker.width().max(1) as u16 + 1)
-                .min(area.right().saturating_sub(1));
+                .min(view_area.right().saturating_sub(1));
             cursor_block(
                 frame.buffer_mut(),
                 Rect::new(icon_x, y, 1, 1),
@@ -136,10 +156,13 @@ fn sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     if app.pane().loading && app.pane().entries.is_empty() {
         centred(
             frame.buffer_mut(),
-            area,
+            view_area,
             "Loading…",
             Style::default().fg(config::THEME.view.secondary),
         );
+    }
+    if let Some(feedback_area) = feedback_area {
+        status_bar(frame, app, feedback_area);
     }
 }
 
@@ -2624,5 +2647,37 @@ mod tests {
             terminal.draw(|frame| draw(frame, &mut app)).unwrap();
             assert_eq!(app.pane().area, Rect::new(0, 0, width, height));
         }
+    }
+
+    #[test]
+    fn sidebar_borrows_bottom_row_for_search_and_pending_commands() {
+        let handle = crate::editor::test_handle();
+        let root = std::env::temp_dir();
+        let mut app = App::new(root.clone());
+        app.enable_editor(root, handle);
+        app.set_editor_layout(EditorLayout::Sidebar);
+        app.mode = Mode::Search;
+        app.input = "manifest".into();
+
+        let mut terminal = Terminal::new(TestBackend::new(24, 5)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let bottom: String = (0..24)
+            .map(|x| terminal.backend().buffer().cell((x, 4)).unwrap().symbol())
+            .collect();
+        assert!(
+            bottom.starts_with("/manifest"),
+            "feedback row was: {bottom:?}"
+        );
+        assert_eq!(app.pane().area.height, 4);
+
+        app.mode = Mode::Normal;
+        app.input.clear();
+        app.pending_chord_leader = Some('c');
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let bottom: String = (0..24)
+            .map(|x| terminal.backend().buffer().cell((x, 4)).unwrap().symbol())
+            .collect();
+        assert!(bottom.ends_with('c'), "showcmd row was: {bottom:?}");
+        assert_eq!(app.pane().area.height, 4);
     }
 }
