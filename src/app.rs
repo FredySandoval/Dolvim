@@ -1,6 +1,7 @@
 //! Application state: tabs, panes, selection, navigation, modes.
 
 use std::collections::{HashMap, HashSet};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver};
@@ -166,7 +167,7 @@ impl Mode {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MenuKind {
     Hamburger,
     ViewMode,
@@ -187,6 +188,7 @@ pub enum MarkPending {
 pub struct EntryFocus {
     pub path: PathBuf,
     pub selection_key: PathBuf,
+    pub backing_path: PathBuf,
     retry_missing: bool,
 }
 
@@ -194,13 +196,14 @@ impl EntryFocus {
     fn new(entry: &Entry) -> Self {
         Self {
             path: entry.path.clone(),
-            selection_key: entry.selection_key(),
+            selection_key: entry.selection_key().to_path_buf(),
+            backing_path: entry.filesystem_path().to_path_buf(),
             retry_missing: false,
         }
     }
 
     fn matches(&self, entry: &Entry) -> bool {
-        self.selection_key == entry.selection_key()
+        self.selection_key == entry.selection_key() && self.backing_path == entry.filesystem_path()
     }
 }
 
@@ -237,7 +240,11 @@ pub struct Pane {
     pub sort: Sort,
     pub show_hidden: bool,
     pub filter: String,
-    pub expanded: HashSet<PathBuf>,
+    pub expanded: HashSet<FoldKey>,
+    /// Child snapshots already read for Details folds. The key includes both
+    /// the row identity and physical location, so equal Trash paths cannot
+    /// share children across deleted generations.
+    loaded_children: HashMap<FoldKey, Vec<Entry>>,
     /// Stable row that an asynchronous refresh should place under the cursor.
     pub pending_focus: Option<EntryFocus>,
     pub history: Vec<Target>,
@@ -261,6 +268,8 @@ pub struct Pane {
     pub compact_widths: Vec<u16>,
     pub compact_width_rows: u16,
     pub compact_width_avail: u16,
+    pub content_generation: u64,
+    pub compact_width_generation: u64,
     /// Left edge of the icon grid, which floats inside the pane as the leftover
     /// columns are split into margin.
     pub grid_x: u16,
@@ -275,54 +284,112 @@ pub struct Pane {
     pub crumb_pick: Option<PathBuf>,
 }
 
-fn expanded_listing(roots: Vec<Entry>, expanded: &HashSet<PathBuf>, sort: Sort) -> Vec<Entry> {
+/// Identity of one expandable directory row. Trash may contain several rows
+/// with the same original path, so neither logical pathname nor backend ID is
+/// sufficient alone; descendants also need the generation's backing location.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct FoldKey {
+    pub path: PathBuf,
+    pub(crate) selection_key: PathBuf,
+    pub(crate) backing_path: PathBuf,
+}
+
+impl FoldKey {
+    fn from_entry(entry: &Entry) -> Self {
+        Self {
+            path: entry.path.clone(),
+            selection_key: entry.selection_key().to_path_buf(),
+            backing_path: entry.filesystem_path().to_path_buf(),
+        }
+    }
+
+    fn live(path: PathBuf) -> Self {
+        Self {
+            selection_key: path.clone(),
+            backing_path: path.clone(),
+            path,
+        }
+    }
+
+    fn is_within(&self, root: &Self) -> bool {
+        if self.path == root.path {
+            self == root
+        } else {
+            self.path.starts_with(&root.path) && self.backing_path.starts_with(&root.backing_path)
+        }
+    }
+}
+
+fn expanded_listing(
+    roots: Vec<Entry>,
+    expanded: &HashSet<FoldKey>,
+    loaded_children: &HashMap<FoldKey, Vec<Entry>>,
+    sort: Sort,
+) -> Vec<Entry> {
     fn append(
         mut entry: Entry,
         depth: u16,
-        expanded: &HashSet<PathBuf>,
+        expanded: &HashSet<FoldKey>,
+        loaded_children: &HashMap<FoldKey, Vec<Entry>>,
         sort: Sort,
         output: &mut Vec<Entry>,
     ) {
         entry.depth = depth;
-        entry.expanded = entry.is_dir() && expanded.contains(&entry.path);
-        let path = entry.path.clone();
-        let backing_path = entry.backing_path.clone();
+        let key = FoldKey::from_entry(&entry);
+        entry.expanded = entry.is_dir() && expanded.contains(&key);
         let is_expanded = entry.expanded;
         output.push(entry);
         if !is_expanded {
             return;
         }
-        let physical = backing_path.as_deref().unwrap_or(&path);
-        if let Ok(mut children) =
-            fs::read_dir_as(physical, &path, depth + 1, backing_path.is_some())
-        {
-            fs::sort_entries(&mut children, sort);
-            for child in children {
-                append(child, depth + 1, expanded, sort, output);
-            }
+        let Some(children) = loaded_children.get(&key) else {
+            return;
+        };
+        let mut children = children.clone();
+        fs::sort_entries(&mut children, sort);
+        for child in children {
+            append(child, depth + 1, expanded, loaded_children, sort, output);
         }
     }
 
     let mut output = Vec::new();
     for root in roots {
-        append(root, 0, expanded, sort, &mut output);
+        append(root, 0, expanded, loaded_children, sort, &mut output);
     }
     output
 }
 
-/// Collect folders below `roots`, guarding against directory symlink cycles.
-/// The paths themselves (rather than canonical paths) remain the fold keys.
-fn recursive_folders(roots: Vec<Entry>) -> (HashSet<PathBuf>, Option<(PathBuf, std::io::Error)>) {
-    let mut folders = HashSet::new();
-    let mut visited = HashSet::new();
-    let mut pending = roots;
+/// Refresh the snapshots for folds which are currently represented. Closed
+/// descendants stay cached so closing a fold and refiltering remain in-memory.
+fn refresh_expanded_children(
+    roots: &[Entry],
+    expanded: &HashSet<FoldKey>,
+    loaded_children: &mut HashMap<FoldKey, Vec<Entry>>,
+) -> Option<(PathBuf, String)> {
+    let mut pending: Vec<(Entry, HashSet<(u64, u64)>)> = roots
+        .iter()
+        .filter(|entry| entry.is_dir())
+        .cloned()
+        .map(|entry| (entry, HashSet::new()))
+        .collect();
     let mut first_error = None;
 
-    while let Some(entry) = pending.pop() {
-        folders.insert(entry.path.clone());
+    while let Some((entry, mut ancestors)) = pending.pop() {
+        let key = FoldKey::from_entry(&entry);
+        if !expanded.contains(&key) {
+            continue;
+        }
         let physical = entry.filesystem_path();
-        let identity = std::fs::canonicalize(physical).unwrap_or_else(|_| physical.to_path_buf());
-        if !visited.insert(identity) {
+        let identity = match std::fs::metadata(physical) {
+            Ok(metadata) => (metadata.dev(), metadata.ino()),
+            Err(error) => {
+                loaded_children.remove(&key);
+                first_error.get_or_insert_with(|| (entry.path.clone(), error.to_string()));
+                continue;
+            }
+        };
+        if !ancestors.insert(identity) {
+            loaded_children.remove(&key);
             continue;
         }
         match fs::read_dir_as(
@@ -331,15 +398,94 @@ fn recursive_folders(roots: Vec<Entry>) -> (HashSet<PathBuf>, Option<(PathBuf, s
             entry.depth + 1,
             entry.backing_path.is_some(),
         ) {
-            Ok(entries) => pending.extend(entries.into_iter().filter(Entry::is_dir)),
-            Err(error) => {
+            Ok(listing) => {
+                pending.extend(
+                    listing
+                        .entries
+                        .iter()
+                        .filter(|child| child.is_dir())
+                        .cloned()
+                        .map(|child| (child, ancestors.clone())),
+                );
                 if first_error.is_none() {
-                    first_error = Some((entry.path, error));
+                    first_error = listing.error.map(|error| (entry.path.clone(), error));
+                }
+                loaded_children.insert(key, listing.entries);
+            }
+            Err(error) => {
+                loaded_children.retain(|candidate, _| !candidate.is_within(&key));
+                if first_error.is_none() {
+                    first_error = Some((entry.path, error.to_string()));
                 }
             }
         }
     }
-    (folders, first_error)
+    first_error
+}
+
+struct RecursiveFolders {
+    folders: HashSet<FoldKey>,
+    loaded_children: HashMap<FoldKey, Vec<Entry>>,
+    first_error: Option<(PathBuf, String)>,
+}
+
+/// Collect and load folders below `roots`, guarding against directory symlink
+/// cycles. The paths themselves (rather than canonical paths) remain fold keys.
+fn recursive_folders(roots: Vec<Entry>) -> RecursiveFolders {
+    let mut folders = HashSet::new();
+    let mut loaded_children = HashMap::new();
+    let mut pending: Vec<(Entry, HashSet<(u64, u64)>)> = roots
+        .into_iter()
+        .map(|entry| (entry, HashSet::new()))
+        .collect();
+    let mut first_error = None;
+
+    while let Some((entry, mut ancestors)) = pending.pop() {
+        let key = FoldKey::from_entry(&entry);
+        folders.insert(key.clone());
+        let physical = entry.filesystem_path();
+        let identity = match std::fs::metadata(physical) {
+            Ok(metadata) => (metadata.dev(), metadata.ino()),
+            Err(error) => {
+                first_error.get_or_insert_with(|| (entry.path.clone(), error.to_string()));
+                continue;
+            }
+        };
+        if !ancestors.insert(identity) {
+            continue;
+        }
+        match fs::read_dir_as(
+            physical,
+            &entry.path,
+            entry.depth + 1,
+            entry.backing_path.is_some(),
+        ) {
+            Ok(listing) => {
+                pending.extend(
+                    listing
+                        .entries
+                        .iter()
+                        .filter(|child| child.is_dir())
+                        .cloned()
+                        .map(|child| (child, ancestors.clone())),
+                );
+                if first_error.is_none() {
+                    first_error = listing.error.map(|error| (entry.path.clone(), error));
+                }
+                loaded_children.insert(key, listing.entries);
+            }
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some((entry.path, error.to_string()));
+                }
+            }
+        }
+    }
+    RecursiveFolders {
+        folders,
+        loaded_children,
+        first_error,
+    }
 }
 
 static NEXT_PANE_ID: AtomicU64 = AtomicU64::new(1);
@@ -373,6 +519,7 @@ impl Pane {
             show_hidden: false,
             filter: String::new(),
             expanded: HashSet::new(),
+            loaded_children: HashMap::new(),
             pending_focus: None,
             history_pos: 0,
             seq: 0,
@@ -387,6 +534,8 @@ impl Pane {
             compact_widths: Vec::new(),
             compact_width_rows: 0,
             compact_width_avail: 0,
+            content_generation: 0,
+            compact_width_generation: u64::MAX,
             grid_x: 0,
             last_reveal: (0, config::DEFAULT_VIEW),
             crumb_focus: None,
@@ -396,6 +545,16 @@ impl Pane {
 
     pub fn len(&self) -> usize {
         self.visible.len()
+    }
+
+    #[cfg(test)]
+    pub fn is_path_expanded(&self, path: &Path) -> bool {
+        self.expanded.iter().any(|key| key.path == path)
+    }
+
+    #[cfg(test)]
+    pub fn expand_live_path(&mut self, path: PathBuf) {
+        self.expanded.insert(FoldKey::live(path));
     }
 
     pub fn is_empty(&self) -> bool {
@@ -422,6 +581,22 @@ impl Pane {
     /// on every refresh.
     pub fn set_entries(&mut self, entries: Vec<Entry>) {
         let keep = self.current().map(EntryFocus::new);
+        self.loaded_children.retain(|key, _| {
+            entries
+                .iter()
+                .any(|root| key.is_within(&FoldKey::from_entry(root)))
+        });
+        self.expanded.retain(|key| {
+            entries
+                .iter()
+                .any(|root| key.is_within(&FoldKey::from_entry(root)))
+        });
+        if let Some((path, error)) =
+            refresh_expanded_children(&entries, &self.expanded, &mut self.loaded_children)
+        {
+            self.error
+                .get_or_insert_with(|| format!("Cannot read {}: {error}", path.display()));
+        }
         self.entries = entries;
         self.refilter_keeping(keep);
         let Some(wanted) = self.pending_focus.clone() else {
@@ -448,6 +623,7 @@ impl Pane {
     pub fn focus_after_refresh(&mut self, path: PathBuf) {
         self.pending_focus = Some(EntryFocus {
             selection_key: path.clone(),
+            backing_path: path.clone(),
             path,
             retry_missing: true,
         });
@@ -458,7 +634,22 @@ impl Pane {
             return;
         };
         while ancestor != self.cwd && ancestor.starts_with(&self.cwd) {
-            self.expanded.insert(ancestor.to_path_buf());
+            let suffix_depth = focus
+                .path
+                .strip_prefix(ancestor)
+                .map(|suffix| suffix.components().count())
+                .unwrap_or(0);
+            let mut backing_ancestor = focus.backing_path.as_path();
+            for _ in 0..suffix_depth {
+                if let Some(parent) = backing_ancestor.parent() {
+                    backing_ancestor = parent;
+                }
+            }
+            self.expanded.insert(FoldKey {
+                path: ancestor.to_path_buf(),
+                selection_key: ancestor.to_path_buf(),
+                backing_path: backing_ancestor.to_path_buf(),
+            });
             let Some(parent) = ancestor.parent() else {
                 break;
             };
@@ -468,6 +659,18 @@ impl Pane {
 
     fn focus_now(&mut self, focus: EntryFocus) {
         self.reveal_ancestors(&focus);
+        let roots: Vec<Entry> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.depth == 0)
+            .cloned()
+            .collect();
+        if let Some((path, error)) =
+            refresh_expanded_children(&roots, &self.expanded, &mut self.loaded_children)
+        {
+            self.error
+                .get_or_insert_with(|| format!("Cannot read {}: {error}", path.display()));
+        }
         self.filter.clear();
         self.refilter_keeping(None);
         if self
@@ -489,8 +692,8 @@ impl Pane {
 
     fn refilter_keeping(&mut self, keep: Option<EntryFocus>) {
         // A worker listing contains roots only. Rebuild expanded descendants
-        // from the durable path set before filtering; globally sorting the flat
-        // tree would separate children from their parents.
+        // from cached child snapshots before filtering; globally sorting the
+        // flat tree would separate children from their parents.
         let mut roots: Vec<Entry> = self
             .entries
             .iter()
@@ -498,7 +701,7 @@ impl Pane {
             .cloned()
             .collect();
         fs::sort_entries(&mut roots, self.sort);
-        self.entries = expanded_listing(roots, &self.expanded, self.sort);
+        self.entries = expanded_listing(roots, &self.expanded, &self.loaded_children, self.sort);
         self.revisible();
         self.cursor = keep
             .and_then(|wanted| {
@@ -513,6 +716,7 @@ impl Pane {
     /// Rebuild `visible` only. Kept separate from `refilter` because the
     /// Details tree is ordered positionally and must not be re-sorted.
     fn revisible(&mut self) {
+        self.content_generation = self.content_generation.wrapping_add(1);
         self.compact_widths.clear();
         let filter_lower = self.filter.to_lowercase();
         let hidden_ok = self.show_hidden;
@@ -620,7 +824,7 @@ impl Pane {
                 .filter_map(|&entry_index| {
                     let e = &self.entries[entry_index];
                     self.selected
-                        .contains(&e.selection_key())
+                        .contains(e.selection_key())
                         .then(|| e.path.clone())
                 })
                 .collect()
@@ -632,7 +836,7 @@ impl Pane {
     pub fn selected_trash_refs(&self) -> Vec<ops::TrashRef> {
         let to_ref = |entry: &Entry| {
             Some(ops::TrashRef {
-                id: entry.trash_id.clone()?,
+                id: entry.trash_id()?.to_os_string(),
                 original_path: entry.path.clone(),
                 name: entry.path.file_name()?.to_os_string(),
             })
@@ -643,7 +847,7 @@ impl Pane {
         self.visible
             .iter()
             .filter_map(|&index| self.entries.get(index))
-            .filter(|entry| self.selected.contains(&entry.selection_key()))
+            .filter(|entry| self.selected.contains(entry.selection_key()))
             .filter_map(to_ref)
             .fold(Vec::new(), |mut items, item| {
                 if !items
@@ -744,7 +948,7 @@ impl Tab {
 
 /// Rects captured during the last render, so mouse events hit-test against
 /// what the user actually sees rather than against a recomputed guess.
-#[derive(Default, Clone)]
+#[derive(Default)]
 pub struct Hitboxes {
     pub back: Rect,
     pub forward: Rect,
@@ -760,7 +964,7 @@ pub struct Hitboxes {
     pub path_bar: Rect,
     pub places: Rect,
     pub tabs: Vec<Rect>,
-    pub headers: Vec<(Rect, SortKey)>,
+    pub headers: Vec<(Rect, usize, SortKey)>,
     /// The popup currently on screen, for click-to-pick.
     pub menu_popup: Rect,
 }
@@ -800,6 +1004,8 @@ pub enum Observation {
         committed: usize,
         failed: usize,
         cancelled: bool,
+        indeterminate: bool,
+        retained: usize,
     },
 }
 
@@ -970,9 +1176,13 @@ impl App {
         }
     }
 
-    pub fn editor_opened(&mut self, id: u64) {
+    pub fn editor_opened(&mut self, id: u64, acknowledged_path: &Path) {
         let path = self.editor.as_mut().and_then(|editor| {
-            if editor.latest_request.as_ref().map(|request| request.0) == Some(id) {
+            if editor
+                .latest_request
+                .as_ref()
+                .is_some_and(|request| request.0 == id && request.1 == acknowledged_path)
+            {
                 editor.latest_request.take().map(|request| request.1)
             } else {
                 None
@@ -980,6 +1190,8 @@ impl App {
         });
         if let Some(path) = path {
             self.reveal_editor_path(path, true);
+        } else {
+            self.error("Editor acknowledgement did not match the pending open request");
         }
     }
 
@@ -1011,6 +1223,7 @@ impl App {
                 target: Target::Dir(browse_root),
                 focus: Some(EntryFocus {
                     selection_key: path.clone(),
+                    backing_path: path.clone(),
                     path,
                     retry_missing: false,
                 }),
@@ -1076,6 +1289,8 @@ impl App {
         committed: usize,
         failed: usize,
         cancelled: bool,
+        indeterminate: bool,
+        retained: usize,
     ) {
         self.observation_events
             .push(Observation::OperationFinished {
@@ -1083,6 +1298,8 @@ impl App {
                 committed,
                 failed,
                 cancelled,
+                indeterminate,
+                retained,
             });
     }
 
@@ -1223,7 +1440,9 @@ impl App {
                 .retain(|key| !paths.iter().any(|path| key.starts_with(path)));
             if sources_removed {
                 pane.expanded
-                    .retain(|key| !paths.iter().any(|path| key.starts_with(path)));
+                    .retain(|key| !paths.iter().any(|path| key.path.starts_with(path)));
+                pane.loaded_children
+                    .retain(|key, _| !paths.iter().any(|path| key.path.starts_with(path)));
             }
         }
     }
@@ -1248,7 +1467,7 @@ impl App {
             && intent.directory.starts_with(&self.pane().cwd);
         if can_expand_in_place {
             let pane = self.pane_mut();
-            pane.expanded.insert(intent.directory);
+            pane.expanded.insert(FoldKey::live(intent.directory));
             pane.focus_after_refresh(path);
             self.refresh_in_place();
         } else if self.pane().cwd != intent.directory {
@@ -1297,24 +1516,40 @@ impl App {
         }
         match target {
             Target::Dir(ref d) => {
-                self.watcher.watch(d);
                 self.lister.request(d.clone(), seq);
             }
-            Target::Trash => {
-                let entries = ops::list_trash();
-                self.apply_listing(seq, entries, None);
-            }
+            Target::Trash => match ops::list_trash() {
+                Ok(entries) => self.apply_listing(seq, entries, None),
+                Err(error) => {
+                    let pane = self.pane_mut();
+                    if pane.seq == seq {
+                        pane.error = Some(error);
+                        pane.loading = false;
+                    }
+                }
+            },
             Target::TrashDir {
                 ref original,
                 ref backing,
                 ..
-            } => {
-                let (entries, error) = match fs::read_dir_as(backing, original, 0, true) {
-                    Ok(entries) => (entries, None),
-                    Err(error) => (Vec::new(), Some(error.to_string())),
-                };
-                self.apply_listing(seq, entries, error);
-            }
+            } => match fs::read_dir_as(backing, original, 0, true) {
+                Ok(listing) => self.apply_listing(
+                    seq,
+                    listing.entries,
+                    listing
+                        .error
+                        .map(|error| format!("Listing incomplete: {error}")),
+                ),
+                Err(error) => {
+                    let message = format!("Cannot read Trash folder: {error}");
+                    let pane = self.pane_mut();
+                    if pane.seq == seq {
+                        pane.loading = false;
+                        pane.error = Some(message.clone());
+                    }
+                    self.error(message);
+                }
+            },
             Target::Network => {
                 self.apply_listing(
                     seq,
@@ -1323,8 +1558,8 @@ impl App {
                 );
             }
             Target::RecentDays(days) => {
-                let entries = recent(&places::home(), days);
-                self.apply_listing(seq, entries, None);
+                let listing = recent(&places::home(), days);
+                self.apply_listing(seq, listing.entries, listing.error);
             }
         }
     }
@@ -1352,7 +1587,7 @@ impl App {
                         .or_default()
                         .extend(entries);
                 }
-                fs::ListingMsg::Done { path, seq } => {
+                fs::ListingMsg::Done { path, seq, error } => {
                     let entries = self
                         .streaming
                         .remove(&StreamKey {
@@ -1361,7 +1596,7 @@ impl App {
                         })
                         .unwrap_or_default();
                     // A pane other than the active one may own this `seq`.
-                    self.deliver_listing(&path, seq, entries, None);
+                    self.deliver_listing(&path, seq, entries, error);
                 }
                 fs::ListingMsg::Listed(listing) => {
                     self.deliver_listing(
@@ -1373,9 +1608,30 @@ impl App {
                 }
             }
         }
-        if self.watcher.take_dirty() {
-            self.refresh_in_place();
-            changed = true;
+        match self.watcher.take_update() {
+            Ok(update) => {
+                for path in update.dirty_paths {
+                    let pane_ids: Vec<u64> = self
+                        .tabs
+                        .iter()
+                        .flat_map(|tab| tab.panes.iter())
+                        .filter(|pane| matches!(&pane.target, Target::Dir(dir) if dir == &path))
+                        .map(|pane| pane.id)
+                        .collect();
+                    for pane_id in pane_ids {
+                        self.refresh_pane_in_place(pane_id);
+                    }
+                    changed = true;
+                }
+                if let Some(error) = update.error {
+                    self.error(format!("Filesystem watcher failed: {error}"));
+                    changed = true;
+                }
+            }
+            Err(error) => {
+                self.error(format!("Filesystem watcher failed: {error}"));
+                changed = true;
+            }
         }
         let live_seqs: HashSet<u64> = self
             .tabs
@@ -1399,6 +1655,101 @@ impl App {
         }
     }
 
+    /// A panicked worker may have unrecorded effects. Refresh every real pane
+    /// whose directory contains a known source/target, plus every Trash view;
+    /// restricting this to the initiating split would leave aliases stale.
+    pub fn reconcile_indeterminate_transfer(
+        &mut self,
+        effects: &[ops::TransferEffect],
+        affected_paths: &[PathBuf],
+    ) {
+        let pane_ids: Vec<u64> = self
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.panes.iter())
+            .filter_map(|pane| match &pane.target {
+                Target::Dir(directory)
+                    if effects.iter().any(|effect| {
+                        effect.source.starts_with(directory)
+                            || effect.target.starts_with(directory)
+                            || directory.starts_with(&effect.source)
+                            || directory.starts_with(&effect.target)
+                    }) || affected_paths
+                        .iter()
+                        .any(|path| path.starts_with(directory) || directory.starts_with(path)) =>
+                {
+                    Some(pane.id)
+                }
+                _ => None,
+            })
+            .collect();
+        for pane_id in pane_ids {
+            self.refresh_pane_in_place(pane_id);
+        }
+
+        if self
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.panes.iter())
+            .any(|pane| matches!(pane.target, Target::Trash))
+        {
+            self.reconcile_trash_panes(ops::list_trash());
+        }
+
+        let backed: Vec<(u64, PathBuf, PathBuf)> = self
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.panes.iter())
+            .filter_map(|pane| match &pane.target {
+                Target::TrashDir {
+                    original, backing, ..
+                } => Some((pane.id, original.clone(), backing.clone())),
+                _ => None,
+            })
+            .collect();
+        for (pane_id, original, backing) in backed {
+            let listing = fs::read_dir_as(&backing, &original, 0, true);
+            if let Some(pane) = self
+                .tabs
+                .iter_mut()
+                .flat_map(|tab| tab.panes.iter_mut())
+                .find(|pane| pane.id == pane_id)
+            {
+                match listing {
+                    Ok(listing) => {
+                        pane.error = listing.error;
+                        pane.set_entries(listing.entries);
+                    }
+                    Err(error) => pane.error = Some(format!("Cannot reconcile Trash: {error}")),
+                }
+            }
+        }
+    }
+
+    /// Reconcile every open top-level Trash view after a committed mutation
+    /// whose backend generation could not be identified.
+    pub(crate) fn reconcile_trash_panes(&mut self, listing: Result<Vec<Entry>, String>) {
+        for pane in self
+            .tabs
+            .iter_mut()
+            .flat_map(|tab| tab.panes.iter_mut())
+            .filter(|pane| matches!(&pane.target, Target::Trash))
+        {
+            pane.seq += 1;
+            pane.loading = false;
+            match &listing {
+                Ok(entries) => {
+                    pane.error = None;
+                    pane.set_entries(entries.clone());
+                }
+                Err(error) => pane.error = Some(error.clone()),
+            }
+        }
+        if let Err(error) = listing {
+            self.error(format!("Cannot reconcile Trash views: {error}"));
+        }
+    }
+
     /// Relist a particular directory pane without changing tab or split focus.
     /// Completion reducers use this for an operation's source pane; the global
     /// watcher only follows one directory and therefore cannot make split-pane
@@ -1419,6 +1770,20 @@ impl App {
             });
         if let Some((directory, seq)) = request {
             self.lister.request(directory, seq);
+        }
+    }
+
+    /// Bind filesystem events to the active target. Calling this from the event
+    /// loop makes direct pane/tab focus changes follow the same lifecycle as
+    /// navigation, while virtual locations explicitly leave nothing watched.
+    pub fn sync_active_watcher(&mut self) {
+        let target = self.pane().target.clone();
+        let result = match target {
+            Target::Dir(directory) => self.watcher.watch(&directory),
+            _ => self.watcher.unwatch(),
+        };
+        if let Err(error) = result {
+            self.error(format!("Cannot update filesystem watch: {error}"));
         }
     }
 
@@ -1493,6 +1858,7 @@ impl App {
             pane.selected.clear();
             pane.filter.clear();
             pane.expanded.clear();
+            pane.loaded_children.clear();
             if let Some(focus) = focus {
                 pane.reveal_ancestors(&focus);
                 pane.pending_focus = Some(focus);
@@ -1843,7 +2209,7 @@ impl App {
                 .into_iter()
                 .filter_map(|visible_index| {
                     pane.entry_at(visible_index)
-                        .map(|entry| entry.selection_key())
+                        .map(|entry| entry.selection_key().to_path_buf())
                 })
                 .collect();
             pane.selected.clear();
@@ -1889,8 +2255,8 @@ impl App {
         };
         let pane = self.pane_mut();
         let key = entry.selection_key();
-        if !pane.selected.remove(&key) {
-            pane.selected.insert(key);
+        if !pane.selected.remove(key) {
+            pane.selected.insert(key.to_path_buf());
         }
     }
 
@@ -1899,7 +2265,7 @@ impl App {
         pane.selected = pane
             .visible
             .iter()
-            .map(|&entry_index| pane.entries[entry_index].selection_key())
+            .map(|&entry_index| pane.entries[entry_index].selection_key().to_path_buf())
             .collect();
     }
 
@@ -1908,7 +2274,7 @@ impl App {
         let all: HashSet<PathBuf> = pane
             .visible
             .iter()
-            .map(|&entry_index| pane.entries[entry_index].selection_key())
+            .map(|&entry_index| pane.entries[entry_index].selection_key().to_path_buf())
             .collect();
         pane.selected = all.difference(&pane.selected).cloned().collect();
     }
@@ -2124,7 +2490,7 @@ impl App {
             return;
         };
         if entry.is_dir() {
-            if self.pane().expanded.contains(&entry.path) {
+            if self.pane().expanded.contains(&FoldKey::from_entry(&entry)) {
                 self.close_fold(false);
             } else {
                 self.open_fold(false);
@@ -2132,25 +2498,30 @@ impl App {
             return;
         }
 
-        // `depth` bounds this walk to represented tree ancestors: the pane's
-        // cwd is not itself a visible fold, even if a stale key exists for it.
-        let containing_fold = entry
-            .path
-            .ancestors()
-            .skip(1)
-            .take(entry.depth as usize)
-            .find(|path| self.pane().expanded.contains(*path))
-            .map(Path::to_path_buf);
+        // Find the represented parent row rather than looking it up by logical
+        // path: two Trash generations can have an identical ancestor chain.
+        let Some(&entry_index) = self.pane().visible.get(self.pane().cursor) else {
+            return;
+        };
+        let containing_fold = self.pane().entries[..entry_index]
+            .iter()
+            .rev()
+            .find(|candidate| {
+                candidate.is_dir()
+                    && candidate.depth < entry.depth
+                    && self
+                        .pane()
+                        .expanded
+                        .contains(&FoldKey::from_entry(candidate))
+            })
+            .cloned();
         let Some(containing_fold) = containing_fold else {
             return;
         };
+        let key = FoldKey::from_entry(&containing_fold);
         let pane = self.pane_mut();
-        pane.expanded.remove(&containing_fold);
-        pane.refilter_keeping(Some(EntryFocus {
-            selection_key: containing_fold.clone(),
-            path: containing_fold,
-            retry_missing: false,
-        }));
+        pane.expanded.remove(&key);
+        pane.refilter_keeping(Some(EntryFocus::new(&containing_fold)));
     }
 
     /// Open the folder under the cursor, optionally including every folder
@@ -2164,26 +2535,40 @@ impl App {
         }
 
         if recursive {
-            let (folders, first_error) = recursive_folders(vec![entry.clone()]);
+            let loaded = recursive_folders(vec![entry.clone()]);
+            let key = FoldKey::from_entry(&entry);
             let pane = self.pane_mut();
-            pane.expanded.extend(folders);
+            pane.expanded.retain(|candidate| !candidate.is_within(&key));
+            pane.loaded_children
+                .retain(|candidate, _| !candidate.is_within(&key));
+            pane.expanded.extend(loaded.folders);
+            pane.loaded_children.extend(loaded.loaded_children);
             pane.refilter();
-            if let Some((path, error)) = first_error {
+            if let Some((path, error)) = loaded.first_error {
                 self.error(format!("Cannot read {}: {error}", path.display()));
             }
         } else {
-            if let Err(error) = fs::read_dir_as(
+            let listing = match fs::read_dir_as(
                 entry.filesystem_path(),
                 &entry.path,
                 entry.depth + 1,
                 entry.backing_path.is_some(),
             ) {
-                self.error(format!("Cannot read {}: {error}", entry.name));
-                return;
-            }
+                Ok(listing) => listing,
+                Err(error) => {
+                    self.error(format!("Cannot read {}: {error}", entry.name));
+                    return;
+                }
+            };
+            let error = listing.error;
             let pane = self.pane_mut();
-            pane.expanded.insert(entry.path);
+            let key = FoldKey::from_entry(&entry);
+            pane.loaded_children.insert(key.clone(), listing.entries);
+            pane.expanded.insert(key);
             pane.refilter();
+            if let Some(error) = error {
+                self.error(format!("Listing {} is incomplete: {error}", entry.name));
+            }
         }
     }
 
@@ -2193,14 +2578,15 @@ impl App {
         let Some(entry) = self.pane().current().cloned() else {
             return;
         };
-        if !entry.is_dir() || !self.pane().expanded.contains(&entry.path) {
+        let key = FoldKey::from_entry(&entry);
+        if !entry.is_dir() || !self.pane().expanded.contains(&key) {
             return;
         }
         let pane = self.pane_mut();
         if recursive {
-            pane.expanded.retain(|path| !path.starts_with(&entry.path));
+            pane.expanded.retain(|candidate| !candidate.is_within(&key));
         } else {
-            pane.expanded.remove(&entry.path);
+            pane.expanded.remove(&key);
         }
         pane.refilter();
     }
@@ -2223,11 +2609,12 @@ impl App {
             .filter(|entry| entry.depth == 0 && entry.is_dir())
             .cloned()
             .collect();
-        let (folders, first_error) = recursive_folders(roots);
+        let loaded = recursive_folders(roots);
         let pane = self.pane_mut();
-        pane.expanded.extend(folders);
+        pane.expanded = loaded.folders;
+        pane.loaded_children = loaded.loaded_children;
         pane.refilter();
-        if let Some((path, error)) = first_error {
+        if let Some((path, error)) = loaded.first_error {
             self.error(format!("Cannot read {}: {error}", path.display()));
         }
     }
@@ -2235,18 +2622,28 @@ impl App {
 
 /// Files under `root` modified within `days`, shallow-recursive like Dolphin's
 /// baloo-free fallback. Depth is capped so `Recent` cannot walk a whole disk.
-fn recent(root: &Path, days: u32) -> Vec<Entry> {
+fn recent(root: &Path, days: u32) -> fs::DirectoryListing {
     let cutoff = fs::now_epoch() - (days as i64) * 86400;
     let mut out = Vec::new();
+    let mut first_error = None;
     let mut queue = vec![(root.to_path_buf(), 0u32)];
     while let Some((dir, depth)) = queue.pop() {
         if depth > config::RECENT_MAX_DEPTH || out.len() > config::RECENT_MAX_ITEMS {
             break;
         }
-        let Ok(kids) = fs::read_dir(&dir, 0) else {
-            continue;
+        let listing = match fs::read_dir(&dir, 0) {
+            Ok(listing) => listing,
+            Err(error) => {
+                first_error
+                    .get_or_insert_with(|| format!("Cannot read {}: {error}", dir.display()));
+                continue;
+            }
         };
-        for entry in kids {
+        if let Some(error) = listing.error {
+            first_error
+                .get_or_insert_with(|| format!("Cannot fully read {}: {error}", dir.display()));
+        }
+        for entry in listing.entries {
             if entry.hidden {
                 continue;
             }
@@ -2258,7 +2655,10 @@ fn recent(root: &Path, days: u32) -> Vec<Entry> {
         }
     }
     out.sort_by_key(|e| std::cmp::Reverse(e.mtime));
-    out
+    fs::DirectoryListing {
+        entries: out,
+        error: first_error,
+    }
 }
 
 #[cfg(test)]
@@ -2287,7 +2687,7 @@ mod tests {
                 mode: 0,
                 readable: true,
                 hidden: name.starts_with('.'),
-                trash_id: None,
+                trash_identity: None,
                 depth: 0,
                 expanded: false,
             })
@@ -2389,6 +2789,61 @@ mod tests {
     }
 
     #[test]
+    fn refilter_uses_loaded_children_after_the_directory_disappears() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("dolvim-refilter-cache-{unique}"));
+        let folder = base.join("folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("cached.txt"), b"cached").unwrap();
+
+        let mut pane = Pane::new(base.clone());
+        pane.expand_live_path(folder.clone());
+        pane.set_entries(fs::read_dir(&base, 0).unwrap().entries);
+        assert!(pane.entries.iter().any(|entry| entry.name == "cached.txt"));
+
+        std::fs::remove_dir_all(&folder).unwrap();
+        pane.filter = "cached".into();
+        pane.sort.key = SortKey::Size;
+        pane.refilter();
+
+        assert_eq!(pane.visible.len(), 1);
+        assert_eq!(
+            pane.current().map(|entry| entry.name.as_str()),
+            Some("cached.txt")
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn failed_expanded_refresh_invalidates_the_stale_branch_and_reports_error() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("dolvim-refresh-failure-{unique}"));
+        let folder = base.join("folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("stale.txt"), b"stale").unwrap();
+        let roots = fs::read_dir(&base, 0).unwrap().entries;
+        let key = FoldKey::from_entry(&roots[0]);
+        let mut expanded = HashSet::new();
+        expanded.insert(key.clone());
+        let mut loaded = HashMap::new();
+        loaded.insert(key.clone(), fs::read_dir(&folder, 1).unwrap().entries);
+
+        std::fs::remove_dir_all(&folder).unwrap();
+        std::fs::write(&folder, b"not a directory").unwrap();
+        let error = refresh_expanded_children(&roots, &expanded, &mut loaded);
+
+        assert!(error.is_some());
+        assert!(!loaded.contains_key(&key));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn refresh_rebuilds_the_expanded_tree() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2400,16 +2855,168 @@ mod tests {
         std::fs::write(folder.join("first.txt"), b"first").unwrap();
 
         let mut pane = Pane::new(base.clone());
-        pane.expanded.insert(folder.clone());
-        pane.set_entries(fs::read_dir(&base, 0).unwrap());
+        pane.expand_live_path(folder.clone());
+        pane.set_entries(fs::read_dir(&base, 0).unwrap().entries);
         assert!(pane.entries.iter().any(|entry| entry.name == "first.txt"));
 
         std::fs::write(folder.join("second.txt"), b"second").unwrap();
-        pane.set_entries(fs::read_dir(&base, 0).unwrap());
-        assert!(pane.expanded.contains(&folder));
+        pane.set_entries(fs::read_dir(&base, 0).unwrap().entries);
+        assert!(pane.is_path_expanded(&folder));
         assert!(pane.entries.iter().any(|entry| entry.name == "first.txt"));
         assert!(pane.entries.iter().any(|entry| entry.name == "second.txt"));
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expanded_aliases_to_the_same_directory_each_refresh_their_children() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("dolvim-refresh-aliases-{unique}"));
+        let target = base.join("target");
+        let first = base.join("first");
+        let second = base.join("second");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("leaf.txt"), b"leaf").unwrap();
+        std::os::unix::fs::symlink(&target, &first).unwrap();
+        std::os::unix::fs::symlink(&target, &second).unwrap();
+
+        let mut pane = Pane::new(base.clone());
+        pane.expand_live_path(first.clone());
+        pane.expand_live_path(second.clone());
+        pane.set_entries(fs::read_dir(&base, 0).unwrap().entries);
+
+        assert!(pane
+            .entries
+            .iter()
+            .any(|entry| entry.path == first.join("leaf.txt")));
+        assert!(pane
+            .entries
+            .iter()
+            .any(|entry| entry.path == second.join("leaf.txt")));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_folders_loads_aliases_but_stops_true_cycles() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("dolvim-recursive-aliases-{unique}"));
+        let target = base.join("target");
+        let first = base.join("first");
+        let second = base.join("second");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("leaf.txt"), b"leaf").unwrap();
+        std::os::unix::fs::symlink(&target, &first).unwrap();
+        std::os::unix::fs::symlink(&target, &second).unwrap();
+        std::os::unix::fs::symlink(&target, target.join("cycle")).unwrap();
+
+        let roots: Vec<Entry> = fs::read_dir(&base, 0)
+            .unwrap()
+            .entries
+            .into_iter()
+            .filter(|entry| entry.name == "first" || entry.name == "second")
+            .collect();
+        let loaded = recursive_folders(roots);
+        let first_key = FoldKey::live(first.clone());
+        let second_key = FoldKey::live(second.clone());
+
+        assert!(loaded.loaded_children.contains_key(&first_key));
+        assert!(loaded.loaded_children.contains_key(&second_key));
+        assert!(loaded.folders.contains(&FoldKey::live(first.join("cycle"))));
+        assert!(loaded
+            .folders
+            .contains(&FoldKey::live(second.join("cycle"))));
+        assert_eq!(loaded.folders.len(), 4);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn failed_trash_reconciliation_preserves_every_open_snapshot() {
+        let mut app = App::new(PathBuf::from("/tmp"));
+        app.pane_mut().target = Target::Trash;
+        app.pane_mut().set_entries(entries_named(&["first"]));
+        app.pane_mut().loading = true;
+
+        let mut second = Tab::new(PathBuf::from("trash:/"));
+        second.pane_mut().target = Target::Trash;
+        second.pane_mut().set_entries(entries_named(&["second"]));
+        second.pane_mut().loading = true;
+        app.tabs.push(second);
+
+        app.reconcile_trash_panes(Err("Cannot inspect Trash".into()));
+
+        assert_eq!(app.tabs[0].pane().entries[0].name, "first");
+        assert_eq!(app.tabs[1].pane().entries[0].name, "second");
+        for tab in &app.tabs {
+            assert_eq!(tab.pane().error.as_deref(), Some("Cannot inspect Trash"));
+            assert!(!tab.pane().loading);
+        }
+    }
+
+    #[test]
+    fn affected_transfer_reconciles_every_matching_split_tab_and_all_trash_views() {
+        let unique = NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("dolvim-panic-reconcile-{unique}"));
+        let backing = root.join("trash-backing");
+        std::fs::create_dir_all(&backing).unwrap();
+        std::fs::write(backing.join("fresh"), b"fresh").unwrap();
+        let source = root.join("source");
+        let target = root.join("target");
+        std::fs::write(&source, b"source").unwrap();
+
+        let mut app = App::new(root.clone());
+        app.toggle_split();
+        app.new_tab(root.clone());
+        let mut top_trash = Tab::new(PathBuf::from("trash:/"));
+        top_trash.pane_mut().target = Target::Trash;
+        top_trash
+            .pane_mut()
+            .set_entries(entries_named(&["top-stale"]));
+        let top_trash_id = top_trash.pane().id;
+        let top_seq = top_trash.pane().seq;
+        app.tabs.push(top_trash);
+        let mut trash_tab = Tab::new(root.clone());
+        trash_tab.pane_mut().target = Target::TrashDir {
+            original: root.join("logical"),
+            backing: backing.clone(),
+            display: PathBuf::from("backed"),
+        };
+        trash_tab.pane_mut().set_entries(entries_named(&["stale"]));
+        app.tabs.push(trash_tab);
+
+        app.reconcile_indeterminate_transfer(
+            &[ops::TransferEffect {
+                source: source.clone(),
+                target: target.clone(),
+                trash_ref: None,
+                source_removed: false,
+            }],
+            &[source, target],
+        );
+
+        let matching_loading = app
+            .tabs
+            .iter()
+            .take(2)
+            .flat_map(|tab| tab.panes.iter())
+            .filter(|pane| matches!(pane.target, Target::Dir(_)))
+            .all(|pane| pane.loading);
+        assert!(matching_loading);
+        let refreshed_top = app
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.panes.iter())
+            .find(|pane| pane.id == top_trash_id)
+            .unwrap();
+        assert!(refreshed_top.seq > top_seq);
+        assert_eq!(app.tabs.last().unwrap().pane().entries[0].name, "fresh");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2417,17 +3024,97 @@ mod tests {
         let path = PathBuf::from("/tmp/same.txt");
         let mut first = entries_named(&["same.txt"]).remove(0);
         first.path = path.clone();
-        first.trash_id = Some("generation-1".into());
+        first.set_trash_id("generation-1");
         let mut second = first.clone();
-        second.trash_id = Some("generation-2".into());
+        second.set_trash_id("generation-2");
         let mut pane = Pane::new(PathBuf::from("trash:/"));
         pane.entries = vec![first.clone(), second];
         pane.visible = vec![0, 1];
-        pane.selected.insert(first.selection_key());
+        pane.selected.insert(first.selection_key().to_path_buf());
 
         let selected = pane.selected_trash_refs();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].id, std::ffi::OsString::from("generation-1"));
+    }
+
+    #[test]
+    fn duplicate_trash_directory_generations_keep_distinct_folds_and_children() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("dolvim-trash-folds-{unique}"));
+        let first_backing = base.join("generation-1");
+        let second_backing = base.join("generation-2");
+        std::fs::create_dir_all(&first_backing).unwrap();
+        std::fs::create_dir_all(&second_backing).unwrap();
+        std::fs::write(first_backing.join("old.txt"), b"old").unwrap();
+        std::fs::write(second_backing.join("new.txt"), b"new").unwrap();
+
+        let original = PathBuf::from("/gone/same");
+        let mut first = entries_named(&["same"]).remove(0);
+        first.path = original.clone();
+        first.kind = fs::Kind::Dir;
+        first.set_trash_id("generation-1");
+        first.backing_path = Some(first_backing.clone());
+        let mut second = first.clone();
+        second.set_trash_id("generation-2");
+        second.backing_path = Some(second_backing.clone());
+
+        let mut app = App::new(PathBuf::from("trash:/"));
+        app.pane_mut().set_entries(vec![first, second]);
+        app.open_fold(false);
+
+        assert_eq!(app.pane().expanded.len(), 1);
+        assert!(app
+            .pane()
+            .entries
+            .iter()
+            .any(|entry| entry.name == "old.txt"));
+        assert!(!app
+            .pane()
+            .entries
+            .iter()
+            .any(|entry| entry.name == "new.txt"));
+        let second_cursor = app
+            .pane()
+            .visible
+            .iter()
+            .position(|&index| {
+                app.pane().entries[index].trash_id() == Some(std::ffi::OsStr::new("generation-2"))
+            })
+            .unwrap();
+        app.pane_mut().cursor = second_cursor;
+        app.open_fold(false);
+
+        assert_eq!(app.pane().expanded.len(), 2);
+        assert_eq!(app.pane().loaded_children.len(), 2);
+        assert!(app
+            .pane()
+            .entries
+            .iter()
+            .any(|entry| entry.name == "old.txt"));
+        assert!(app
+            .pane()
+            .entries
+            .iter()
+            .any(|entry| entry.name == "new.txt"));
+        let first_key = app
+            .pane()
+            .expanded
+            .iter()
+            .find(|key| key.backing_path == first_backing)
+            .unwrap();
+        let second_key = app
+            .pane()
+            .expanded
+            .iter()
+            .find(|key| key.backing_path == second_backing)
+            .unwrap();
+        assert_eq!(app.pane().loaded_children[first_key][0].name, "old.txt");
+        assert_eq!(app.pane().loaded_children[second_key][0].name, "new.txt");
+
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -2436,7 +3123,7 @@ mod tests {
         let mut root = entries_named(&["herdr"]).remove(0);
         root.path = original.clone();
         root.kind = fs::Kind::Dir;
-        root.trash_id = Some("herdr.2.trashinfo".into());
+        root.set_trash_id("herdr.2.trashinfo");
         let mut child = entries_named(&["SKILL.md"]).remove(0);
         child.path = original.join("SKILL.md");
         child.depth = 1;
@@ -2444,8 +3131,8 @@ mod tests {
         let mut pane = Pane::new(PathBuf::from("trash:/"));
         pane.entries = vec![root.clone(), child.clone()];
         pane.visible = vec![0, 1];
-        pane.selected.insert(root.selection_key());
-        pane.selected.insert(child.selection_key());
+        pane.selected.insert(root.selection_key().to_path_buf());
+        pane.selected.insert(child.selection_key().to_path_buf());
 
         let selected = pane.selected_trash_refs();
         assert_eq!(selected.len(), 1);
@@ -2456,7 +3143,7 @@ mod tests {
         assert_eq!(selected[0].original_path, original);
 
         pane.selected.clear();
-        pane.selected.insert(child.selection_key());
+        pane.selected.insert(child.selection_key().to_path_buf());
         assert!(pane.selected_trash_refs().is_empty());
     }
 
@@ -2486,13 +3173,14 @@ mod tests {
         let focus = EntryFocus {
             path: wanted.clone(),
             selection_key: wanted.clone(),
+            backing_path: wanted.clone(),
             retry_missing: false,
         };
         pane.reveal_ancestors(&focus);
         pane.pending_focus = Some(focus);
-        pane.set_entries(fs::read_dir(&base, 0).unwrap());
+        pane.set_entries(fs::read_dir(&base, 0).unwrap().entries);
 
-        assert!(pane.expanded.contains(&folder));
+        assert!(pane.is_path_expanded(&folder));
         assert_eq!(pane.current().map(|entry| &entry.path), Some(&wanted));
         assert!(pane.pending_focus.is_none());
         std::fs::remove_dir_all(base).unwrap();
@@ -2504,6 +3192,7 @@ mod tests {
         pane.pending_focus = Some(EntryFocus {
             path: PathBuf::from("/tmp/missing"),
             selection_key: PathBuf::from("/tmp/missing"),
+            backing_path: PathBuf::from("/tmp/missing"),
             retry_missing: false,
         });
 
@@ -2620,7 +3309,8 @@ mod tests {
         std::fs::write(&leaf, b"leaf").unwrap();
 
         let mut app = App::new(base.clone());
-        app.pane_mut().set_entries(fs::read_dir(&base, 0).unwrap());
+        app.pane_mut()
+            .set_entries(fs::read_dir(&base, 0).unwrap().entries);
         app.open_all_folds();
         app.pane_mut().cursor = app
             .pane()
@@ -2631,16 +3321,16 @@ mod tests {
 
         app.toggle_expand();
 
-        assert!(app.pane().expanded.contains(&outer));
-        assert!(!app.pane().expanded.contains(&inner));
+        assert!(app.pane().is_path_expanded(&outer));
+        assert!(!app.pane().is_path_expanded(&inner));
         assert_eq!(app.pane().current().map(|entry| &entry.path), Some(&inner));
         assert!(!app.pane().entries.iter().any(|entry| entry.path == leaf));
 
         // On the folder row itself, `za` still toggles that folder rather than
         // its containing outer fold.
         app.toggle_expand();
-        assert!(app.pane().expanded.contains(&outer));
-        assert!(app.pane().expanded.contains(&inner));
+        assert!(app.pane().is_path_expanded(&outer));
+        assert!(app.pane().is_path_expanded(&inner));
         assert!(app.pane().entries.iter().any(|entry| entry.path == leaf));
 
         std::fs::remove_dir_all(base).unwrap();
@@ -2661,7 +3351,8 @@ mod tests {
         std::fs::write(b.join("leaf"), b"leaf").unwrap();
 
         let mut app = App::new(base.clone());
-        app.pane_mut().set_entries(fs::read_dir(&base, 0).unwrap());
+        app.pane_mut()
+            .set_entries(fs::read_dir(&base, 0).unwrap().entries);
         app.pane_mut().cursor = app
             .pane()
             .visible
@@ -2670,25 +3361,25 @@ mod tests {
             .unwrap();
 
         app.open_fold(true);
-        assert!(app.pane().expanded.contains(&a));
-        assert!(app.pane().expanded.contains(&b));
+        assert!(app.pane().is_path_expanded(&a));
+        assert!(app.pane().is_path_expanded(&b));
         assert!(app.pane().entries.iter().any(|entry| entry.name == "leaf"));
 
         app.close_fold(false);
-        assert!(!app.pane().expanded.contains(&a));
-        assert!(app.pane().expanded.contains(&b));
+        assert!(!app.pane().is_path_expanded(&a));
+        assert!(app.pane().is_path_expanded(&b));
         assert!(!app.pane().entries.iter().any(|entry| entry.name == "leaf"));
         app.open_fold(false);
         assert!(app.pane().entries.iter().any(|entry| entry.name == "leaf"));
 
         app.close_fold(true);
-        assert!(!app.pane().expanded.contains(&a));
-        assert!(!app.pane().expanded.contains(&b));
+        assert!(!app.pane().is_path_expanded(&a));
+        assert!(!app.pane().is_path_expanded(&b));
         app.open_all_folds();
-        assert!(app.pane().expanded.contains(&a));
-        assert!(app.pane().expanded.contains(&b));
-        assert!(app.pane().expanded.contains(&x));
-        assert!(app.pane().expanded.contains(&x.join("y")));
+        assert!(app.pane().is_path_expanded(&a));
+        assert!(app.pane().is_path_expanded(&b));
+        assert!(app.pane().is_path_expanded(&x));
+        assert!(app.pane().is_path_expanded(&x.join("y")));
         app.close_all_folds();
         assert!(app.pane().expanded.is_empty());
         assert!(app.pane().entries.iter().all(|entry| entry.depth == 0));
@@ -2708,7 +3399,8 @@ mod tests {
         std::fs::write(&first, b"first").unwrap();
         std::fs::write(&second, b"second").unwrap();
         let mut app = App::new(root.clone());
-        app.pane_mut().set_entries(fs::read_dir(&root, 0).unwrap());
+        app.pane_mut()
+            .set_entries(fs::read_dir(&root, 0).unwrap().entries);
         app.enable_editor(root.clone(), editor::test_handle());
         app.select_by_path(&first);
         app.activate();
@@ -2723,7 +3415,7 @@ mod tests {
 
         app.select_by_path(&second);
         app.activate();
-        app.editor_opened(1);
+        app.editor_opened(1, &first);
         assert_eq!(
             app.editor
                 .as_ref()
@@ -2745,15 +3437,17 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(&wanted, b"wanted").unwrap();
         let mut app = App::new(root.clone());
-        app.pane_mut().set_entries(fs::read_dir(&root, 0).unwrap());
+        app.pane_mut()
+            .set_entries(fs::read_dir(&root, 0).unwrap().entries);
         app.enable_editor(root.clone(), editor::test_handle());
 
         app.reveal_editor_path(wanted.clone(), false);
-        assert!(app.pane().expanded.contains(&root.join("one")));
-        assert!(app.pane().expanded.contains(&nested));
+        assert!(app.pane().is_path_expanded(&root.join("one")));
+        assert!(app.pane().is_path_expanded(&nested));
         assert_eq!(app.pane().current().map(|entry| &entry.path), Some(&wanted));
         app.set_editor_layout(editor::Layout::Sidebar);
-        app.pane_mut().set_entries(fs::read_dir(&root, 0).unwrap());
+        app.pane_mut()
+            .set_entries(fs::read_dir(&root, 0).unwrap().entries);
         app.reconcile_editor_selection();
         assert_eq!(app.pane().current().map(|entry| &entry.path), Some(&wanted));
         assert_eq!(app.editor_layout(), Some(editor::Layout::Sidebar));
@@ -2770,13 +3464,20 @@ mod tests {
         app.pane_mut()
             .selected
             .extend([root.clone(), child.clone(), sibling.clone()]);
-        app.pane_mut()
-            .expanded
-            .extend([root.clone(), child.clone(), sibling.clone()]);
+        for path in [root.clone(), child.clone(), sibling.clone()] {
+            app.pane_mut().expand_live_path(path);
+        }
 
         app.remove_operation_paths(pane_id, &HashSet::from([root]), true);
 
         assert_eq!(app.pane().selected, HashSet::from([sibling.clone()]));
-        assert_eq!(app.pane().expanded, HashSet::from([sibling]));
+        assert_eq!(
+            app.pane()
+                .expanded
+                .iter()
+                .map(|key| key.path.clone())
+                .collect::<HashSet<_>>(),
+            HashSet::from([sibling])
+        );
     }
 }

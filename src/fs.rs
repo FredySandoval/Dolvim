@@ -1,6 +1,7 @@
 //! Directory listing, sorting, metadata formatting, and the listing worker.
 
-use std::cmp::Ordering;
+use std::borrow::Cow;
+use std::cmp::{Ordering, Reverse};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -39,11 +40,31 @@ pub struct Entry {
     /// Free to compute: the child count already has to open it.
     pub readable: bool,
     pub hidden: bool,
-    /// Backend generation identity when this row comes from the Trash view.
-    pub trash_id: Option<std::ffi::OsString>,
+    /// Controlled Trash generation identity. Keeping the backend ID and its
+    /// allocation-free selection key in one value prevents divergence.
+    pub(crate) trash_identity: Option<TrashIdentity>,
     /// Depth in an expanded Details tree; 0 for a plain listing.
     pub depth: u16,
     pub expanded: bool,
+}
+
+pub fn trash_selection_key(id: &std::ffi::OsStr) -> PathBuf {
+    let mut key = std::ffi::OsString::from("trash-generation:");
+    key.push(id);
+    PathBuf::from(key)
+}
+
+#[derive(Clone, Debug)]
+pub struct TrashIdentity {
+    id: std::ffi::OsString,
+    selection_key: PathBuf,
+}
+
+impl TrashIdentity {
+    pub fn new(id: std::ffi::OsString) -> Self {
+        let selection_key = trash_selection_key(&id);
+        Self { id, selection_key }
+    }
 }
 
 impl Entry {
@@ -57,17 +78,24 @@ impl Entry {
         self.kind == Kind::Dir
     }
 
-    /// Stable selection identity. Live rows use their path; Trash generations
-    /// add the backend ID so duplicate deletions of one pathname remain distinct.
-    pub fn selection_key(&self) -> PathBuf {
-        match &self.trash_id {
-            None => self.path.clone(),
-            Some(id) => {
-                let mut key = std::ffi::OsString::from("trash-generation:");
-                key.push(id);
-                PathBuf::from(key)
-            }
-        }
+    /// Stable selection identity. Live rows borrow their path; Trash generations
+    /// borrow the key computed when the listing was built.
+    pub fn selection_key(&self) -> &Path {
+        self.trash_identity
+            .as_ref()
+            .map(|identity| identity.selection_key.as_path())
+            .unwrap_or(&self.path)
+    }
+
+    pub fn trash_id(&self) -> Option<&std::ffi::OsStr> {
+        self.trash_identity
+            .as_ref()
+            .map(|identity| identity.id.as_os_str())
+    }
+
+    #[cfg(test)]
+    pub fn set_trash_id(&mut self, id: impl Into<std::ffi::OsString>) {
+        self.trash_identity = Some(TrashIdentity::new(id.into()));
     }
 
     /// A directory the current user cannot look inside.
@@ -79,23 +107,25 @@ impl Entry {
         self.kind == Kind::File && self.mode & 0o111 != 0
     }
 
-    pub fn ext(&self) -> Option<String> {
-        self.path
-            .extension()
-            .map(|extension| extension.to_string_lossy().to_lowercase())
+    /// Borrow UTF-8 extensions and use a lossy value only for unusual Unix
+    /// names. This keeps the rendering fast path allocation-free without
+    /// classifying every non-UTF-8 extension as absent.
+    pub fn ext(&self) -> Option<Cow<'_, str>> {
+        Some(self.path.extension()?.to_string_lossy())
     }
 
     pub fn is_image(&self) -> bool {
         self.ext()
-            .is_some_and(|extension| config::IMAGE_EXTS.contains(&extension.as_str()))
+            .is_some_and(|extension| extension_in(&extension, config::IMAGE_EXTS))
     }
 
-    /// The "Type" column, Dolphin-style plain-English descriptions.
-    pub fn type_name(&self) -> String {
+    /// The "Type" column, Dolphin-style plain-English descriptions. Most
+    /// descriptions are borrowed; only names containing an extension allocate.
+    pub fn type_name(&self) -> Cow<'static, str> {
         match self.kind {
             Kind::Dir => "Folder".into(),
             Kind::Symlink => "Link".into(),
-            Kind::File => match self.ext().as_deref() {
+            Kind::File => match self.ext() {
                 None => {
                     if self.is_executable() {
                         "Executable".into()
@@ -103,17 +133,31 @@ impl Entry {
                         "Unknown".into()
                     }
                 }
-                Some(extension) if config::IMAGE_EXTS.contains(&extension) => {
-                    format!("{} image", extension.to_uppercase())
+                Some(extension) if extension_in(&extension, config::IMAGE_EXTS) => {
+                    format!("{} image", extension.to_uppercase()).into()
                 }
-                Some(extension) if config::ARCHIVE_EXTS.contains(&extension) => "Archive".into(),
-                Some("sh" | "bash" | "zsh" | "fish") => "Shell script".into(),
-                Some("rs") => "Rust source".into(),
-                Some("txt" | "md") => "Text document".into(),
-                Some("pdf") => "PDF document".into(),
-                Some("mp3" | "flac" | "ogg" | "wav" | "m4a") => "Audio".into(),
-                Some("mp4" | "mkv" | "webm" | "avi" | "mov") => "Video".into(),
-                Some(extension) => format!("{} file", extension.to_uppercase()),
+                Some(extension) if extension_in(&extension, config::ARCHIVE_EXTS) => {
+                    "Archive".into()
+                }
+                Some(extension) if extension_in(&extension, &["sh", "bash", "zsh", "fish"]) => {
+                    "Shell script".into()
+                }
+                Some(extension) if extension_eq(&extension, "rs") => "Rust source".into(),
+                Some(extension) if extension_in(&extension, &["txt", "md"]) => {
+                    "Text document".into()
+                }
+                Some(extension) if extension_eq(&extension, "pdf") => "PDF document".into(),
+                Some(extension)
+                    if extension_in(&extension, &["mp3", "flac", "ogg", "wav", "m4a"]) =>
+                {
+                    "Audio".into()
+                }
+                Some(extension)
+                    if extension_in(&extension, &["mp4", "mkv", "webm", "avi", "mov"]) =>
+                {
+                    "Video".into()
+                }
+                Some(extension) => format!("{} file", extension.to_uppercase()).into(),
             },
         }
     }
@@ -148,27 +192,58 @@ impl Entry {
             Kind::File => {
                 let extension = self.ext();
                 if let Some(icon) = extension.as_deref().and_then(|extension| {
-                    config::FILE_ICONS
-                        .iter()
-                        .find_map(|&(candidate, icon)| (candidate == extension).then_some(icon))
+                    config::FILE_ICONS.iter().find_map(|&(candidate, icon)| {
+                        extension_eq(candidate, extension).then_some(icon)
+                    })
                 }) {
                     icon
                 } else {
                     match extension.as_deref() {
-                        Some(extension) if config::IMAGE_EXTS.contains(&extension) => {
+                        Some(extension) if extension_in(extension, config::IMAGE_EXTS) => {
                             glyph::PICTURE
                         }
-                        Some(extension) if config::ARCHIVE_EXTS.contains(&extension) => {
+                        Some(extension) if extension_in(extension, config::ARCHIVE_EXTS) => {
                             glyph::ARCHIVE
                         }
-                        Some("mp3" | "flac" | "ogg" | "wav" | "m4a") => glyph::MUSIC,
-                        Some("mp4" | "mkv" | "webm" | "avi" | "mov") => glyph::VIDEO,
-                        Some("txt" | "md" | "pdf" | "doc" | "docx" | "odt") => glyph::DOCUMENT,
+                        Some(extension)
+                            if extension_in(extension, &["mp3", "flac", "ogg", "wav", "m4a"]) =>
+                        {
+                            glyph::MUSIC
+                        }
+                        Some(extension)
+                            if extension_in(extension, &["mp4", "mkv", "webm", "avi", "mov"]) =>
+                        {
+                            glyph::VIDEO
+                        }
+                        Some(extension)
+                            if extension_in(
+                                extension,
+                                &["txt", "md", "pdf", "doc", "docx", "odt"],
+                            ) =>
+                        {
+                            glyph::DOCUMENT
+                        }
                         _ => glyph::FILE,
                     }
                 }
             }
         }
+    }
+}
+
+fn extension_in(extension: &str, candidates: &[&str]) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| extension_eq(extension, candidate))
+}
+
+fn extension_eq(left: &str, right: &str) -> bool {
+    if left.is_ascii() && right.is_ascii() {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left.chars()
+            .flat_map(char::to_lowercase)
+            .eq(right.chars().flat_map(char::to_lowercase))
     }
 }
 
@@ -211,6 +286,15 @@ impl Default for Sort {
 /// Dolphin's natural sort: digit runs compare numerically, so `file10` follows
 /// `file9`. Case-insensitive, like every other file manager worth using.
 pub fn natural_cmp(a: &str, b: &str) -> Ordering {
+    if a.is_ascii() && b.is_ascii() {
+        return natural_cmp_folded(a, b).then_with(|| a.cmp(b));
+    }
+    let left_lower: String = a.chars().flat_map(char::to_lowercase).collect();
+    let right_lower: String = b.chars().flat_map(char::to_lowercase).collect();
+    natural_cmp_folded(&left_lower, &right_lower).then_with(|| a.cmp(b))
+}
+
+fn natural_cmp_folded(a: &str, b: &str) -> Ordering {
     let (mut left_chars, mut right_chars) = (a.chars().peekable(), b.chars().peekable());
     loop {
         match (left_chars.peek().copied(), right_chars.peek().copied()) {
@@ -226,9 +310,10 @@ pub fn natural_cmp(a: &str, b: &str) -> Ordering {
                         order => return order,
                     }
                 } else {
-                    let (left_lower, right_lower) =
-                        (lowercase_char(left_char), lowercase_char(right_char));
-                    match left_lower.cmp(&right_lower) {
+                    match left_char
+                        .to_ascii_lowercase()
+                        .cmp(&right_char.to_ascii_lowercase())
+                    {
                         Ordering::Equal => {
                             left_chars.next();
                             right_chars.next();
@@ -239,10 +324,6 @@ pub fn natural_cmp(a: &str, b: &str) -> Ordering {
             }
         }
     }
-}
-
-fn lowercase_char(c: char) -> char {
-    c.to_lowercase().next().unwrap_or(c)
 }
 
 fn take_number(digit_chars: &mut std::iter::Peekable<std::str::Chars>) -> u128 {
@@ -261,6 +342,25 @@ fn take_number(digit_chars: &mut std::iter::Peekable<std::str::Chars>) -> u128 {
 }
 
 pub fn sort_entries(entries: &mut [Entry], sort: Sort) {
+    if sort.key == SortKey::Type {
+        // Establish the secondary order first. The stable cached-key sort then
+        // formats each type once, rather than allocating in every comparison.
+        entries.sort_by(|a, b| reverse_if(natural_cmp(&a.name, &b.name), sort.reverse));
+        if sort.reverse {
+            entries.sort_by_cached_key(|entry| {
+                (
+                    sort.dirs_first && !entry.is_dir(),
+                    Reverse(entry.type_name()),
+                )
+            });
+        } else {
+            entries.sort_by_cached_key(|entry| {
+                (sort.dirs_first && !entry.is_dir(), entry.type_name())
+            });
+        }
+        return;
+    }
+
     entries.sort_by(|a, b| {
         if sort.dirs_first {
             match (a.is_dir(), b.is_dir()) {
@@ -279,22 +379,28 @@ pub fn sort_entries(entries: &mut [Entry], sort: Sort) {
                 .mtime
                 .cmp(&b.mtime)
                 .then_with(|| natural_cmp(&a.name, &b.name)),
-            SortKey::Type => a
-                .type_name()
-                .cmp(&b.type_name())
-                .then_with(|| natural_cmp(&a.name, &b.name)),
+            SortKey::Type => unreachable!("type sorting is handled above"),
         };
-        if sort.reverse {
-            order.reverse()
-        } else {
-            order
-        }
+        reverse_if(order, sort.reverse)
     });
 }
 
-/// Read one directory. Unreadable entries are skipped, not fatal — Dolphin
-/// shows what it can and complains in the status bar.
-pub fn read_dir(path: &Path, depth: u16) -> std::io::Result<Vec<Entry>> {
+fn reverse_if(order: Ordering, reverse: bool) -> Ordering {
+    if reverse {
+        order.reverse()
+    } else {
+        order
+    }
+}
+
+/// Entries successfully read from a directory, plus the first per-entry
+/// failure. The outer `Result` is reserved for failure to open the directory.
+pub struct DirectoryListing {
+    pub entries: Vec<Entry>,
+    pub error: Option<String>,
+}
+
+pub fn read_dir(path: &Path, depth: u16) -> std::io::Result<DirectoryListing> {
     read_dir_as(path, path, depth, false)
 }
 
@@ -305,12 +411,39 @@ pub fn read_dir_as(
     logical: &Path,
     depth: u16,
     backed: bool,
-) -> std::io::Result<Vec<Entry>> {
-    let entries = fs::read_dir(physical)?
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry_from_dir_entry(entry, logical, depth, backed))
-        .collect();
-    Ok(entries)
+) -> std::io::Result<DirectoryListing> {
+    let read_dir = fs::read_dir(physical)?;
+    Ok(collect_entries(read_dir, logical, depth, backed))
+}
+
+fn collect_entries(
+    read_dir: impl Iterator<Item = std::io::Result<fs::DirEntry>>,
+    logical: &Path,
+    depth: u16,
+    backed: bool,
+) -> DirectoryListing {
+    let mut entries = Vec::new();
+    let mut error = None;
+    for result in read_dir {
+        let result = result.and_then(|entry| entry_from_dir_entry(entry, logical, depth, backed));
+        match result {
+            Ok(built) => {
+                entries.push(built.entry);
+                if let Some(warning) = built.warning {
+                    error.get_or_insert(warning);
+                }
+            }
+            Err(entry_error) => {
+                error.get_or_insert_with(|| entry_error.to_string());
+            }
+        }
+    }
+    DirectoryListing { entries, error }
+}
+
+struct BuiltEntry {
+    entry: Entry,
+    warning: Option<String>,
 }
 
 fn entry_from_dir_entry(
@@ -318,20 +451,31 @@ fn entry_from_dir_entry(
     logical: &Path,
     depth: u16,
     backed: bool,
-) -> Option<Entry> {
+) -> std::io::Result<BuiltEntry> {
     let name = dir_entry.file_name().to_string_lossy().into_owned();
     let physical_path = dir_entry.path();
     let entry_path = logical.join(dir_entry.file_name());
-    let link_metadata = fs::symlink_metadata(&physical_path).ok()?;
+    let link_metadata = fs::symlink_metadata(&physical_path)?;
     let is_link = link_metadata.file_type().is_symlink();
-    let link_target = is_link
-        .then(|| fs::read_link(&physical_path).ok())
-        .flatten();
-    // Dolphin follows links for the type shown, but keeps the link marker.
-    let metadata = if is_link {
-        fs::metadata(&physical_path).unwrap_or(link_metadata)
+    let link_target = if is_link {
+        Some(fs::read_link(&physical_path)?)
     } else {
-        link_metadata
+        None
+    };
+    // Dolphin follows links for the type shown, but keeps broken-link rows.
+    let (metadata, mut warning) = if is_link {
+        match fs::metadata(&physical_path) {
+            Ok(metadata) => (metadata, None),
+            Err(error) => (
+                link_metadata,
+                Some(format!(
+                    "Cannot follow {}: {error}",
+                    physical_path.display()
+                )),
+            ),
+        }
+    } else {
+        (link_metadata, None)
     };
     let kind = if metadata.is_dir() {
         Kind::Dir
@@ -343,31 +487,40 @@ fn entry_from_dir_entry(
     // One `read_dir` answers both "how many children" and "can we get in",
     // so the lock state costs no extra syscall.
     let child_count = (kind == Kind::Dir).then(|| dir_child_count(&physical_path));
-    Some(Entry {
-        hidden: name.starts_with('.'),
-        name,
-        path: entry_path,
-        backing_path: backed.then_some(physical_path),
-        link_target,
-        kind,
-        size: match child_count {
-            Some(count) => count.unwrap_or(0),
-            None => metadata.len(),
+    if let Some(Err(error)) = &child_count {
+        warning.get_or_insert_with(|| format!("Cannot count {}: {error}", physical_path.display()));
+    }
+    Ok(BuiltEntry {
+        entry: Entry {
+            hidden: name.starts_with('.'),
+            name,
+            path: entry_path,
+            backing_path: backed.then_some(physical_path),
+            link_target,
+            kind,
+            size: match &child_count {
+                Some(Ok(count)) => *count,
+                Some(Err(_)) => 0,
+                None => metadata.len(),
+            },
+            mtime: metadata.mtime(),
+            mode: metadata.permissions().mode(),
+            readable: child_count.map(|count| count.is_ok()).unwrap_or(true),
+            trash_identity: None,
+            depth,
+            expanded: false,
         },
-        mtime: metadata.mtime(),
-        mode: metadata.permissions().mode(),
-        readable: child_count.map(|count| count.is_some()).unwrap_or(true),
-        trash_id: None,
-        depth,
-        expanded: false,
+        warning,
     })
 }
 
-/// `None` when the directory cannot be opened at all.
-fn dir_child_count(dir: &Path) -> Option<u64> {
-    fs::read_dir(dir)
-        .map(|read_dir| read_dir.count() as u64)
-        .ok()
+fn dir_child_count(dir: &Path) -> std::io::Result<u64> {
+    let mut count = 0;
+    for entry in fs::read_dir(dir)? {
+        entry?;
+        count += 1;
+    }
+    Ok(count)
 }
 
 /// Base 1000, KDE's "Metric" file size setting. The binary units it also offers
@@ -691,6 +844,7 @@ pub enum ListingMsg {
     Done {
         path: PathBuf,
         seq: u64,
+        error: Option<String>,
     },
 }
 
@@ -743,6 +897,7 @@ impl Lister {
                     }
                 };
                 let mut batch = Vec::with_capacity(2000);
+                let mut first_error = None;
                 for dir_entry in read_dir {
                     while let Ok(newer_request) = rx.try_recv() {
                         pending = Some(newer_request);
@@ -750,13 +905,19 @@ impl Lister {
                     if pending.is_some() {
                         break;
                     }
-                    let Some(entry) = dir_entry
-                        .ok()
-                        .and_then(|entry| entry_from_dir_entry(entry, &path, 0, false))
-                    else {
-                        continue;
-                    };
-                    batch.push(entry);
+                    match dir_entry.and_then(|entry| entry_from_dir_entry(entry, &path, 0, false)) {
+                        Ok(built) => {
+                            batch.push(built.entry);
+                            if let Some(warning) = built.warning {
+                                first_error.get_or_insert(warning);
+                            }
+                        }
+                        Err(error) => {
+                            first_error
+                                .get_or_insert_with(|| format!("Listing incomplete: {error}"));
+                            continue;
+                        }
+                    }
                     if batch.len() == 2000 {
                         let _ = tx.send(ListingMsg::Batch {
                             path: path.clone(),
@@ -774,7 +935,11 @@ impl Lister {
                     seq,
                     entries: batch,
                 });
-                let _ = tx.send(ListingMsg::Done { path, seq });
+                let _ = tx.send(ListingMsg::Done {
+                    path,
+                    seq,
+                    error: first_error,
+                });
             }
         });
         Lister { jobs }
@@ -800,6 +965,36 @@ mod tests {
     fn giant_digit_runs_do_not_panic() {
         let long = "9".repeat(60);
         assert_eq!(natural_cmp(&long, &long), Ordering::Equal);
+    }
+
+    #[test]
+    fn unicode_folding_compares_complete_lowercase_expansions() {
+        assert_eq!(natural_cmp("İ2", "i\u{307}10"), Ordering::Less);
+        assert!(extension_eq("K", "k"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_extensions_are_classified_as_lossy_extensions() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let entry = Entry {
+            name: "invalid extension".into(),
+            path: PathBuf::from(std::ffi::OsString::from_vec(b"file.\xffx".to_vec())),
+            backing_path: None,
+            link_target: None,
+            kind: Kind::File,
+            size: 0,
+            mtime: 0,
+            mode: 0,
+            readable: true,
+            hidden: false,
+            trash_identity: None,
+            depth: 0,
+            expanded: false,
+        };
+        assert_eq!(entry.ext().as_deref(), Some("�x"));
+        assert_eq!(entry.type_name(), "�X file");
     }
 
     #[test]
@@ -850,9 +1045,53 @@ mod tests {
         let target = PathBuf::from("../../.agents/skills/herdr");
         std::os::unix::fs::symlink(&target, dir.join("herdr")).unwrap();
 
-        let entries = read_dir(&dir, 0).unwrap();
+        let listing = read_dir(&dir, 0).unwrap();
 
-        assert_eq!(entries[0].link_target.as_ref(), Some(&target));
+        assert!(listing
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("Cannot follow")));
+        assert_eq!(listing.entries[0].link_target.as_ref(), Some(&target));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn per_entry_errors_leave_a_partial_listing_and_report_the_first_failure() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("dolvim-partial-listing-{unique}"));
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("visible.txt"), b"visible").unwrap();
+        let entry = fs::read_dir(&dir).unwrap().next().unwrap().unwrap();
+        let injected = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "entry denied");
+
+        let listing = collect_entries(vec![Ok(entry), Err(injected)].into_iter(), &dir, 0, false);
+
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].name, "visible.txt");
+        assert_eq!(listing.error.as_deref(), Some("entry denied"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn metadata_failure_is_reported_instead_of_silently_dropping_the_entry() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("dolvim-metadata-failure-{unique}"));
+        fs::create_dir(&dir).unwrap();
+        let vanished = dir.join("vanished.txt");
+        fs::write(&vanished, b"temporary").unwrap();
+        let entry = fs::read_dir(&dir).unwrap().next().unwrap().unwrap();
+        fs::remove_file(vanished).unwrap();
+
+        let listing = collect_entries(vec![Ok(entry)].into_iter(), &dir, 0, false);
+
+        assert!(listing.entries.is_empty());
+        assert!(listing.error.is_some());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -869,7 +1108,7 @@ mod tests {
             mode: 0,
             readable: true,
             hidden: false,
-            trash_id: None,
+            trash_identity: None,
             depth: 0,
             expanded: false,
         };
@@ -894,7 +1133,7 @@ mod tests {
             mode: 0,
             readable: true,
             hidden: false,
-            trash_id: None,
+            trash_identity: None,
             depth: 0,
             expanded: false,
         };

@@ -58,9 +58,14 @@ pub fn handle_mouse_event(app: &mut App, m: MouseEvent) {
     }
 }
 
-/// Over one of the two toolbar buttons that drop a menu.
-fn on_menu_button(app: &App, x: u16, y: u16) -> bool {
-    rect_contains(app.hits.view_menu, x, y) || rect_contains(app.hits.menu, x, y)
+fn menu_button_at(app: &App, x: u16, y: u16) -> Option<MenuKind> {
+    if rect_contains(app.hits.view_menu, x, y) {
+        Some(MenuKind::ViewMode)
+    } else if rect_contains(app.hits.menu, x, y) {
+        Some(MenuKind::Hamburger)
+    } else {
+        None
+    }
 }
 
 /// The one thing the pointer does without a click: a toolbar button that drops
@@ -77,17 +82,16 @@ fn handle_pointer_move(app: &mut App, x: u16, y: u16) {
     if !matches!(app.mode, Mode::Normal | Mode::Buttons(_) | Mode::Menu(_)) {
         return;
     }
-    let hitboxes = app.hits.clone();
     // The caret, not the icon beside it: on a split button the icon is the
     // action and only the caret drops the list, which is how clicking works too.
-    let menu_to_open = if rect_contains(hitboxes.view_menu, x, y) {
+    let menu_to_open = if rect_contains(app.hits.view_menu, x, y) {
         MenuKind::ViewMode
-    } else if rect_contains(hitboxes.menu, x, y) {
+    } else if rect_contains(app.hits.menu, x, y) {
         MenuKind::Hamburger
     } else {
         return;
     };
-    if app.mode != Mode::Menu(menu_to_open.clone()) {
+    if app.mode != Mode::Menu(menu_to_open) {
         vim::open_menu(app, menu_to_open);
     }
 }
@@ -125,20 +129,24 @@ fn handle_scroll(app: &mut App, x: u16, y: u16, scroll_delta: isize) {
 
 fn handle_left_press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
     // An open menu swallows the click: inside picks, outside dismisses.
-    if let Mode::Menu(kind) = app.mode.clone() {
+    if let Mode::Menu(kind) = &app.mode {
+        let kind = *kind;
         let items = vim::menu_items(&kind);
         if let Some(i) = menu_index(app, x, y, items.len()) {
             let action = items[i].action;
             vim::leave_toolbar(app);
             vim::run_action(app, action, 1);
-        } else if !on_menu_button(app, x, y) {
-            // Clicking the button the menu hangs from would close it, and the
-            // next pointer motion would open it again. Leave it be.
+        } else if let Some(clicked_kind) = menu_button_at(app, x, y) {
+            if clicked_kind != kind {
+                vim::open_menu(app, clicked_kind);
+            }
+        } else {
             app.mode = Mode::Normal;
         }
         return;
     }
-    if let Mode::CrumbMenu(segment_index) = app.mode.clone() {
+    if let Mode::CrumbMenu(segment_index) = &app.mode {
+        let segment_index = *segment_index;
         let items = vim::crumb_siblings(app, segment_index);
         if let Some(i) = menu_index(app, x, y, items.len()) {
             let d = items[i].clone();
@@ -154,61 +162,74 @@ fn handle_left_press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
         return;
     }
 
-    // Toolbar.
-    let hitboxes = app.hits.clone();
-    if rect_contains(hitboxes.back, x, y) {
+    // Toolbar. Each hit-test borrow ends before its action mutates the app.
+    if rect_contains(app.hits.back, x, y) {
         return app.back();
     }
-    if rect_contains(hitboxes.forward, x, y) {
+    if rect_contains(app.hits.forward, x, y) {
         return app.forward();
     }
-    if rect_contains(hitboxes.view_cycle, x, y) {
+    if rect_contains(app.hits.view_cycle, x, y) {
         return vim::run_action(app, Action::CycleView, 1);
     }
-    if rect_contains(hitboxes.view_menu, x, y) {
+    if rect_contains(app.hits.view_menu, x, y) {
         return vim::open_menu(app, MenuKind::ViewMode);
     }
-    if rect_contains(hitboxes.split, x, y) {
+    if rect_contains(app.hits.split, x, y) {
         return app.toggle_split();
     }
-    if rect_contains(hitboxes.search, x, y) {
+    if rect_contains(app.hits.search, x, y) {
         return vim::run_action(app, Action::EnterSearch, 1);
     }
-    if rect_contains(hitboxes.menu, x, y) {
+    if rect_contains(app.hits.menu, x, y) {
         return vim::open_menu(app, MenuKind::Hamburger);
     }
-    for (rect, segment_index) in &hitboxes.crumb_arrows {
-        if rect_contains(*rect, x, y) {
-            return vim::open_crumb(app, *segment_index);
-        }
+    let crumb_arrow = app
+        .hits
+        .crumb_arrows
+        .iter()
+        .find_map(|(rect, index)| rect_contains(*rect, x, y).then_some(*index));
+    if let Some(segment_index) = crumb_arrow {
+        return vim::open_crumb(app, segment_index);
     }
-    for (rect, crumb_path) in &hitboxes.crumbs {
-        if rect_contains(*rect, x, y) {
-            return app.open_breadcrumb(crumb_path.clone());
-        }
+    let crumb_path = app
+        .hits
+        .crumbs
+        .iter()
+        .find_map(|(rect, path)| rect_contains(*rect, x, y).then(|| path.clone()));
+    if let Some(path) = crumb_path {
+        return app.open_breadcrumb(path);
     }
     // Clicking the empty part of the location bar edits it, as in Dolphin.
-    if rect_contains(hitboxes.path_bar, x, y) && app.mode != Mode::PathEdit {
+    if rect_contains(app.hits.path_bar, x, y) && app.mode != Mode::PathEdit {
         return vim::run_action(app, Action::EnterPathEdit, 1);
     }
-    for (tab_index, rect) in hitboxes.tabs.iter().enumerate() {
-        if rect_contains(*rect, x, y) {
-            app.active_tab = tab_index;
-            app.focus = Focus::Tabs;
-            return;
-        }
+    let tab_index = app
+        .hits
+        .tabs
+        .iter()
+        .position(|rect| rect_contains(*rect, x, y));
+    if let Some(tab_index) = tab_index {
+        app.active_tab = tab_index;
+        app.focus = Focus::Tabs;
+        return;
     }
     // Details column headers sort, and re-sort in reverse on a second click.
-    for (rect, sort_key) in &hitboxes.headers {
-        if rect_contains(*rect, x, y) {
-            return app.set_sort(*sort_key);
-        }
+    let header = app
+        .hits
+        .headers
+        .iter()
+        .find_map(|(rect, pane, key)| rect_contains(*rect, x, y).then_some((*pane, *key)));
+    if let Some((pane, sort_key)) = header {
+        app.tab_mut().active = pane;
+        return app.set_sort(sort_key);
     }
-    if app.places_visible && rect_contains(hitboxes.places, x, y) {
+    if app.places_visible && rect_contains(app.hits.places, x, y) {
         let places_row_index = places_row_at(app, y);
         if let Some(row) = app.places.get(places_row_index) {
             if matches!(row, crate::places::Row::Item { eject: true, .. })
-                && x >= hitboxes
+                && x >= app
+                    .hits
                     .places
                     .right()
                     .saturating_sub(config::glyph::EJECT.width().max(1) as u16 + 1)
@@ -245,7 +266,7 @@ fn handle_left_press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
     let entry_identity = app
         .pane()
         .entry_at(vis)
-        .map(|entry| (entry.path.clone(), entry.selection_key()));
+        .map(|entry| (entry.path.clone(), entry.selection_key().to_path_buf()));
     let Some((path, selection_key)) = entry_identity else {
         return;
     };
@@ -271,7 +292,11 @@ fn handle_left_press(app: &mut App, x: u16, y: u16, ctrl: bool, shift: bool) {
         let anchor = app.pane().anchor;
         let (a, b) = (anchor.min(vis), anchor.max(vis));
         let range: Vec<PathBuf> = (a..=b)
-            .filter_map(|i| app.pane().entry_at(i).map(|e| e.selection_key()))
+            .filter_map(|i| {
+                app.pane()
+                    .entry_at(i)
+                    .map(|e| e.selection_key().to_path_buf())
+            })
             .collect();
         let p = app.pane_mut();
         p.selected.clear();
@@ -546,7 +571,7 @@ mod tests {
             mode: 0,
             readable: true,
             hidden: false,
-            trash_id: None,
+            trash_identity: None,
             depth,
             expanded: false,
         };
@@ -575,7 +600,6 @@ mod tests {
     #[test]
     fn split_drag_keeps_source_cleanup_and_folder_reveal_owners_distinct() {
         use crate::fs::{Entry, Kind};
-        use std::sync::atomic::Ordering;
 
         let unique = format!(
             "dolvim-split-drag-{}-{}",
@@ -621,7 +645,7 @@ mod tests {
                 mode: 0,
                 readable: true,
                 hidden: false,
-                trash_id: None,
+                trash_identity: None,
                 depth: 0,
                 expanded: false,
             }];
@@ -644,13 +668,19 @@ mod tests {
         assert_eq!(reveal.pane_id, target_pane_id);
         assert_eq!(reveal.directory, hovered_folder);
 
-        while !transfer.progress.finished.load(Ordering::Relaxed) {
+        while !transfer.progress.is_finished() {
             std::thread::sleep(Duration::from_millis(1));
         }
-        let outcome = transfer.progress.outcome.lock().unwrap();
-        let effect = outcome.as_ref().unwrap().committed.first().unwrap();
+        let outcome = app
+            .active_transfer
+            .as_mut()
+            .unwrap()
+            .progress
+            .join()
+            .unwrap()
+            .expect_completed();
+        let effect = outcome.committed.first().unwrap();
         assert_eq!(effect.target, hovered_folder.join("item.txt"));
-        drop(outcome);
         std::fs::remove_dir_all(root).unwrap();
     }
 

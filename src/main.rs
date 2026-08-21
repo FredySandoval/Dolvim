@@ -287,6 +287,9 @@ fn run(
     // echo. Restore first, then let the default hook print its report.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        if ops::transfer_worker_handles_panic() {
+            return;
+        }
         restore_terminal();
         default_hook(info);
     }));
@@ -349,12 +352,17 @@ fn run(
         }
 
         drain_observations(&mut app, observer.as_mut())?;
+        app.sync_active_watcher();
         dirty |= app.pump_fs_events();
         app.reconcile_editor_selection();
         dirty |= pump_editor(&mut app, editor_connection.as_ref());
         dirty |= app.refresh_places();
         dirty |= app.pump_external_launches();
         dirty |= app.thumbs.pump_decoded_thumbs();
+        if app.thumbs.take_worker_failure() {
+            app.error("Thumbnail worker stopped; pending previews can be retried");
+            dirty = true;
+        }
         dirty |= finish_transfer(&mut app);
         // Transfer counters are shared atomics updated by the worker, so keep
         // progress responsive without making the quiescent loop redraw.
@@ -410,18 +418,14 @@ fn pump_editor(app: &mut App, connection: Option<&editor::Connection>) -> bool {
         changed = true;
         match event {
             editor::Event::Message(editor::Incoming::SetLayout { layout, .. }) => {
-                app.set_editor_layout(if layout == "sidebar" {
-                    editor::Layout::Sidebar
-                } else {
-                    editor::Layout::Full
-                });
+                app.set_editor_layout(layout);
             }
             editor::Event::Message(editor::Incoming::SetFocus { focused, .. }) => {
                 app.set_editor_terminal_focus(focused);
             }
             editor::Event::Message(editor::Incoming::Opened { id, path, .. }) => {
                 match editor::protocol_path(path) {
-                    Ok(_) => app.editor_opened(id),
+                    Ok(path) => app.editor_opened(id, &path),
                     Err(error) => app.error(error),
                 }
             }
@@ -464,20 +468,44 @@ fn drain_observations(app: &mut App, observer: Option<&mut observer::Observer>) 
                 committed,
                 failed,
                 cancelled,
-            } => observer.operation_finished(id, committed, failed, cancelled)?,
+                indeterminate,
+                retained,
+            } => observer.operation_finished(
+                id,
+                committed,
+                failed,
+                cancelled,
+                indeterminate,
+                retained,
+            )?,
         }
     }
     Ok(())
 }
 
+fn transfer_failure_message(
+    label: &str,
+    committed: usize,
+    failures: &[ops::ItemFailure],
+    cancelled: bool,
+) -> String {
+    let cancellation = if cancelled { ", cancelled" } else { "" };
+    let detail = failures
+        .first()
+        .map(|failure| format!(" — {}", failure.message))
+        .unwrap_or_default();
+    format!(
+        "{label} — {committed} committed, {} failed{cancellation}{detail}",
+        failures.len()
+    )
+}
+
 /// Collect a finished background transfer: journal it, report it, relist.
 fn finish_transfer(app: &mut App) -> bool {
-    let done = app.active_transfer.as_ref().is_some_and(|transfer| {
-        transfer
-            .progress
-            .finished
-            .load(std::sync::atomic::Ordering::Relaxed)
-    });
+    let done = app
+        .active_transfer
+        .as_ref()
+        .is_some_and(|transfer| transfer.progress.is_finished());
     if !done {
         return false;
     }
@@ -486,32 +514,51 @@ fn finish_transfer(app: &mut App) -> bool {
     };
     let reveal = active_transfer.reveal;
     let selection_pane_id = active_transfer.selection_pane_id;
-    let progress = active_transfer.progress;
-    let outcome = progress
-        .outcome
-        .lock()
-        .ok()
-        .and_then(|mut outcome_guard| outcome_guard.take());
-    let Some(outcome) = outcome else {
-        app.error("Transfer finished without an outcome");
-        app.refresh_in_place();
-        return true;
+    let mut progress = active_transfer.progress;
+    let affected_paths = progress.affected_paths().to_vec();
+    let (outcome, panic_message) = match progress.join() {
+        Ok(ops::TransferCompletion::Completed(outcome)) => (outcome, None),
+        Ok(ops::TransferCompletion::Panicked { outcome, message }) => (outcome, Some(message)),
+        Err(message) => (ops::TransferOutcome::default(), Some(message)),
     };
 
     let committed_sources: std::collections::HashSet<_> = outcome
         .committed
         .iter()
+        .filter(|effect| effect.source_removed)
         .map(|effect| effect.source.clone())
         .collect();
     match progress.kind {
         ops::TransferKind::Move if !outcome.committed.is_empty() => {
-            app.undo.push(ops::UndoOp::Move {
-                moved_pairs: outcome
-                    .committed
-                    .iter()
-                    .map(|effect| (effect.source.clone(), effect.target.clone()))
-                    .collect(),
-            });
+            let moved_pairs = outcome
+                .committed
+                .iter()
+                .filter(|effect| effect.source_removed)
+                .map(|effect| (effect.source.clone(), effect.target.clone()))
+                .collect::<Vec<_>>();
+            let resolved = (!moved_pairs.is_empty())
+                .then_some(ops::UndoOp::Move { moved_pairs })
+                .map(Box::new);
+            let unresolved = outcome
+                .committed
+                .iter()
+                .filter(|effect| !effect.source_removed)
+                .map(|effect| ops::RenamePartial {
+                    source: effect.source.clone(),
+                    target: effect.target.clone(),
+                    message: "destination committed while source remains".into(),
+                })
+                .collect::<Vec<_>>();
+            if unresolved.is_empty() {
+                if let Some(resolved) = resolved {
+                    app.undo.push(*resolved);
+                }
+            } else {
+                app.undo.push(ops::UndoOp::UnresolvedRename {
+                    effects: unresolved,
+                    operation: resolved,
+                });
+            }
         }
         ops::TransferKind::Restore if !outcome.committed.is_empty() => {
             app.undo.push(ops::UndoOp::Restore {
@@ -578,6 +625,7 @@ fn finish_transfer(app: &mut App) -> bool {
     let committed_selection_keys: std::collections::HashSet<_> = outcome
         .committed
         .iter()
+        .filter(|effect| progress.kind != ops::TransferKind::Move || effect.source_removed)
         .map(|effect| {
             effect
                 .trash_ref
@@ -592,20 +640,58 @@ fn finish_transfer(app: &mut App) -> bool {
     );
 
     let committed = outcome.committed.len();
-    let failed = outcome.failed.len();
+    let failed =
+        outcome.failed.len() + outcome.cleanup_failed.len() + usize::from(panic_message.is_some());
+    let retained = outcome.retained_output.len();
     if let Some(id) = active_transfer.observation_id {
-        app.observation_events_finished(id, committed, failed, outcome.cancelled);
+        app.observation_events_finished(
+            id,
+            committed,
+            failed,
+            outcome.cancelled,
+            panic_message.is_some(),
+            retained,
+        );
     }
-    if failed > 0 || outcome.cancelled {
+    if let Some(message) = &panic_message {
         app.error(format!(
-            "{} — {committed} committed, {failed} failed{}",
-            progress.label,
-            if outcome.cancelled { ", cancelled" } else { "" }
+            "{} — worker panicked ({message}); {committed} recorded effect(s), filesystem may contain untracked effects",
+            progress.label
         ));
+    } else if failed > 0 || outcome.cancelled || retained > 0 {
+        let mut failures = outcome.failed.clone();
+        failures.extend(outcome.cleanup_failed.clone());
+        let mut message =
+            transfer_failure_message(&progress.label, committed, &failures, outcome.cancelled);
+        if let Some(retained_output) = outcome.retained_output.first() {
+            message.push_str(&format!(
+                "; {retained} retained output(s), including {} — {} (source {})",
+                retained_output.target.display(),
+                retained_output.message,
+                retained_output.source.display()
+            ));
+        }
+        app.error(message);
     } else {
         app.info(format!("{} — {committed} done", progress.label));
     }
     let reveal_pane_id = reveal.as_ref().map(|intent| intent.pane_id);
+    let partial_move = progress.kind == ops::TransferKind::Move
+        && (!outcome.failed.is_empty()
+            || !outcome.retained_output.is_empty()
+            || outcome
+                .committed
+                .iter()
+                .any(|effect| !effect.source_removed));
+    let restore_changed_trash = progress.kind == ops::TransferKind::Restore && committed > 0;
+    if panic_message.is_some()
+        || partial_move
+        || !outcome.retained_output.is_empty()
+        || !outcome.cleanup_failed.is_empty()
+        || restore_changed_trash
+    {
+        app.reconcile_indeterminate_transfer(&outcome.committed, &affected_paths);
+    }
     if reveal_pane_id != Some(selection_pane_id) {
         app.refresh_pane_in_place(selection_pane_id);
     }
@@ -647,6 +733,125 @@ mod cli_tests {
     fn parse(args: &[&str]) -> Result<Cli, String> {
         parse_args(args.iter().map(|s| s.to_string()))
     }
+    #[test]
+    fn panic_after_effect_runs_the_completion_reducer() {
+        let root = std::env::temp_dir();
+        let source = root.join("panic-source");
+        let target = root.join("panic-target");
+        let progress = ops::panicking_progress_after_effect(
+            ops::TransferKind::Move,
+            ops::TransferEffect {
+                source: source.clone(),
+                target: target.clone(),
+                trash_ref: None,
+                source_removed: true,
+            },
+        );
+        let mut app = App::new(root.clone());
+        app.enable_observation();
+        app.begin_observed_transfer(progress, None, root, 1);
+        while !app.active_transfer.as_ref().unwrap().progress.is_finished() {
+            std::thread::yield_now();
+        }
+
+        assert!(finish_transfer(&mut app));
+        assert!(app.active_transfer.is_none());
+        assert!(app.status_is_error);
+        assert!(app
+            .status
+            .contains("filesystem may contain untracked effects"));
+        assert!(matches!(
+            app.undo.last(),
+            Some(ops::UndoOp::Move { moved_pairs })
+                if moved_pairs == &vec![(source, target)]
+        ));
+        assert!(app.take_observation_events().iter().any(|event| matches!(
+            event,
+            app::Observation::OperationFinished {
+                committed: 1,
+                failed: 1,
+                cancelled: false,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn retained_move_output_keeps_source_register_and_reports_observer_uncertainty() {
+        let root =
+            std::env::temp_dir().join(format!("dolvim-retained-output-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source");
+        let target = root.join("target");
+        let outcome = ops::TransferOutcome {
+            committed: vec![ops::TransferEffect {
+                source: source.clone(),
+                target: target.clone(),
+                trash_ref: None,
+                source_removed: false,
+            }],
+            retained_output: vec![ops::RetainedOutput {
+                source: source.clone(),
+                target,
+                message: "injected source cleanup failure".into(),
+            }],
+            ..Default::default()
+        };
+        let progress = ops::completed_progress(ops::TransferKind::Move, outcome);
+        let mut app = App::new(root.clone());
+        app.toggle_split();
+        app.new_tab(root.clone());
+        app.enable_observation();
+        app.register = ops::UnnamedRegister::Live {
+            paths: vec![source.clone()],
+            cut: true,
+        };
+        app.begin_observed_transfer(progress, None, root.clone(), 1);
+        while !app.active_transfer.as_ref().unwrap().progress.is_finished() {
+            std::thread::yield_now();
+        }
+
+        assert!(finish_transfer(&mut app));
+        assert!(matches!(
+            &app.register,
+            ops::UnnamedRegister::Live { paths, cut: true } if paths == &vec![source.clone()]
+        ));
+        assert!(matches!(
+            app.undo.last(),
+            Some(ops::UndoOp::UnresolvedRename { effects, .. })
+                if effects.len() == 1 && effects[0].source == source
+        ));
+        assert!(app.status.contains("retained output"));
+        assert!(app
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.panes.iter())
+            .filter(|pane| matches!(pane.target, crate::places::Target::Dir(_)))
+            .all(|pane| pane.loading));
+        assert!(app.take_observation_events().iter().any(|event| matches!(
+            event,
+            app::Observation::OperationFinished { retained: 1, .. }
+        )));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn transfer_failure_status_reports_partial_cleanup_details() {
+        let message = transfer_failure_message(
+            "Moving 1 item(s)",
+            0,
+            &[ops::ItemFailure {
+                path: PathBuf::from("/source"),
+                message: "Complete destination preserved; source may be partially removed".into(),
+            }],
+            false,
+        );
+
+        assert!(message.contains("0 committed, 1 failed"));
+        assert!(message.contains("destination preserved"));
+        assert!(message.contains("source may be partially removed"));
+    }
+
     #[test]
     fn parses_observer_and_directory() {
         let cli = parse(&["--test-observe", "/tmp/e.jsonl", "/tmp/root"]).unwrap();

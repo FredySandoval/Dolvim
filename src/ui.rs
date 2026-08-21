@@ -15,6 +15,7 @@ use crate::app::{App, Focus, MenuKind, Mode, Pane, ViewMode};
 use crate::config;
 use crate::editor::Layout as EditorLayout;
 use crate::fs::{self, SortKey};
+use crate::ops::TransferProgress;
 use crate::places::Row;
 use crate::vim;
 
@@ -54,10 +55,6 @@ fn sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
         .editor
         .as_ref()
         .is_some_and(|editor| editor.terminal_focused);
-    let selected_path = app
-        .editor
-        .as_ref()
-        .and_then(|editor| editor.selected_path.clone());
     {
         let pane = app.pane_mut();
         pane.area = area;
@@ -67,17 +64,24 @@ fn sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
         pane.cell_height = 1;
         reveal_cursor(pane, pane.cursor, rows as usize);
     }
-    let offset = app.pane().offset;
+    let selected_path = app
+        .editor
+        .as_ref()
+        .and_then(|editor| editor.selected_path.as_deref());
+    let cut_paths = app.register.cut_paths();
+    let pane = app.pane();
+    let cut = !cut_paths.is_empty();
+    let offset = pane.offset;
     for row in 0..rows as usize {
         let visible_index = offset + row;
-        let Some(entry) = app.pane().entry_at(visible_index).cloned() else {
+        let Some(entry) = pane.entry_at(visible_index) else {
             break;
         };
         let y = area.y + row as u16;
         if y >= area.bottom() || area.width == 0 {
             break;
         }
-        let selected = selected_path.as_deref() == Some(entry.path.as_path());
+        let selected = selected_path == Some(entry.path.as_path());
         let selection = if active {
             config::THEME.selection
         } else {
@@ -88,7 +92,8 @@ fn sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                 .fg(selection.foreground)
                 .bg(selection.background)
         } else {
-            entry_style(app.pane(), visible_index, false, false)
+            let is_cut = cut && cut_paths.contains(&entry.path);
+            entry_style(entry, entry_selected(pane, entry), is_cut, false)
         };
         let row_area = Rect::new(area.x, y, area.width, 1);
         if selected {
@@ -113,7 +118,7 @@ fn sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
         frame
             .buffer_mut()
             .set_string(area.x, y, clip(&text, area.width as usize), style);
-        if visible_index == app.pane().cursor {
+        if visible_index == pane.cursor {
             let icon_x = area
                 .x
                 .saturating_add(entry.depth * 2)
@@ -440,6 +445,7 @@ fn body(frame: &mut Frame, app: &mut App, area: Rect) {
         app.hits.tabs.clear();
     }
     let view_area = view_rows[1];
+    app.hits.headers.clear();
 
     let n = app.tab().panes.len();
     if n > 1 {
@@ -621,8 +627,8 @@ fn draw_pane(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
                 .fg(config::THEME.view.secondary)
                 .bg(config::THEME.view.background),
         );
-    } else if let Some(e) = &p.error {
-        let msg = e.clone();
+    } else if p.entries.is_empty() && p.error.is_some() {
+        let msg = p.error.clone().unwrap_or_default();
         centred(
             frame.buffer_mut(),
             area,
@@ -648,14 +654,11 @@ fn draw_pane(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
     }
 }
 
-fn entry_selected(pane: &Pane, visible_index: usize) -> bool {
-    let entry = &pane.entries[pane.visible[visible_index]];
-    pane.selected.contains(&entry.selection_key())
+fn entry_selected(pane: &Pane, entry: &fs::Entry) -> bool {
+    pane.selected.contains(entry.selection_key())
 }
 
-fn entry_style(pane: &Pane, visible_index: usize, is_cut: bool, active: bool) -> Style {
-    let e = &pane.entries[pane.visible[visible_index]];
-    let selected = pane.selected.contains(&e.selection_key());
+fn entry_style(e: &fs::Entry, selected: bool, is_cut: bool, active: bool) -> Style {
     let fg = if is_cut {
         config::THEME.entry.cut
     } else if e.is_locked() {
@@ -739,8 +742,6 @@ fn draw_icons_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, act
         rows,
         margin_x,
     } = icon_grid(area);
-    let cut_set = app.register.cut_paths().to_vec();
-    let cut = !cut_set.is_empty();
     {
         let p = app.pane_at_mut(idx);
         p.grid_cols = cols;
@@ -751,9 +752,12 @@ fn draw_icons_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, act
         let cur_row = p.cursor / cols as usize;
         reveal_cursor(p, cur_row, rows as usize);
     }
-    let p_len = app.pane_at(idx).visible.len();
-    let offset = app.pane_at(idx).offset;
-    let first = offset * cols as usize;
+    let active_tab = app.active_tab;
+    let cut_paths = app.register.cut_paths();
+    let cut = !cut_paths.is_empty();
+    let p = &app.tabs[active_tab].panes[idx];
+    let thumbs = &mut app.thumbs;
+    let first = p.offset * cols as usize;
 
     let gap = config::CELL_GAP.min(cell_width.saturating_sub(3));
     let tile_w = cell_width - gap;
@@ -764,7 +768,7 @@ fn draw_icons_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, act
 
     for slot in 0..(cols as usize * rows as usize) {
         let vis = first + slot;
-        if vis >= p_len {
+        if vis >= p.visible.len() {
             break;
         }
         let (r, c) = (slot / cols as usize, slot % cols as usize);
@@ -779,15 +783,13 @@ fn draw_icons_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, act
         if cell.width == 0 || cell.height == 0 {
             continue;
         }
-        let e = {
-            let p = app.pane_at(idx);
-            p.entries[p.visible[vis]].clone()
-        };
-        let is_cut = cut && cut_set.contains(&e.path);
-        let st = entry_style(app.pane_at(idx), vis, is_cut, active);
+        let e = &p.entries[p.visible[vis]];
+        let is_cut = cut && cut_paths.contains(&e.path);
+        let selected = entry_selected(p, e);
+        let st = entry_style(e, selected, is_cut, active);
 
         // Selection fill covers the whole cell.
-        if entry_selected(app.pane_at(idx), vis) {
+        if selected {
             let selection = if active {
                 config::THEME.selection
             } else {
@@ -807,13 +809,13 @@ fn draw_icons_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, act
         let drew = e.is_image()
             && thumb_area.width > 1
             && thumb_area.height > 0
-            && try_draw_thumbnail(frame, &mut app.thumbs, thumb_area, &e.path);
+            && try_draw_thumbnail(frame, thumbs, thumb_area, &e.path);
         if !drew {
             centred(
                 frame.buffer_mut(),
                 thumb_area,
                 e.glyph(),
-                st.fg(icon_color(&e, is_cut)),
+                st.fg(icon_color(e, is_cut)),
             );
         }
 
@@ -828,7 +830,7 @@ fn draw_icons_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, act
             frame.buffer_mut().set_string(x, y, part, st);
         }
 
-        if vis == app.pane_at(idx).cursor {
+        if vis == p.cursor {
             // The frame hugs what is actually drawn: the blank margin row it is
             // hung from, the icon, and only the name rows this name used. A
             // one-line name gets a short box instead of two rows of empty space,
@@ -841,16 +843,11 @@ fn draw_icons_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, act
                 active,
             );
         }
-        let selected = entry_selected(app.pane_at(idx), vis);
-        if selected || (active && vis == app.pane_at(idx).cursor) {
+        if selected || (active && vis == p.cursor) {
             state_marker(
                 frame.buffer_mut(),
                 cell,
-                if active && vis == app.pane_at(idx).cursor {
-                    '>'
-                } else {
-                    '*'
-                },
+                if active && vis == p.cursor { '>' } else { '*' },
             );
         }
     }
@@ -858,66 +855,71 @@ fn draw_icons_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, act
 
 fn draw_compact_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool) {
     let rows = area.height.max(1);
-    let cut_set = app.register.cut_paths().to_vec();
-    let cut = !cut_set.is_empty();
     // The margin is the pane's, not each column's: columns are already held
     // apart by the blank `compact_widths` leaves on the right.
-    let avail = area.width.saturating_sub(config::VIEW_MARGIN);
-    ensure_compact_widths(app.pane_at_mut(idx), rows, avail);
-    let widths = app.pane_at(idx).compact_widths.clone();
+    let right = area.right();
+    let grid_x = area
+        .x
+        .saturating_add(config::VIEW_MARGIN.min(area.width))
+        .min(right);
+    let avail = right.saturating_sub(grid_x);
     {
         let p = app.pane_at_mut(idx);
         p.grid_rows = rows;
         p.cell_height = 1;
+        p.grid_x = grid_x;
+        p.column_widths.clear();
+        if avail == 0 {
+            p.grid_cols = 1;
+            p.cell_width = 0;
+            return;
+        }
+
+        ensure_compact_widths(p, rows, avail);
         // Compact flows down columns, so the scroll axis is columns.
         let cur_col = p.cursor / rows as usize;
         if p.last_reveal != (p.cursor, p.view) {
             p.last_reveal = (p.cursor, p.view);
-            scroll_columns(&mut p.offset, cur_col, &widths, avail);
+            scroll_columns(&mut p.offset, cur_col, &p.compact_widths, avail);
         }
-    }
-    let p_len = app.pane_at(idx).visible.len();
-    let offset = app.pane_at(idx).offset;
 
-    // Only whole columns are drawn, except the first: at any width something
-    // must be on screen, even if it is a name too long for the pane.
-    let mut shown: Vec<u16> = Vec::new();
-    let mut used = 0;
-    for w in widths.iter().skip(offset) {
-        if used + w > avail && !shown.is_empty() {
-            break;
+        // Only whole columns are drawn, except the first: at any width something
+        // must be on screen, even if it is a name too long for the pane.
+        let mut used = 0u16;
+        for &width in p.compact_widths.iter().skip(p.offset) {
+            if width > avail.saturating_sub(used) && !p.column_widths.is_empty() {
+                break;
+            }
+            let width = width.min(avail.saturating_sub(used));
+            p.column_widths.push(width);
+            used = used.saturating_add(width);
         }
-        shown.push(*w);
-        used += w;
-    }
-    {
-        let p = app.pane_at_mut(idx);
-        p.grid_cols = shown.len().max(1) as u16;
-        p.cell_width = shown.first().copied().unwrap_or(1);
-        p.column_widths = shown.clone();
-        p.grid_x = area.x + config::VIEW_MARGIN;
+        p.grid_cols = p.column_widths.len().max(1) as u16;
+        p.cell_width = p.column_widths.first().copied().unwrap_or(1);
     }
 
-    let mut x = area.x + config::VIEW_MARGIN;
-    for (c, cw) in shown.iter().enumerate() {
+    let active_tab = app.active_tab;
+    let cut_paths = app.register.cut_paths();
+    let cut = !cut_paths.is_empty();
+    let p = &app.tabs[active_tab].panes[idx];
+    let mut x = grid_x;
+    for (c, &column_width) in p.column_widths.iter().enumerate() {
         for r in 0..rows {
-            let vis = (offset + c) * rows as usize + r as usize;
-            if vis >= p_len {
+            let vis = (p.offset + c) * rows as usize + r as usize;
+            if vis >= p.visible.len() {
                 break;
             }
             let y = area.y + r;
             if y >= area.bottom() {
                 break;
             }
-            let e = {
-                let p = app.pane_at(idx);
-                p.entries[p.visible[vis]].clone()
-            };
-            let is_cut = cut && cut_set.contains(&e.path);
-            let st = entry_style(app.pane_at(idx), vis, is_cut, active);
-            let w = (*cw).min(area.right() - x);
+            let e = &p.entries[p.visible[vis]];
+            let is_cut = cut && cut_paths.contains(&e.path);
+            let selected = entry_selected(p, e);
+            let st = entry_style(e, selected, is_cut, active);
+            let w = column_width.min(right.saturating_sub(x));
             let cell = Rect::new(x, y, w, 1);
-            if entry_selected(app.pane_at(idx), vis) {
+            if selected {
                 let selection = if active {
                     config::THEME.selection
                 } else {
@@ -925,34 +927,29 @@ fn draw_compact_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, a
                 };
                 fill(frame.buffer_mut(), cell, selection.background);
             }
-            let text = compact_entry_text(&e);
+            let text = compact_entry_text(e);
             frame
                 .buffer_mut()
                 .set_string(x, y, clip(&text, w.saturating_sub(1) as usize), st);
-            if vis == app.pane_at(idx).cursor {
+            if vis == p.cursor {
                 let icon = icon_cell(x, y, e.glyph());
                 cursor_block(
                     frame.buffer_mut(),
                     icon,
                     cell,
                     active,
-                    entry_selected(app.pane_at(idx), vis).then_some(cell),
+                    selected.then_some(cell),
                 );
             }
-            let selected = entry_selected(app.pane_at(idx), vis);
-            if selected || (active && vis == app.pane_at(idx).cursor) {
+            if selected || (active && vis == p.cursor) {
                 state_marker(
                     frame.buffer_mut(),
                     cell,
-                    if active && vis == app.pane_at(idx).cursor {
-                        '>'
-                    } else {
-                        '*'
-                    },
+                    if active && vis == p.cursor { '>' } else { '*' },
                 );
             }
         }
-        x += cw;
+        x = x.saturating_add(column_width).min(right);
     }
 }
 
@@ -974,15 +971,16 @@ fn ensure_compact_widths(p: &mut crate::app::Pane, rows: u16, avail: u16) {
     if !p.compact_widths.is_empty()
         && p.compact_width_rows == rows
         && p.compact_width_avail == avail
+        && p.compact_width_generation == p.content_generation
     {
         return;
     }
     p.compact_width_rows = rows;
     p.compact_width_avail = avail;
-    p.compact_widths = p
-        .visible
-        .chunks(rows as usize)
-        .map(|col| {
+    p.compact_width_generation = p.content_generation;
+    p.compact_widths.clear();
+    p.compact_widths
+        .extend(p.visible.chunks(rows as usize).map(|col| {
             let max_item_width = col
                 .iter()
                 .map(|&i| {
@@ -993,8 +991,7 @@ fn ensure_compact_widths(p: &mut crate::app::Pane, rows: u16, avail: u16) {
                 .unwrap_or(1);
             // One trailing blank keeps neighbouring columns from touching.
             ((max_item_width + 1) as u16).min(avail.max(1))
-        })
-        .collect();
+        }));
 }
 
 /// Scroll the least that brings column `col` on screen. Ragged widths mean the
@@ -1128,8 +1125,6 @@ fn draw_details_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, a
     let rows = list.height.max(1);
     let cols = detail_columns(area, time_width(app.pane_at(idx)));
     let sort = app.pane_at(idx).sort;
-    let cut_set = app.register.cut_paths().to_vec();
-    let cut = !cut_set.is_empty();
 
     {
         let p = app.pane_at_mut(idx);
@@ -1149,7 +1144,6 @@ fn draw_details_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, a
         Rect::new(area.x, head, area.width, 1),
         config::THEME.toolbar.background,
     );
-    app.hits.headers.clear();
     let keys = [SortKey::Name, SortKey::Size, SortKey::Date, SortKey::Type];
     // A click anywhere up to the next column sorts by this one: the gaps belong
     // to the column on their left, so no cell of the header row is dead.
@@ -1173,29 +1167,29 @@ fn draw_details_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, a
         let end = col.x + col.width;
         app.hits
             .headers
-            .push((Rect::new(hx, head, end - hx, 1), key));
+            .push((Rect::new(hx, head, end - hx, 1), idx, key));
         hx = end;
     }
 
-    let p_len = app.pane_at(idx).visible.len();
-    let offset = app.pane_at(idx).offset;
+    let active_tab = app.active_tab;
+    let cut_paths = app.register.cut_paths();
+    let cut = !cut_paths.is_empty();
+    let p = &app.tabs[active_tab].panes[idx];
     for r in 0..rows as usize {
-        let vis = offset + r;
-        if vis >= p_len {
+        let vis = p.offset + r;
+        if vis >= p.visible.len() {
             break;
         }
         let y = list.y + r as u16;
         if y >= list.bottom() {
             break;
         }
-        let e = {
-            let p = app.pane_at(idx);
-            p.entries[p.visible[vis]].clone()
-        };
-        let is_cut = cut && cut_set.contains(&e.path);
-        let st = entry_style(app.pane_at(idx), vis, is_cut, active);
+        let e = &p.entries[p.visible[vis]];
+        let is_cut = cut && cut_paths.contains(&e.path);
+        let selected = entry_selected(p, e);
+        let st = entry_style(e, selected, is_cut, active);
         let row = Rect::new(area.x, y, area.width, 1);
-        if entry_selected(app.pane_at(idx), vis) {
+        if selected {
             let selection = if active {
                 config::THEME.selection
             } else {
@@ -1223,11 +1217,11 @@ fn draw_details_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, a
             e.name
         );
         cols[0].draw_text(frame.buffer_mut(), y, &name, st);
-        cols[1].draw_text(frame.buffer_mut(), y, &fs::format_entry_size(&e), st);
+        cols[1].draw_text(frame.buffer_mut(), y, &fs::format_entry_size(e), st);
         cols[2].draw_text(frame.buffer_mut(), y, &fs::format_time(e.mtime), st);
         cols[3].draw_text(frame.buffer_mut(), y, &e.type_name(), st);
 
-        if vis == app.pane_at(idx).cursor {
+        if vis == p.cursor {
             // The tree column pushes the icon right: indent, arrow, one blank.
             let ix = cols[0].x + indent + arrow.width().max(1) as u16 + 1;
             cursor_block(
@@ -1235,19 +1229,14 @@ fn draw_details_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, a
                 icon_cell(ix, y, e.glyph()),
                 row,
                 active,
-                entry_selected(app.pane_at(idx), vis).then_some(row),
+                selected.then_some(row),
             );
         }
-        let selected = entry_selected(app.pane_at(idx), vis);
-        if selected || (active && vis == app.pane_at(idx).cursor) {
+        if selected || (active && vis == p.cursor) {
             state_marker(
                 frame.buffer_mut(),
                 row,
-                if active && vis == app.pane_at(idx).cursor {
-                    '>'
-                } else {
-                    '*'
-                },
+                if active && vis == p.cursor { '>' } else { '*' },
             );
         }
     }
@@ -1512,20 +1501,18 @@ fn plural(n: usize) -> &'static str {
 fn overlays(frame: &mut Frame, app: &mut App, area: Rect) {
     if let Some(active_transfer) = &app.active_transfer {
         let r = centre_rect(area, config::PROGRESS_POPUP_W, config::PROGRESS_POPUP_H);
-        let fraction = active_transfer.progress.fraction();
-        let current_file = active_transfer
-            .progress
-            .current_file
-            .lock()
-            .map(|current_file_guard| current_file_guard.clone())
-            .unwrap_or_default();
+        let snapshot = active_transfer.progress.snapshot();
+        let (current_entry, mut progress) = transfer_progress_display(&snapshot);
+        if active_transfer.progress.is_cancelling() {
+            progress = format!("Cancelling… {progress}");
+        }
         let body = vec![
             Line::from(active_transfer.progress.label.clone()),
             Line::from(Span::styled(
-                current_file,
+                current_entry,
                 Style::default().fg(config::THEME.view.secondary),
             )),
-            Line::from(progress_bar(fraction, config::PROGRESS_BAR_WIDTH)),
+            Line::from(progress),
             Line::from(Span::styled(
                 "Esc cancel",
                 Style::default().fg(config::THEME.view.secondary),
@@ -1642,7 +1629,7 @@ fn overlays(frame: &mut Frame, app: &mut App, area: Rect) {
                 labelled_row("Modified", &fs::format_time(e.mtime)),
                 labelled_row("Permissions", &perms(e.mode)),
                 labelled_row(
-                    if e.backing_path.is_some() || e.trash_id.is_some() {
+                    if e.backing_path.is_some() || e.trash_id().is_some() {
                         "Original location"
                     } else {
                         "Location"
@@ -1653,7 +1640,7 @@ fn overlays(frame: &mut Frame, app: &mut App, area: Rect) {
                         .unwrap_or_default(),
                 ),
                 labelled_row(
-                    if e.backing_path.is_some() || e.trash_id.is_some() {
+                    if e.backing_path.is_some() || e.trash_id().is_some() {
                         "Original path"
                     } else {
                         "Full path"
@@ -1767,8 +1754,55 @@ fn help_lines() -> Vec<Line<'static>> {
     ]
 }
 
+fn transfer_progress_display(progress: &TransferProgress) -> (String, String) {
+    match progress {
+        TransferProgress::Discovering {
+            completed_entries,
+            current_entry,
+        } => (
+            current_entry.clone(),
+            format!("Working\u{2026} {completed_entries} entries complete"),
+        ),
+        TransferProgress::Items {
+            completed_items,
+            total_items,
+            current_entry,
+        } => {
+            let complete = completed_items >= total_items;
+            let fraction = if *total_items == 0 {
+                1.0
+            } else {
+                (*completed_items as f64 / *total_items as f64).clamp(0.0, 1.0)
+            };
+            let percentage = if complete {
+                100
+            } else {
+                ((fraction * 100.0).floor() as u8).min(99)
+            };
+            (
+                current_entry.clone(),
+                format!(
+                    "{} {:>3}%",
+                    progress_bar(fraction, config::PROGRESS_BAR_WIDTH),
+                    percentage
+                ),
+            )
+        }
+        TransferProgress::Cleanup {
+            retained_outputs,
+            cleanup_failures,
+            current_entry,
+        } => (
+            current_entry.clone(),
+            format!(
+                "Cleaning up… {retained_outputs} retained, {cleanup_failures} cleanup failures"
+            ),
+        ),
+    }
+}
+
 fn progress_bar(fraction: f64, width: usize) -> String {
-    let filled = (fraction * width as f64).round() as usize;
+    let filled = (fraction * width as f64).floor() as usize;
     format!(
         "{}{}",
         "\u{2588}".repeat(filled.min(width)),
@@ -2150,6 +2184,38 @@ fn centre_rect(area: Rect, w: u16, h: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_progress_is_explicitly_indeterminate() {
+        let (entry, display) = transfer_progress_display(&TransferProgress::Discovering {
+            completed_entries: 7,
+            current_entry: "folder".into(),
+        });
+
+        assert_eq!(entry, "folder");
+        assert_eq!(display, "Working\u{2026} 7 entries complete");
+        assert!(!display.contains('%'));
+        assert!(!display.contains('\u{2588}'));
+    }
+
+    #[test]
+    fn stable_item_progress_has_a_determinate_percentage() {
+        let (entry, display) = transfer_progress_display(&TransferProgress::Items {
+            completed_items: 1,
+            total_items: 4,
+            current_entry: "note.txt".into(),
+        });
+
+        assert_eq!(entry, "note.txt");
+        assert!(display.ends_with(" 25%"));
+        assert_eq!(
+            display
+                .chars()
+                .filter(|character| *character == '\u{2588}')
+                .count(),
+            config::PROGRESS_BAR_WIDTH / 4
+        );
+    }
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -2200,6 +2266,104 @@ mod tests {
         }
     }
 
+    fn render_test_entry(name: &str) -> fs::Entry {
+        fs::Entry {
+            name: name.into(),
+            path: PathBuf::from("/tmp").join(name),
+            backing_path: None,
+            link_target: None,
+            kind: fs::Kind::File,
+            size: 0,
+            mtime: 0,
+            mode: 0,
+            readable: true,
+            hidden: false,
+            trash_identity: None,
+            depth: 0,
+            expanded: false,
+        }
+    }
+
+    fn compact_app_with_entry() -> App {
+        let mut app = App::new(std::env::temp_dir());
+        let pane = app.pane_mut();
+        pane.view = ViewMode::Compact;
+        pane.entries = vec![render_test_entry("entry.txt")];
+        pane.visible = vec![0];
+        pane.loading = false;
+        app
+    }
+
+    #[test]
+    fn nonempty_compact_view_accepts_zero_width() {
+        let mut app = compact_app_with_entry();
+        let mut terminal = Terminal::new(TestBackend::new(2, 2)).unwrap();
+
+        terminal
+            .draw(|frame| draw_compact_view(frame, &mut app, Rect::new(1, 0, 0, 2), 0, true))
+            .unwrap();
+
+        assert_eq!(app.pane().grid_x, 1);
+        assert_eq!(app.pane().cell_width, 0);
+        assert!(app.pane().column_widths.is_empty());
+    }
+
+    #[test]
+    fn nonempty_compact_view_clamps_tiny_columns_to_the_pane() {
+        let mut app = compact_app_with_entry();
+        let area = Rect::new(1, 0, 2, 2);
+        let mut terminal = Terminal::new(TestBackend::new(area.right(), 2)).unwrap();
+
+        terminal
+            .draw(|frame| draw_compact_view(frame, &mut app, area, 0, true))
+            .unwrap();
+
+        let pane = app.pane();
+        assert_eq!(pane.grid_x, 2);
+        assert_eq!(pane.column_widths, vec![1]);
+        assert!(pane.grid_x + pane.column_widths.iter().copied().sum::<u16>() <= area.right());
+    }
+
+    #[test]
+    fn every_file_view_renders_trash_selection_and_cut_highlighting() {
+        for view in [ViewMode::Icons, ViewMode::Compact, ViewMode::Details] {
+            let mut app = App::new(std::env::temp_dir());
+            let mut selected = render_test_entry("selected.txt");
+            selected.set_trash_id("generation-1");
+            let cut = render_test_entry("cut.txt");
+            let selected_key = selected.selection_key().to_path_buf();
+            let cut_path = cut.path.clone();
+            {
+                let pane = app.pane_mut();
+                pane.view = view;
+                pane.entries = vec![selected, cut];
+                pane.visible = vec![0, 1];
+                pane.selected.insert(selected_key);
+                pane.loading = false;
+            }
+            app.register.set(vec![cut_path], true);
+
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let pane_area = app.pane().area;
+            let buffer = terminal.backend().buffer();
+            let cells = pane_area.rows().flat_map(|row| row.columns());
+            let styles: Vec<_> = cells.filter_map(|position| buffer.cell(position)).collect();
+
+            assert!(
+                styles.iter().any(|cell| {
+                    cell.bg == config::THEME.selection.background
+                        || cell.bg == config::THEME.inactive_selection.background
+                }),
+                "{view:?} did not render the Trash generation selection"
+            );
+            assert!(
+                styles.iter().any(|cell| cell.fg == config::THEME.entry.cut),
+                "{view:?} did not render the cut entry"
+            );
+        }
+    }
+
     #[test]
     fn compact_entries_include_their_tree_depth() {
         let entry = fs::Entry {
@@ -2213,7 +2377,7 @@ mod tests {
             mode: 0,
             readable: true,
             hidden: false,
-            trash_id: None,
+            trash_identity: None,
             depth: 2,
             expanded: false,
         };

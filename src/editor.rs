@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 pub const VERSION: u8 = 1;
 const MAX_LINE: usize = 64 * 1024;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
 pub enum Layout {
     Full,
     Sidebar,
@@ -22,7 +23,7 @@ pub enum Layout {
 #[serde(tag = "type")]
 pub enum Incoming {
     #[serde(rename = "set_layout")]
-    SetLayout { version: u8, layout: String },
+    SetLayout { version: u8, layout: Layout },
     #[serde(rename = "set_focus")]
     SetFocus { version: u8, focused: bool },
     #[serde(rename = "opened")]
@@ -41,20 +42,12 @@ pub enum Event {
 }
 
 #[derive(Serialize)]
-struct Outgoing<'a> {
-    version: u8,
-    #[serde(rename = "type")]
-    kind: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    token: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    root: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    id: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    path: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reason: Option<&'a str>,
+#[serde(tag = "type", rename_all = "lowercase")]
+enum Outgoing<'a> {
+    Hello { version: u8, token: &'a str },
+    Ready { version: u8, root: &'a str },
+    Open { version: u8, id: u64, path: &'a str },
+    Exiting { version: u8, reason: &'a str },
 }
 
 enum Command {
@@ -72,14 +65,10 @@ impl Handle {
         let path = path
             .to_str()
             .ok_or_else(|| "Editor integration cannot open a non-UTF-8 path".to_string())?;
-        self.send(Outgoing {
+        self.send(Outgoing::Open {
             version: VERSION,
-            kind: "open",
-            token: None,
-            root: None,
-            id: Some(id),
-            path: Some(path),
-            reason: None,
+            id,
+            path,
         })
     }
 
@@ -127,23 +116,13 @@ impl Connection {
     }
 
     fn send_startup(&self, token: &str, root: &str) -> Result<(), String> {
-        self.handle.send(Outgoing {
+        self.handle.send(Outgoing::Hello {
             version: VERSION,
-            kind: "hello",
-            token: Some(token),
-            root: None,
-            id: None,
-            path: None,
-            reason: None,
+            token,
         })?;
-        self.handle.send(Outgoing {
+        self.handle.send(Outgoing::Ready {
             version: VERSION,
-            kind: "ready",
-            token: None,
-            root: Some(root),
-            id: None,
-            path: None,
-            reason: None,
+            root,
         })
     }
 
@@ -156,19 +135,24 @@ impl Connection {
     }
 
     pub fn close(mut self, reason: &str) {
-        let _ = self.handle.send(Outgoing {
+        self.shutdown(reason);
+    }
+
+    fn shutdown(&mut self, reason: &str) {
+        let _ = self.handle.send(Outgoing::Exiting {
             version: VERSION,
-            kind: "exiting",
-            token: None,
-            root: None,
-            id: None,
-            path: None,
-            reason: Some(reason),
+            reason,
         });
         let _ = self.handle.tx.send(Command::Close);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.shutdown("error");
     }
 }
 
@@ -254,6 +238,9 @@ fn take_lines(buffer: &mut Vec<u8>) -> Result<Vec<Vec<u8>>, String> {
         }
         lines.push(line);
     }
+    if buffer.len() > MAX_LINE {
+        return Err("Editor protocol line is too large".into());
+    }
     Ok(lines)
 }
 
@@ -269,11 +256,6 @@ fn parse_message(line: &[u8]) -> Result<Incoming, String> {
     };
     if version != VERSION {
         return Err(format!("Unsupported editor protocol version: {version}"));
-    }
-    if let Incoming::SetLayout { layout, .. } = &message {
-        if layout != "full" && layout != "sidebar" {
-            return Err(format!("Unsupported editor layout: {layout}"));
-        }
     }
     Ok(message)
 }
@@ -316,8 +298,19 @@ mod tests {
     fn malformed_oversized_and_wrong_version_are_rejected() {
         assert!(parse_message(b"not json").is_err());
         assert!(parse_message(br#"{"version":2,"type":"shutdown"}"#).is_err());
+        assert!(parse_message(br#"{"version":1,"type":"set_layout","layout":"wide"}"#).is_err());
+        assert_eq!(
+            parse_message(br#"{"version":1,"type":"set_layout","layout":"sidebar"}"#),
+            Ok(Incoming::SetLayout {
+                version: VERSION,
+                layout: Layout::Sidebar,
+            })
+        );
         let mut oversized = vec![b'x'; MAX_LINE + 1];
         assert!(take_lines(&mut oversized).is_err());
+        let mut valid_then_oversized = b"{}\n".to_vec();
+        valid_then_oversized.extend(std::iter::repeat_n(b'x', MAX_LINE + 1));
+        assert!(take_lines(&mut valid_then_oversized).is_err());
     }
 
     #[test]
@@ -353,14 +346,9 @@ mod tests {
 
     #[test]
     fn authentication_message_contains_exact_token_and_version() {
-        let message = serde_json::to_value(Outgoing {
+        let message = serde_json::to_value(Outgoing::Hello {
             version: VERSION,
-            kind: "hello",
-            token: Some("secret"),
-            root: None,
-            id: None,
-            path: None,
-            reason: None,
+            token: "secret",
         })
         .unwrap();
         assert_eq!(message["version"], VERSION);

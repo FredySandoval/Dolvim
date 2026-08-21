@@ -25,8 +25,16 @@ pub struct PaneSnapshot {
     cursor_path: Option<ObservedPath>,
     selected_paths: Vec<ObservedPath>,
     expanded_paths: Vec<ObservedPath>,
+    expanded_generations: Vec<ExpandedGeneration>,
     entry_count: usize,
     loading: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ExpandedGeneration {
+    logical: ObservedPath,
+    backing: ObservedPath,
+    selection_key: ObservedPath,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -175,10 +183,13 @@ impl Observer {
         committed: usize,
         failed: usize,
         cancelled: bool,
+        indeterminate: bool,
+        retained: usize,
     ) -> io::Result<()> {
         self.emit(
             "operation_finished",
-            json!({"operation_id":id,"committed":committed,"failed":failed,"cancelled":cancelled}),
+            json!({"operation_id":id,"committed":committed,"failed":failed,"cancelled":cancelled,
+                "indeterminate":indeterminate,"retained_output":retained}),
         )
     }
 
@@ -229,15 +240,27 @@ impl Snapshot {
                 let mut expanded_paths = pane
                     .expanded
                     .iter()
-                    .map(|p| observed_path(root, p))
+                    .map(|key| observed_path(root, &key.path))
                     .collect::<Vec<_>>();
                 expanded_paths.sort_by_key(|p| serde_json::to_string(p).unwrap_or_default());
+                let mut expanded_generations = pane
+                    .expanded
+                    .iter()
+                    .map(|key| ExpandedGeneration {
+                        logical: observed_path(root, &key.path),
+                        backing: observed_path(root, &key.backing_path),
+                        selection_key: observed_path(root, &key.selection_key),
+                    })
+                    .collect::<Vec<_>>();
+                expanded_generations
+                    .sort_by_key(|identity| serde_json::to_string(identity).unwrap_or_default());
                 PaneSnapshot {
                     id: pane.id,
                     cwd: observed_path(root, pane.display_path()),
                     cursor_path: pane.current().map(|e| observed_path(root, &e.path)),
                     selected_paths,
                     expanded_paths,
+                    expanded_generations,
                     entry_count: pane.visible.len(),
                     loading: pane.loading,
                 }

@@ -3,7 +3,6 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -48,12 +47,16 @@ pub fn handle_key_event(app: &mut App, key_event: KeyEvent) {
     // The transfer popup is modal, as Dolphin's is. Letting keys through means
     // you can navigate away from a live copy, or start a second one on top of
     // `app.active_transfer` and orphan the first thread with no way to see or stop it.
-    if let Some(active_transfer) = &app.active_transfer {
-        if key_event.code == KeyCode::Esc {
-            active_transfer
-                .progress
-                .cancel_requested
-                .store(true, Ordering::Relaxed);
+    if app.active_transfer.is_some() {
+        if lookup_binding(app, key_event) == Some(Action::QuitAll) {
+            if let Some(active_transfer) = &app.active_transfer {
+                active_transfer.progress.cancel();
+            }
+            app.quit = true;
+        } else if key_event.code == KeyCode::Esc {
+            if let Some(active_transfer) = &app.active_transfer {
+                active_transfer.progress.cancel();
+            }
         }
         return;
     }
@@ -305,10 +308,10 @@ fn write_live_register(app: &mut App, cut: bool, verb: &str, empty_message: &str
 }
 
 /// The one path to the Trash. Every delete key ends here so that the undo
-/// entry, the message and the refresh cannot drift apart.
-fn move_to_trash(app: &mut App, paths: Vec<PathBuf>) -> Vec<ops::TrashRef> {
+/// entry, register, message and refresh cannot drift apart.
+fn trash_paths(app: &mut App, paths: Vec<PathBuf>, write_register: bool) {
     if paths.is_empty() {
-        return Vec::new();
+        return;
     }
     // In the Trash there is no further "away" to move something to, so `x`
     // means purge, as it does in Dolphin. It goes behind the Shift+Del
@@ -318,54 +321,122 @@ fn move_to_trash(app: &mut App, paths: Vec<PathBuf>) -> Vec<ops::TrashRef> {
         if !items.is_empty() {
             app.mode = Mode::Confirm(Confirm::PurgeFromTrash(items));
         }
-        return Vec::new();
+        return;
     }
 
     let outcome = ops::trash(&paths);
-    if outcome.committed.is_empty() {
-        let message = outcome
+    let trash_listing = (outcome.committed_len() > 0).then(ops::list_trash);
+    apply_trash_outcome(app, outcome, trash_listing, write_register);
+}
+
+fn move_to_trash(app: &mut App, paths: Vec<PathBuf>) {
+    trash_paths(app, paths, false);
+}
+
+/// Vim's `d` is both a removal and a write to the unnamed register. The
+/// register is derived from committed effects, never from requested operands.
+fn delete_to_register(app: &mut App, paths: Vec<PathBuf>) {
+    trash_paths(app, paths, true);
+}
+
+/// Reconcile all application state from authoritative backend effects. An
+/// injected Trash listing keeps this reducer deterministic in tests while the
+/// caller still obtains the real listing after an untracked commit.
+fn apply_trash_outcome(
+    app: &mut App,
+    outcome: ops::TrashOutcome,
+    trash_listing: Option<Result<Vec<crate::fs::Entry>, String>>,
+    write_register: bool,
+) {
+    if outcome.committed_len() == 0 {
+        let reasons = outcome
             .failed
-            .first()
-            .map(|failure| failure.message.clone())
-            .unwrap_or_else(|| "Nothing moved to Trash".into());
-        app.error(message);
-        return Vec::new();
+            .iter()
+            .map(|failure| failure.message.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if reasons.is_empty() {
+            app.error("Nothing moved to Trash");
+        } else {
+            app.error(format!(
+                "Nothing moved to Trash; {} failed ({reasons})",
+                outcome.failed.len()
+            ));
+        }
+        return;
     }
 
     let committed_paths: std::collections::HashSet<_> = outcome
         .committed
         .iter()
         .map(|item| item.original_path.clone())
+        .chain(
+            outcome
+                .committed_untracked
+                .iter()
+                .map(|commit| commit.path.clone()),
+        )
         .collect();
-    app.undo.push(ops::UndoOp::Trash {
-        items: outcome.committed.clone(),
-    });
+    if !outcome.committed.is_empty() {
+        app.undo.push(ops::UndoOp::Trash {
+            items: outcome.committed.clone(),
+        });
+    }
+    if write_register {
+        // Untracked commits were consumed but have no safe register identity;
+        // retain exactly the tracked generations and clear if there are none.
+        app.register.set_deleted(outcome.committed.clone());
+    }
     let pane_id = app.pane().id;
     app.remove_operation_paths(pane_id, &committed_paths, true);
-    app.refresh_in_place();
-    if outcome.is_complete() {
-        app.info(format!(
-            "Moved {} item(s) to Trash",
-            outcome.committed.len()
-        ));
-    } else {
-        app.error(format!(
-            "Moved {} item(s) to Trash; {} failed: {}",
-            outcome.committed.len(),
-            outcome.failed.len(),
-            outcome.failed[0].message
-        ));
+    if let Some(listing) = trash_listing {
+        app.reconcile_trash_panes(listing);
     }
-    app.leave_visual();
-    outcome.committed
-}
+    // Always relist after a commit, including one whose Trash identity could
+    // not be rediscovered. The source view must not retain vanished rows.
+    app.refresh_in_place();
 
-/// Vim's `d` is both a removal and a write to the unnamed register. The
-/// register is derived from committed effects, never from requested operands.
-fn delete_to_register(app: &mut App, paths: Vec<PathBuf>) {
-    let deleted = move_to_trash(app, paths);
-    if !deleted.is_empty() {
-        app.register.set_deleted(deleted);
+    let mut status = format!("Moved {} item(s) to Trash", outcome.committed_len());
+    if !outcome.committed_untracked.is_empty() {
+        use std::fmt::Write as _;
+        let reasons = outcome
+            .committed_untracked
+            .iter()
+            .map(|commit| commit.message.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(
+            status,
+            "; {} undoable; {} cannot be undone ({reasons})",
+            outcome.committed.len(),
+            outcome.committed_untracked.len()
+        )
+        .unwrap();
+    }
+    if !outcome.failed.is_empty() {
+        use std::fmt::Write as _;
+        let reasons = outcome
+            .failed
+            .iter()
+            .map(|failure| failure.message.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(status, "; {} failed ({reasons})", outcome.failed.len()).unwrap();
+    }
+    let failed_paths: Vec<PathBuf> = outcome
+        .failed
+        .iter()
+        .map(|failure| failure.path.clone())
+        .collect();
+    if outcome.is_complete() && outcome.committed_untracked.is_empty() {
+        app.info(status);
+    } else {
+        app.error(status);
+    }
+    let was_visual = app.mode.is_visual();
+    app.leave_visual();
+    if was_visual {
+        app.pane_mut().selected.extend(failed_paths);
     }
 }
 
@@ -1027,9 +1098,19 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
                     app.info(outcome.message);
                     app.refresh_in_place();
                 }
-                Err(e) => {
-                    app.error(format!("Undo failed: {e}"));
-                    app.undo.push(op);
+                Err(failure) => {
+                    app.error(format!("Undo failed: {failure}"));
+                    if let Some(remaining) = failure.remaining {
+                        let affected = ops::unresolved_rename_paths(&remaining);
+                        app.undo.push(remaining);
+                        if affected.is_empty() {
+                            app.refresh_in_place();
+                        } else {
+                            app.reconcile_indeterminate_transfer(&[], &affected);
+                        }
+                    } else {
+                        app.refresh_in_place();
+                    }
                 }
             },
         },
@@ -1471,7 +1552,14 @@ fn commit_text_input(app: &mut App) {
                 app.select_by_path(&to);
                 app.info(format!("Renamed to {input}"));
             }
-            Err(e) => app.error(e),
+            Err(failure) => {
+                app.error(failure.message);
+                if let Some(remaining) = failure.remaining {
+                    let affected = ops::unresolved_rename_paths(&remaining);
+                    app.undo.push(remaining);
+                    app.reconcile_indeterminate_transfer(&[], &affected);
+                }
+            }
         },
         Mode::BatchRename => {
             let rename_paths = app.pane().selected_paths();
@@ -1482,7 +1570,14 @@ fn commit_text_input(app: &mut App) {
                     app.refresh_in_place();
                     app.info(format!("Renamed {} item(s)", rename_paths.len()));
                 }
-                Err(e) => app.error(e),
+                Err(failure) => {
+                    app.error(failure.message);
+                    if let Some(remaining) = failure.remaining {
+                        let affected = ops::unresolved_rename_paths(&remaining);
+                        app.undo.push(remaining);
+                        app.reconcile_indeterminate_transfer(&[], &affected);
+                    }
+                }
             }
         }
         Mode::NewFolder(intent) => match ops::new_folder(&intent.directory, &input) {
@@ -1856,7 +1951,7 @@ fn button_menu(button_index: usize) -> Option<MenuKind> {
     MENU_BUTTONS
         .iter()
         .find(|(_, owning_action)| *owning_action == button_action)
-        .map(|(kind, _)| kind.clone())
+        .map(|(kind, _)| *kind)
 }
 
 /// The button a menu hangs from. `Mode::Menu` carries no index because the same
@@ -1985,7 +2080,7 @@ mod tests {
 
     fn finish_test_transfer(app: &mut App) {
         let progress = &app.active_transfer.as_ref().unwrap().progress;
-        while !progress.finished.load(std::sync::atomic::Ordering::Relaxed) {
+        while !progress.is_finished() {
             std::thread::yield_now();
         }
         crate::finish_transfer(app);
@@ -2455,7 +2550,7 @@ mod tests {
                 mode: 0,
                 readable: true,
                 hidden: false,
-                trash_id: None,
+                trash_identity: None,
                 depth: 0,
                 expanded: false,
             })
@@ -2639,7 +2734,7 @@ mod tests {
             let mut app = App::new(base.clone());
             app.pane_mut().view = view;
             app.pane_mut()
-                .set_entries(crate::fs::read_dir(&base, 0).unwrap());
+                .set_entries(crate::fs::read_dir(&base, 0).unwrap().entries);
 
             handle_key_event(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
             assert_eq!(app.pane().cwd, child, "Enter failed in {view:?}");
@@ -2934,7 +3029,7 @@ mod tests {
             let mut app = App::new(base.clone());
             app.pane_mut().view = ViewMode::Compact;
             app.pane_mut()
-                .set_entries(crate::fs::read_dir(&base, 0).unwrap());
+                .set_entries(crate::fs::read_dir(&base, 0).unwrap().entries);
 
             press_char(&mut app, key);
             assert!(match &app.mode {
@@ -2959,7 +3054,7 @@ mod tests {
                 std::thread::yield_now();
             }
             assert_eq!(app.pane().cwd, base);
-            assert!(app.pane().expanded.contains(&folder));
+            assert!(app.pane().is_path_expanded(&folder));
             assert_eq!(
                 app.pane().current().map(|entry| entry.path.clone()),
                 Some(created)
@@ -2979,7 +3074,7 @@ mod tests {
         std::fs::create_dir_all(base.join("folder-under-cursor")).unwrap();
         let mut app = App::new(base.clone());
         app.pane_mut()
-            .set_entries(crate::fs::read_dir(&base, 0).unwrap());
+            .set_entries(crate::fs::read_dir(&base, 0).unwrap().entries);
 
         press_char(&mut app, 'O');
         assert!(matches!(
@@ -3050,7 +3145,7 @@ mod tests {
         std::fs::create_dir_all(&folder).unwrap();
         let mut app = App::new(base.clone());
         app.pane_mut()
-            .set_entries(crate::fs::read_dir(&base, 0).unwrap());
+            .set_entries(crate::fs::read_dir(&base, 0).unwrap().entries);
         press_char(&mut app, 'o');
         let undo_len = app.undo.len();
         std::fs::remove_dir(&folder).unwrap();
@@ -3077,7 +3172,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let mut app = App::new(base.clone());
         app.pane_mut()
-            .set_entries(crate::fs::read_dir(&base, 0).unwrap());
+            .set_entries(crate::fs::read_dir(&base, 0).unwrap().entries);
         let link_index = app
             .pane()
             .visible
@@ -3108,7 +3203,7 @@ mod tests {
         {
             let mut app = App::new(base.clone());
             let entries = crate::fs::read_dir(&base, 0).unwrap();
-            app.pane_mut().set_entries(entries);
+            app.pane_mut().set_entries(entries.entries);
 
             press_char(&mut app, 'o');
             assert!(matches!(
@@ -3160,7 +3255,7 @@ mod tests {
 
         let mut app = App::new(destination_root.clone());
         app.pane_mut()
-            .set_entries(crate::fs::read_dir(&destination_root, 0).unwrap());
+            .set_entries(crate::fs::read_dir(&destination_root, 0).unwrap().entries);
         assert_eq!(
             app.pane().current().map(|entry| entry.path.clone()),
             Some(destination.clone())
@@ -3169,7 +3264,7 @@ mod tests {
         let mut source_tab = crate::app::Tab::new(source_dir.clone());
         source_tab
             .pane_mut()
-            .set_entries(crate::fs::read_dir(&source_dir, 0).unwrap());
+            .set_entries(crate::fs::read_dir(&source_dir, 0).unwrap().entries);
         app.tabs.push(source_tab);
         app.active_tab = 1;
 
@@ -3212,7 +3307,7 @@ mod tests {
         {
             let mut app = App::new(base.clone());
             let entries = crate::fs::read_dir(&base, 0).unwrap();
-            app.pane_mut().set_entries(entries);
+            app.pane_mut().set_entries(entries.entries);
 
             press_char(&mut app, 'v');
             press_char(&mut app, 'd');
@@ -3260,7 +3355,7 @@ mod tests {
             let mut app = App::new(base.clone());
             app.pane_mut().view = view;
             app.pane_mut()
-                .set_entries(crate::fs::read_dir(&base, 0).unwrap());
+                .set_entries(crate::fs::read_dir(&base, 0).unwrap().entries);
             let original_cursor = app
                 .pane()
                 .visible
@@ -3288,7 +3383,7 @@ mod tests {
             finish_test_listing(&mut app);
             if view == ViewMode::Compact {
                 assert_eq!(app.pane().cwd, base);
-                assert!(app.pane().expanded.contains(&destination));
+                assert!(app.pane().is_path_expanded(&destination));
             } else {
                 assert_eq!(app.pane().cwd, destination);
             }
@@ -3322,7 +3417,7 @@ mod tests {
         let mut app = App::new(base.clone());
         app.pane_mut().view = ViewMode::Compact;
         app.pane_mut()
-            .set_entries(crate::fs::read_dir(&base, 0).unwrap());
+            .set_entries(crate::fs::read_dir(&base, 0).unwrap().entries);
         let destination_cursor = app
             .pane()
             .visible
@@ -3341,11 +3436,69 @@ mod tests {
 
         assert_eq!(std::fs::read(&pasted).unwrap(), b"new payload");
         assert_eq!(app.pane().cwd, base);
-        assert!(app.pane().expanded.contains(&destination));
+        assert!(app.pane().is_path_expanded(&destination));
         assert_eq!(
             app.pane().current().map(|entry| entry.path.clone()),
             Some(pasted)
         );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn failed_undo_reducer_preserves_new_parents_and_keeps_typed_retry_journal() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("dolvim-undo-cleanup-{unique}"));
+        std::fs::create_dir_all(&base).unwrap();
+        let original = base.join("new/parents/item.txt");
+        let missing_moved_path = base.join("missing.txt");
+        let mut app = App::new(base.clone());
+        app.undo.push(ops::UndoOp::Move {
+            moved_pairs: vec![(original, missing_moved_path)],
+        });
+
+        press_char(&mut app, 'u');
+
+        assert!(app.status_is_error);
+        assert!(app.status.contains("Undo failed"));
+        assert!(base.join("new").exists());
+        assert!(matches!(
+            app.undo.last(),
+            Some(ops::UndoOp::RetryCleanup { .. })
+        ));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn vim_undo_retry_retains_and_then_completes_parent_cleanup_effect() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("dolvim-vim-cleanup-retry-{unique}"));
+        std::fs::create_dir_all(&base).unwrap();
+        let parent = base.join("created");
+        let effects = ops::test_create_missing_parents(&parent);
+        std::fs::write(parent.join("blocker"), b"blocker").unwrap();
+        let mut app = App::new(base.clone());
+        app.undo.push(ops::UndoOp::RetryCleanup {
+            parents: effects,
+            operation: None,
+        });
+
+        press_char(&mut app, 'u');
+        assert!(app.status_is_error);
+        assert!(matches!(
+            app.undo.last(),
+            Some(ops::UndoOp::RetryCleanup { .. })
+        ));
+        std::fs::remove_file(parent.join("blocker")).unwrap();
+        std::fs::remove_dir(&parent).unwrap();
+        press_char(&mut app, 'u');
+        assert!(!parent.exists());
+        assert!(app.undo.is_empty());
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -3379,10 +3532,8 @@ mod tests {
         finish_test_transfer(&mut app);
 
         assert!(!valid.exists());
-        assert_eq!(
-            std::fs::read(destination.join("valid.txt")).unwrap(),
-            b"payload"
-        );
+        let moved_target = destination.join("valid.txt");
+        assert_eq!(std::fs::read(&moved_target).unwrap(), b"payload");
         assert_eq!(
             app.register,
             ops::UnnamedRegister::Live {
@@ -3390,11 +3541,77 @@ mod tests {
                 cut: true,
             }
         );
-        assert!(
-            matches!(app.undo.last(), Some(ops::UndoOp::Move { moved_pairs }) if moved_pairs.len() == 1)
+        assert!(matches!(
+            app.undo.last(),
+            Some(ops::UndoOp::Move { moved_pairs })
+                if moved_pairs == &vec![(valid, moved_target)]
+        ));
+        assert!(app.status_is_error);
+        assert!(app.status.contains("failed"));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn mixed_trash_outcome_reconciles_every_committed_effect_and_failure() {
+        let mut app = test_app();
+        install_test_entries(&mut app, &["tracked", "untracked", "failed"]);
+        let tracked = PathBuf::from("/tmp/tracked");
+        let untracked = PathBuf::from("/tmp/untracked");
+        let failed = PathBuf::from("/tmp/failed");
+        app.pane_mut().selected =
+            std::collections::HashSet::from([tracked.clone(), untracked.clone(), failed.clone()]);
+        app.register.set(vec![PathBuf::from("stale")], false);
+
+        let mut trash_tab = crate::app::Tab::new(PathBuf::from("trash:/"));
+        trash_tab.pane_mut().target = Target::Trash;
+        app.tabs.push(trash_tab);
+        let mut refreshed_entry = app.tabs[0].pane().entries[0].clone();
+        refreshed_entry.name = "refreshed".into();
+        refreshed_entry.path = PathBuf::from("/trash/refreshed");
+        let tracked_ref = ops::TrashRef {
+            id: "tracked-id".into(),
+            original_path: tracked.clone(),
+            name: "tracked".into(),
+        };
+
+        apply_trash_outcome(
+            &mut app,
+            ops::TrashOutcome {
+                committed: vec![tracked_ref.clone()],
+                committed_untracked: vec![ops::UntrackedTrashCommit {
+                    path: untracked,
+                    message: "identity unavailable".into(),
+                }],
+                failed: vec![ops::ItemFailure {
+                    path: failed.clone(),
+                    message: "permission denied".into(),
+                }],
+            },
+            Some(Ok(vec![refreshed_entry])),
+            true,
+        );
+
+        assert_eq!(
+            app.pane().selected,
+            std::collections::HashSet::from([failed])
+        );
+        assert_eq!(
+            app.register,
+            ops::UnnamedRegister::Deleted {
+                items: vec![tracked_ref.clone()]
+            }
+        );
+        assert!(matches!(
+            app.undo.last(),
+            Some(ops::UndoOp::Trash { items }) if items == &vec![tracked_ref]
+        ));
+        assert_eq!(app.tabs[1].pane().entries[0].name, "refreshed");
+        assert!(app.pane().loading);
+        assert_eq!(
+            app.status,
+            "Moved 2 item(s) to Trash; 1 undoable; 1 cannot be undone (identity unavailable); 1 failed (permission denied)"
         );
         assert!(app.status_is_error);
-        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -3439,7 +3656,7 @@ mod tests {
         {
             let mut app = App::new(base.clone());
             app.pane_mut()
-                .set_entries(crate::fs::read_dir(&base, 0).unwrap());
+                .set_entries(crate::fs::read_dir(&base, 0).unwrap().entries);
             let original_cursor = app
                 .pane()
                 .visible
@@ -3497,7 +3714,7 @@ mod tests {
         {
             let mut app = App::new(base.clone());
             app.pane_mut()
-                .set_entries(crate::fs::read_dir(&base, 0).unwrap());
+                .set_entries(crate::fs::read_dir(&base, 0).unwrap().entries);
             press_char(&mut app, 'v');
             press_char(&mut app, 'd');
             press_char(&mut app, 'u');
@@ -3508,7 +3725,7 @@ mod tests {
 
             press_char(&mut app, 'p');
             let progress = &app.active_transfer.as_ref().unwrap().progress;
-            while !progress.finished.load(std::sync::atomic::Ordering::Relaxed) {
+            while !progress.is_finished() {
                 std::thread::yield_now();
             }
             assert_eq!(
@@ -3551,9 +3768,9 @@ mod tests {
 
         let mut app = App::new(root.clone());
         app.pane_mut().view = ViewMode::Icons;
-        app.pane_mut().expanded.insert(folder.clone());
+        app.pane_mut().expand_live_path(folder.clone());
         app.pane_mut()
-            .set_entries(crate::fs::read_dir(&root, 0).unwrap());
+            .set_entries(crate::fs::read_dir(&root, 0).unwrap().entries);
         let cursor = app
             .pane()
             .visible
@@ -3590,9 +3807,9 @@ mod tests {
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(&child, b"child").unwrap();
         let mut app = App::new(root.clone());
-        app.pane_mut().expanded.insert(folder.clone());
+        app.pane_mut().expand_live_path(folder.clone());
         app.pane_mut()
-            .set_entries(crate::fs::read_dir(&root, 0).unwrap());
+            .set_entries(crate::fs::read_dir(&root, 0).unwrap().entries);
         let cursor = app
             .pane()
             .visible

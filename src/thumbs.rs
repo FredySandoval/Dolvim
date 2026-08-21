@@ -4,11 +4,11 @@
 //! finished cell grid. See docs/DECISIONS.md for why this is ~60 lines instead
 //! of a rendering crate.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::thread::{self, JoinHandle};
 
 use crate::config;
 
@@ -28,6 +28,27 @@ struct ThumbKey {
     path: PathBuf,
     cell_width: u16,
     cell_height: u16,
+    generation: Option<FileGeneration>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct FileGeneration {
+    device: u64,
+    inode: u64,
+    size: u64,
+    mtime_seconds: i64,
+    mtime_nanoseconds: i64,
+}
+
+fn file_generation(path: &Path) -> Option<FileGeneration> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(FileGeneration {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.len(),
+        mtime_seconds: metadata.mtime(),
+        mtime_nanoseconds: metadata.mtime_nsec(),
+    })
 }
 
 enum State {
@@ -38,85 +59,110 @@ enum State {
 
 /// One decode asked of the worker thread.
 struct ThumbRequest {
-    path: PathBuf,
-    cell_width: u16,
-    cell_height: u16,
+    key: ThumbKey,
 }
 
 /// One finished decode coming back. `thumb` is `None` when the file could not
 /// be decoded.
 struct ThumbResult {
-    path: PathBuf,
-    cell_width: u16,
-    cell_height: u16,
+    key: ThumbKey,
     thumb: Option<Thumb>,
+}
+
+fn spawn_worker() -> (Sender<ThumbRequest>, Receiver<ThumbResult>, JoinHandle<()>) {
+    let (req_tx, req_rx) = channel::<ThumbRequest>();
+    let (res_tx, res_rx) = channel();
+    let worker = thread::spawn(move || {
+        for request in req_rx {
+            let thumb = decode(
+                &request.key.path,
+                request.key.cell_width,
+                request.key.cell_height,
+            );
+            let result = ThumbResult {
+                key: request.key,
+                thumb,
+            };
+            if res_tx.send(result).is_err() {
+                return;
+            }
+        }
+    });
+    (req_tx, res_rx, worker)
 }
 
 pub struct Thumbs {
     cache: HashMap<ThumbKey, State>,
-    /// Insertion order, for the LRU eviction that keeps memory bounded.
-    order: Vec<ThumbKey>,
+    /// Completion order, for FIFO eviction that keeps memory bounded.
+    order: VecDeque<ThumbKey>,
     tx: Sender<ThumbRequest>,
     rx: Receiver<ThumbResult>,
-    inflight_decodes: Arc<Mutex<usize>>,
+    inflight_decodes: usize,
+    worker: Option<JoinHandle<()>>,
+    worker_failed: bool,
 }
 
 impl Thumbs {
     pub fn new() -> Thumbs {
-        let (req_tx, req_rx) = channel::<ThumbRequest>();
-        let (res_tx, res_rx) = channel();
-        let inflight_decodes = Arc::new(Mutex::new(0usize));
-        let inflight_decodes_for_worker = Arc::clone(&inflight_decodes);
-        thread::spawn(move || {
-            for request in req_rx {
-                let thumb = decode(&request.path, request.cell_width, request.cell_height);
-                if let Ok(mut inflight_guard) = inflight_decodes_for_worker.lock() {
-                    *inflight_guard = inflight_guard.saturating_sub(1);
-                }
-                let result = ThumbResult {
-                    path: request.path,
-                    cell_width: request.cell_width,
-                    cell_height: request.cell_height,
-                    thumb,
-                };
-                if res_tx.send(result).is_err() {
-                    return;
-                }
-            }
-        });
+        let (req_tx, res_rx, worker) = spawn_worker();
         Thumbs {
             cache: HashMap::new(),
-            order: Vec::new(),
+            order: VecDeque::new(),
             tx: req_tx,
             rx: res_rx,
-            inflight_decodes,
+            inflight_decodes: 0,
+            worker: Some(worker),
+            worker_failed: false,
         }
     }
 
     /// Collect finished work. Called once per tick.
     pub fn pump_decoded_thumbs(&mut self) -> bool {
         let mut changed = false;
-        while let Ok(result) = self.rx.try_recv() {
-            changed = true;
-            let cache_key = ThumbKey {
-                path: result.path,
-                cell_width: result.cell_width,
-                cell_height: result.cell_height,
-            };
-            self.cache.insert(
-                cache_key.clone(),
-                match result.thumb {
-                    Some(thumb) => State::Ready(thumb),
-                    None => State::Failed,
-                },
-            );
-            self.order.push(cache_key);
+        loop {
+            match self.rx.try_recv() {
+                Ok(result) => {
+                    changed = true;
+                    self.inflight_decodes = self.inflight_decodes.saturating_sub(1);
+                    let cache_key = result.key;
+                    self.cache.insert(
+                        cache_key.clone(),
+                        match result.thumb {
+                            Some(thumb) => State::Ready(thumb),
+                            None => State::Failed,
+                        },
+                    );
+                    self.order.push_back(cache_key);
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    let pending_before = self.cache.len();
+                    self.cache
+                        .retain(|_, state| !matches!(state, State::Pending));
+                    changed |= self.cache.len() != pending_before;
+                    self.inflight_decodes = 0;
+                    self.worker_failed = true;
+                    if self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
+                        let _ = self.worker.take().expect("worker was present").join();
+                    }
+                    let (tx, rx, worker) = spawn_worker();
+                    self.tx = tx;
+                    self.rx = rx;
+                    self.worker = Some(worker);
+                    break;
+                }
+            }
         }
         while self.order.len() > config::THUMB_CACHE_CAP {
-            let evicted_key = self.order.remove(0);
-            self.cache.remove(&evicted_key);
+            if let Some(evicted_key) = self.order.pop_front() {
+                self.cache.remove(&evicted_key);
+            }
         }
         changed
+    }
+
+    pub fn take_worker_failure(&mut self) -> bool {
+        std::mem::take(&mut self.worker_failed)
     }
 
     /// Thumbnail for `path` at `w x h` cells, requesting one if absent.
@@ -135,25 +181,31 @@ impl Thumbs {
             path: path.to_path_buf(),
             cell_width,
             cell_height,
+            generation: file_generation(path),
         };
         if !self.cache.contains_key(&cache_key) {
+            self.cache.retain(|key, _| {
+                key.path != cache_key.path
+                    || key.cell_width != cell_width
+                    || key.cell_height != cell_height
+            });
+            self.order.retain(|key| {
+                key.path != cache_key.path
+                    || key.cell_width != cell_width
+                    || key.cell_height != cell_height
+            });
             // Bound the queue: a directory of 5000 images must not enqueue
             // 5000 decodes ahead of the ones actually on screen.
-            let mut claimed = false;
-            if let Ok(mut inflight_guard) = self.inflight_decodes.lock() {
-                claimed = *inflight_guard < config::THUMB_MAX_INFLIGHT;
-                if claimed {
-                    *inflight_guard += 1;
-                }
-            }
-            if claimed {
-                let _ = self.tx.send(ThumbRequest {
-                    path: cache_key.path.clone(),
-                    cell_width,
-                    cell_height,
-                });
-                self.cache.insert(cache_key.clone(), State::Pending);
-                self.order.push(cache_key);
+            if self.inflight_decodes < config::THUMB_MAX_INFLIGHT
+                && self
+                    .tx
+                    .send(ThumbRequest {
+                        key: cache_key.clone(),
+                    })
+                    .is_ok()
+            {
+                self.inflight_decodes += 1;
+                self.cache.insert(cache_key, State::Pending);
             }
             return None;
         }
@@ -232,6 +284,98 @@ fn pixel_or_white(img: &image::RgbImage, x: u32, y: u32) -> [u8; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successful_request_is_counted_once_and_not_added_to_completion_order() {
+        let mut thumbs = Thumbs::new();
+
+        assert!(thumbs
+            .get_or_request(Path::new("missing.png"), 4, 2)
+            .is_none());
+        assert_eq!(thumbs.inflight_decodes, 1);
+        assert!(matches!(thumbs.cache.values().next(), Some(State::Pending)));
+        assert!(thumbs.order.is_empty());
+    }
+
+    #[test]
+    fn failed_request_send_does_not_claim_an_inflight_slot_or_cache_entry() {
+        let mut thumbs = Thumbs::new();
+        let (disconnected_tx, disconnected_rx) = channel();
+        drop(disconnected_rx);
+        thumbs.tx = disconnected_tx;
+
+        assert!(thumbs
+            .get_or_request(Path::new("missing.png"), 4, 2)
+            .is_none());
+        assert_eq!(thumbs.inflight_decodes, 0);
+        assert!(thumbs.cache.is_empty());
+        assert!(thumbs.order.is_empty());
+    }
+
+    #[test]
+    fn disconnect_clears_pending_work_and_recovers_capacity() {
+        let mut thumbs = Thumbs::new();
+        thumbs.cache.insert(
+            ThumbKey {
+                path: "stranded.png".into(),
+                cell_width: 4,
+                cell_height: 2,
+                generation: None,
+            },
+            State::Pending,
+        );
+        thumbs.inflight_decodes = config::THUMB_MAX_INFLIGHT;
+        let (disconnected_tx, disconnected_rx) = channel();
+        drop(disconnected_tx);
+        thumbs.rx = disconnected_rx;
+
+        assert!(thumbs.pump_decoded_thumbs());
+        assert!(thumbs.cache.is_empty());
+        assert_eq!(thumbs.inflight_decodes, 0);
+        assert!(thumbs.take_worker_failure());
+        assert!(!thumbs.take_worker_failure());
+
+        assert!(thumbs
+            .get_or_request(Path::new("missing-after-restart.png"), 4, 2)
+            .is_none());
+        assert_eq!(thumbs.inflight_decodes, 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while thumbs.inflight_decodes != 0 {
+            thumbs.pump_decoded_thumbs();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "restarted worker stalled"
+            );
+            std::thread::yield_now();
+        }
+        assert!(matches!(thumbs.cache.values().next(), Some(State::Failed)));
+    }
+
+    #[test]
+    fn replacement_invalidates_ready_and_failed_cache_entries() {
+        let dir =
+            std::env::temp_dir().join(format!("dolvim-thumb-generation-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("same.png");
+        std::fs::write(&path, b"bad").unwrap();
+        let first = file_generation(&path);
+
+        let mut thumbs = Thumbs::new();
+        let stale_key = ThumbKey {
+            path: path.clone(),
+            cell_width: 4,
+            cell_height: 2,
+            generation: first,
+        };
+        thumbs.cache.insert(stale_key.clone(), State::Failed);
+        thumbs.order.push_back(stale_key);
+        std::fs::write(&path, b"different and longer").unwrap();
+
+        assert!(thumbs.get_or_request(&path, 4, 2).is_none());
+        assert_eq!(thumbs.cache.len(), 1);
+        assert!(thumbs.cache.keys().all(|key| key.generation != first));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn oversized_or_empty_images_are_rejected_before_decode() {
