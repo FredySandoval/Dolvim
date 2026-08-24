@@ -2083,17 +2083,25 @@ impl App {
                     },
                     true,
                 );
-            } else if self.editor.is_some() {
-                self.open_in_editor(entry.filesystem_path().to_path_buf());
             } else {
-                self.open_external(entry.filesystem_path());
+                self.open_file(entry.filesystem_path().to_path_buf());
             }
         } else if entry.is_dir() {
             self.open_dir(entry.path);
-        } else if self.editor.is_some() {
-            self.open_in_editor(entry.path);
         } else {
-            self.open_external(&entry.path);
+            self.open_file(entry.path);
+        }
+    }
+
+    fn open_file(&mut self, path: PathBuf) {
+        if self.editor.is_none() {
+            self.open_external(&path);
+            return;
+        }
+        match open::opens_in_editor(&path) {
+            Ok(true) => self.open_in_editor(path),
+            Ok(false) => self.open_external(&path),
+            Err(error) => self.error(error.to_string()),
         }
     }
 

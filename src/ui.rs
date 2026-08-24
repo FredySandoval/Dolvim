@@ -135,12 +135,13 @@ fn sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
             entry.glyph(),
             entry.name
         );
+        let tree_x = view_area.x.saturating_add(1);
+        let tree_width = view_area.width.saturating_sub(1);
         frame
             .buffer_mut()
-            .set_string(view_area.x, y, clip(&text, view_area.width as usize), style);
+            .set_string(tree_x, y, clip(&text, tree_width as usize), style);
         if visible_index == pane.cursor {
-            let icon_x = area
-                .x
+            let icon_x = tree_x
                 .saturating_add(entry.depth * 2)
                 .saturating_add(marker.width().max(1) as u16 + 1)
                 .min(view_area.right().saturating_sub(1));
@@ -150,6 +151,18 @@ fn sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                 row_area,
                 active,
                 selected.then_some(row_area),
+            );
+        }
+        let locally_selected = entry_selected(pane, entry);
+        if selected || locally_selected || (active && visible_index == pane.cursor) {
+            state_marker(
+                frame.buffer_mut(),
+                row_area,
+                if active && visible_index == pane.cursor {
+                    '>'
+                } else {
+                    '*'
+                },
             );
         }
     }
@@ -1771,7 +1784,7 @@ fn help_lines() -> Vec<Line<'static>> {
         section_heading("Tabs and commands"),
         key_row("J / K", "previous / next tab"),
         key_row("Ctrl+T Ctrl+W gt gT", "new, close, next, previous"),
-        key_row(":e :cd :sort :view", ":split :q :qa"),
+        key_row(":e :cd :sort :view", ":vsplit :q :qa"),
         key_row("/  n  N", "search      Ctrl+k then the menu button"),
         key_row("ma  'a", "mark this item / go back to it"),
     ]
@@ -2647,6 +2660,37 @@ mod tests {
             terminal.draw(|frame| draw(frame, &mut app)).unwrap();
             assert_eq!(app.pane().area, Rect::new(0, 0, width, height));
         }
+    }
+
+    #[test]
+    fn sidebar_reserves_a_column_for_focus_and_selection_markers() {
+        let handle = crate::editor::test_handle();
+        let root = std::env::temp_dir();
+        let mut app = App::new(root.clone());
+        app.enable_editor(root, handle);
+        app.set_editor_layout(EditorLayout::Sidebar);
+        app.pane_mut().entries = vec![render_test_entry("entry.txt")];
+        app.pane_mut().visible = vec![0];
+        app.pane_mut().loading = false;
+
+        let mut terminal = Terminal::new(TestBackend::new(24, 3)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(
+            terminal.backend().buffer().cell((0, 0)).unwrap().symbol(),
+            ">"
+        );
+        assert_eq!(
+            terminal.backend().buffer().cell((1, 0)).unwrap().symbol(),
+            " "
+        );
+
+        app.set_editor_terminal_focus(false);
+        app.editor.as_mut().unwrap().selected_path = Some(PathBuf::from("/tmp/entry.txt"));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(
+            terminal.backend().buffer().cell((0, 0)).unwrap().symbol(),
+            "*"
+        );
     }
 
     #[test]

@@ -1649,7 +1649,7 @@ fn run_ex_command(app: &mut App, line: &str) {
             "details" => app.set_view(ViewMode::Details),
             _ => app.error(format!("Unknown view: {arg}")),
         },
-        "split" => app.toggle_split(),
+        "vsplit" => app.toggle_split(),
         "tabnew" => {
             let new_tab_dir = if arg.is_empty() {
                 app.pane().cwd.clone()
@@ -2310,6 +2310,26 @@ mod tests {
         let mut app = test_app();
         run_ex_command(&mut app, "view details");
         assert_eq!(app.pane().view, ViewMode::Details);
+    }
+
+    #[test]
+    fn vsplit_opens_the_side_by_side_view() {
+        let mut app = test_app();
+        assert!(!app.split_on());
+
+        run_ex_command(&mut app, "vsplit");
+
+        assert!(app.split_on());
+    }
+
+    #[test]
+    fn split_is_not_misrepresented_as_a_horizontal_split() {
+        let mut app = test_app();
+
+        run_ex_command(&mut app, "split");
+
+        assert!(!app.split_on());
+        assert!(app.status_is_error);
     }
 
     #[test]

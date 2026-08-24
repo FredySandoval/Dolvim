@@ -123,15 +123,15 @@ impl fmt::Display for Error {
     }
 }
 
+/// Whether an editor integration should open `path` as an editor buffer.
+/// Non-editor content keeps using its desktop MIME association.
+pub fn opens_in_editor(path: &Path) -> Result<bool, Error> {
+    Ok(is_editor_mime(&file_mime(path)?))
+}
+
 /// Resolve the desktop association or the editor fallback for `path`.
 pub fn resolve(path: &Path) -> Result<Plan, Error> {
-    let mime = query_mime(&[
-        OsStr::new("query"),
-        OsStr::new("filetype"),
-        path.as_os_str(),
-    ])?
-    .ok_or_else(|| Error::MimeQuery("xdg-mime returned no MIME type".into()))?;
-    validate_mime(&mime)?;
+    let mime = file_mime(path)?;
     let default = query_mime(&[
         OsStr::new("query"),
         OsStr::new("default"),
@@ -155,6 +155,17 @@ pub fn resolve(path: &Path) -> Result<Plan, Error> {
 enum Route<'a> {
     System(&'a str),
     Editor,
+}
+
+fn file_mime(path: &Path) -> Result<String, Error> {
+    let mime = query_mime(&[
+        OsStr::new("query"),
+        OsStr::new("filetype"),
+        path.as_os_str(),
+    ])?
+    .ok_or_else(|| Error::MimeQuery("xdg-mime returned no MIME type".into()))?;
+    validate_mime(&mime)?;
+    Ok(mime)
 }
 
 fn route<'a>(mime: &str, default: Option<&'a str>) -> Result<Route<'a>, Error> {
