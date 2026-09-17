@@ -398,6 +398,7 @@ pub fn sort_entries(entries: &mut [Entry], sort: Sort) {
                 (sort.dirs_first && !entry.is_dir(), entry.type_name())
             });
         }
+        pin_project_entries(entries);
         return;
     }
 
@@ -423,6 +424,13 @@ pub fn sort_entries(entries: &mut [Entry], sort: Sort) {
         };
         reverse_if(order, sort.reverse)
     });
+    pin_project_entries(entries);
+}
+
+/// Keep repository automation immediately available regardless of the active
+/// sort. The stable sort preserves the chosen ordering for every other row.
+fn pin_project_entries(entries: &mut [Entry]) {
+    entries.sort_by_key(|entry| !(entry.is_dir() && entry.name == ".github"));
 }
 
 fn reverse_if(order: Ordering, reverse: bool) -> Ordering {
@@ -580,9 +588,13 @@ fn entry_from_dir_entry(
     }
     Ok(BuiltEntry {
         entry: Entry {
-            // Keep repository automation visible by default, as code editors
-            // commonly do. Other dotfiles retain the normal hidden behavior.
-            hidden: name.starts_with('.') && name != ".github",
+            // Keep repository automation and conventional environment files
+            // visible by default, as code editors commonly do. Other dotfiles
+            // retain the normal hidden behavior.
+            hidden: name.starts_with('.')
+                && name != ".github"
+                && name != ".env"
+                && !name.starts_with(".env."),
             name,
             path: entry_path,
             backing_path: backed.then_some(physical_path),
@@ -1239,7 +1251,7 @@ mod tests {
     }
 
     #[test]
-    fn github_directory_is_visible_while_other_dotfiles_remain_hidden() {
+    fn project_dotfiles_are_visible_while_other_dotfiles_remain_hidden() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1247,6 +1259,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dolvim-visible-github-{unique}"));
         fs::create_dir_all(dir.join(".github/workflows")).unwrap();
         fs::write(dir.join(".env"), b"secret").unwrap();
+        fs::write(dir.join(".env.local"), b"local secret").unwrap();
+        fs::write(dir.join(".environment"), b"still hidden").unwrap();
+        fs::write(dir.join(".other"), b"hidden").unwrap();
 
         let listing = read_dir(&dir, 0).unwrap();
         let hidden = |name| {
@@ -1258,7 +1273,10 @@ mod tests {
                 .hidden
         };
         assert!(!hidden(".github"));
-        assert!(hidden(".env"));
+        assert!(!hidden(".env"));
+        assert!(!hidden(".env.local"));
+        assert!(hidden(".environment"));
+        assert!(hidden(".other"));
 
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1286,6 +1304,44 @@ mod tests {
         assert_eq!(file("source.f#").glyph(), "");
         assert_eq!(file("photo.jpg").glyph(), "");
         assert_eq!(file("unknown.custom").glyph(), config::glyph::FILE);
+    }
+
+    #[test]
+    fn github_directory_is_pinned_above_every_sort_order() {
+        let make_entry = |name: &str, kind: Kind, size: u64, mtime: i64| Entry {
+            name: name.into(),
+            path: PathBuf::from(name),
+            backing_path: None,
+            link_target: None,
+            kind,
+            size,
+            mtime,
+            mode: 0,
+            readable: true,
+            hidden: false,
+            trash_identity: None,
+            depth: 0,
+            expanded: false,
+        };
+
+        for key in [SortKey::Name, SortKey::Size, SortKey::Date, SortKey::Type] {
+            for reverse in [false, true] {
+                let mut entries = vec![
+                    make_entry("src", Kind::Dir, 20, 30),
+                    make_entry("README.md", Kind::File, 30, 20),
+                    make_entry(".github", Kind::Dir, 10, 10),
+                ];
+                sort_entries(
+                    &mut entries,
+                    Sort {
+                        key,
+                        reverse,
+                        dirs_first: true,
+                    },
+                );
+                assert_eq!(entries[0].name, ".github", "{key:?}, reverse={reverse}");
+            }
+        }
     }
 
     #[test]
