@@ -371,6 +371,7 @@ pub const KEY_BINDINGS: &[Bind] = &[
     bind(NONE      , PageDown , VIEW_MODES, Action::PageDown        ),
     bind(NONE      , PageUp   , VIEW_MODES, Action::PageUp          ),
     bind(CTRL      , Char('a'), VIEW_MODES, Action::SelectAll       ),
+    bind(CTRL      , Char(' '), VIEW_MODES, Action::ToggleSelect    ),
     bind(CTRL_SHIFT, Char('A'), VIEW_MODES, Action::InvertSelect    ),
     bind(CTRL      , Char('c'), VIEW_MODES, Action::Copy            ),
     bind(CTRL      , Char('x'), VIEW_MODES, Action::Cut             ),

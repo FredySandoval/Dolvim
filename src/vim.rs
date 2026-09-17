@@ -685,8 +685,6 @@ pub enum Action {
     RowEnd,
     CenterCursor,
     /* selection */
-    /// Unbound for now: Space, the key that used to say this, is the leader.
-    #[allow(dead_code)]
     ToggleSelect,
     SelectAll,
     InvertSelect,
@@ -1000,10 +998,7 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
         }
 
         // selection
-        Action::ToggleSelect => {
-            app.toggle_select();
-            app.move_cursor(stride, false);
-        }
+        Action::ToggleSelect => app.toggle_select(),
         Action::SelectAll => app.select_all(),
         Action::InvertSelect => app.invert_selection(),
         Action::EnterVisual => enter_visual(app, Mode::Visual),
@@ -2069,6 +2064,8 @@ fn accept_crumb(app: &mut App, items: &[PathBuf]) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
     use crate::app::App;
 
@@ -2275,6 +2272,33 @@ mod tests {
         press_char(&mut app, '\'');
         press_char(&mut app, 'z');
         assert!(app.status_is_error);
+    }
+
+    #[test]
+    fn ctrl_space_toggles_individual_items_without_moving_the_cursor() {
+        let mut app = test_app();
+        install_test_entries(&mut app, &["a", "b"]);
+        let ctrl_space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL);
+
+        handle_key_event(&mut app, ctrl_space);
+        assert_eq!(app.pane().cursor, 0);
+        assert_eq!(
+            app.pane().selected,
+            HashSet::from([PathBuf::from("/tmp/a")])
+        );
+
+        app.pane_mut().cursor = 1;
+        handle_key_event(&mut app, ctrl_space);
+        assert_eq!(
+            app.pane().selected,
+            HashSet::from([PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")])
+        );
+
+        handle_key_event(&mut app, ctrl_space);
+        assert_eq!(
+            app.pane().selected,
+            HashSet::from([PathBuf::from("/tmp/a")])
+        );
     }
 
     #[test]

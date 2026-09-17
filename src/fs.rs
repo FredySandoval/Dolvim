@@ -580,7 +580,9 @@ fn entry_from_dir_entry(
     }
     Ok(BuiltEntry {
         entry: Entry {
-            hidden: name.starts_with('.'),
+            // Keep repository automation visible by default, as code editors
+            // commonly do. Other dotfiles retain the normal hidden behavior.
+            hidden: name.starts_with('.') && name != ".github",
             name,
             path: entry_path,
             backing_path: backed.then_some(physical_path),
@@ -1233,6 +1235,31 @@ mod tests {
 
         assert!(listing.entries.is_empty());
         assert!(listing.error.is_some());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn github_directory_is_visible_while_other_dotfiles_remain_hidden() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("dolvim-visible-github-{unique}"));
+        fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+        fs::write(dir.join(".env"), b"secret").unwrap();
+
+        let listing = read_dir(&dir, 0).unwrap();
+        let hidden = |name| {
+            listing
+                .entries
+                .iter()
+                .find(|entry| entry.name == name)
+                .unwrap()
+                .hidden
+        };
+        assert!(!hidden(".github"));
+        assert!(hidden(".env"));
+
         fs::remove_dir_all(dir).unwrap();
     }
 
