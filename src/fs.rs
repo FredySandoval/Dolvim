@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::cmp::{Ordering, Reverse};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -47,6 +48,38 @@ pub struct Entry {
     /// Depth in an expanded Details tree; 0 for a plain listing.
     pub depth: u16,
     pub expanded: bool,
+}
+
+/// Resolve the owning user and group through the system's local account
+/// databases. Numeric IDs remain an honest fallback for unknown/NSS accounts.
+pub fn owner_group_names(path: &Path) -> Option<(String, String)> {
+    static USERS: OnceLock<HashMap<u32, String>> = OnceLock::new();
+    static GROUPS: OnceLock<HashMap<u32, String>> = OnceLock::new();
+
+    let metadata = fs::metadata(path).ok()?;
+    let users = USERS.get_or_init(|| account_names("/etc/passwd", 2));
+    let groups = GROUPS.get_or_init(|| account_names("/etc/group", 2));
+    let uid = metadata.uid();
+    let gid = metadata.gid();
+    Some((
+        users.get(&uid).cloned().unwrap_or_else(|| uid.to_string()),
+        groups.get(&gid).cloned().unwrap_or_else(|| gid.to_string()),
+    ))
+}
+
+fn account_names(path: &str, id_field: usize) -> HashMap<u32, String> {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    contents
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(':');
+            let name = fields.next()?.to_string();
+            let id = fields.nth(id_field.saturating_sub(1))?.parse().ok()?;
+            Some((id, name))
+        })
+        .collect()
 }
 
 pub fn trash_selection_key(id: &std::ffi::OsStr) -> PathBuf {

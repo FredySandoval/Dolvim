@@ -5,10 +5,13 @@
 //! frame never repeatedly launches `bat`, `pdftotext`, or an archiver.
 
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -28,6 +31,11 @@ struct Cache {
 }
 
 static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+
+/// Preview helpers are conveniences, not trusted parsers. Keep both their
+/// lifetime and captured output bounded even when fed corrupt or hostile data.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 
 /// Return at most `max_lines` display lines. Unsupported and unreadable files
 /// return `None`, allowing the UI to retain its normal file icon.
@@ -203,13 +211,52 @@ fn command_with_suffix(
     path: &Path,
     suffix: &[&str],
 ) -> Option<Vec<u8>> {
-    let output = Command::new(program)
+    let mut child = Command::new(program)
         .args(arguments)
         .arg(path)
         .args(suffix)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    output.status.success().then_some(output.stdout)
+    let mut stdout = child.stdout.take()?;
+    // Drain beyond the retained limit so a verbose child cannot fill its pipe
+    // and deadlock while the parent waits for it to exit.
+    let reader = thread::spawn(move || {
+        let mut captured = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        loop {
+            let count = match stdout.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => count,
+                Err(_) => return None,
+            };
+            let remaining = MAX_OUTPUT_BYTES.saturating_sub(captured.len());
+            captured.extend_from_slice(&chunk[..count.min(remaining)]);
+        }
+        Some(captured)
+    });
+
+    let deadline = Instant::now() + COMMAND_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let captured = reader.join().ok().flatten()?;
+    status?.success().then_some(captured)
 }
 
 #[cfg(test)]
@@ -232,5 +279,16 @@ mod tests {
         assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(line.spans[1].style.fg, None);
         assert!(!line.spans[1].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn command_capture_is_hard_limited() {
+        let output = command(
+            "sh",
+            &["-c", "head -c 400000 /dev/zero"],
+            Path::new("ignored"),
+        )
+        .expect("test command succeeds");
+        assert_eq!(output.len(), MAX_OUTPUT_BYTES);
     }
 }

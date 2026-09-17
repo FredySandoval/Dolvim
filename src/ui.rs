@@ -1330,10 +1330,18 @@ fn info_panel(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
 
+    let (owner, group) = fs::owner_group_names(e.filesystem_path())
+        .unwrap_or_else(|| ("Unknown".to_string(), "Unknown".to_string()));
     let footer = [
         format!("Modified  {}", fs::format_time(e.mtime)),
-        format!("Owner:    {}", permission_words((e.mode >> 6) & 7)),
-        format!("Group:    {}", permission_words((e.mode >> 3) & 7)),
+        format!(
+            "Owner:    {} · {owner}",
+            permission_words((e.mode >> 6) & 7)
+        ),
+        format!(
+            "Group:    {} · {group}",
+            permission_words((e.mode >> 3) & 7)
+        ),
         format!("Everyone: {}", permission_words(e.mode & 7)),
     ];
     for (row, line) in footer.iter().enumerate() {

@@ -296,7 +296,11 @@ fn operand_paths(app: &App, count: usize) -> Vec<PathBuf> {
 /// transaction. An empty request is rejected so a failed yank cannot erase an
 /// existing register. A visual range is consumed only after the write commits.
 fn write_live_register(app: &mut App, cut: bool, verb: &str, empty_message: &str) {
-    let paths = ops::normalize_operands(app.pane().selected_paths());
+    // Preserve every explicitly selected row in the register and exported URI
+    // list. Descendant collapsing belongs to recursive filesystem operations,
+    // not to the clipboard: users may deliberately select both a directory
+    // and entries displayed beneath it.
+    let paths = app.pane().selected_paths();
     if paths.is_empty() {
         app.error(empty_message);
         return;
@@ -2612,6 +2616,42 @@ mod tests {
             app.register,
             ops::UnnamedRegister::Live {
                 paths: vec![PathBuf::from("/tmp/b")],
+                cut: false,
+            }
+        );
+    }
+
+    #[test]
+    fn yank_preserves_selected_descendants_in_the_clipboard_register() {
+        let mut app = test_app();
+        install_test_entries(
+            &mut app,
+            &[
+                ".github",
+                ".github/workflows",
+                ".github/workflows/release.yml",
+            ],
+        );
+        app.pane_mut().selected = [
+            PathBuf::from("/tmp/.github"),
+            PathBuf::from("/tmp/.github/workflows"),
+            PathBuf::from("/tmp/.github/workflows/release.yml"),
+        ]
+        .into_iter()
+        .collect();
+        app.mode = Mode::VisualLine;
+
+        press_char(&mut app, 'y');
+
+        assert_eq!(app.status, "Yanked 3 item(s)");
+        assert_eq!(
+            app.register,
+            ops::UnnamedRegister::Live {
+                paths: vec![
+                    PathBuf::from("/tmp/.github"),
+                    PathBuf::from("/tmp/.github/workflows"),
+                    PathBuf::from("/tmp/.github/workflows/release.yml"),
+                ],
                 cut: false,
             }
         );
