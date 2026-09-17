@@ -1548,6 +1548,7 @@ fn commit_text_input(app: &mut App) {
                     _ => from.clone(),
                 };
                 app.undo.push(op);
+                app.editor_renamed(&from, &to);
                 app.refresh_in_place();
                 app.select_by_path(&to);
                 app.info(format!("Renamed to {input}"));

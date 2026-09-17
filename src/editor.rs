@@ -1,11 +1,13 @@
 //! Persistent editor integration over a small newline-delimited JSON protocol.
 
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -44,10 +46,28 @@ pub enum Event {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum Outgoing<'a> {
-    Hello { version: u8, token: &'a str },
-    Ready { version: u8, root: &'a str },
-    Open { version: u8, id: u64, path: &'a str },
-    Exiting { version: u8, reason: &'a str },
+    Hello {
+        version: u8,
+        token: &'a str,
+    },
+    Ready {
+        version: u8,
+        root: &'a str,
+    },
+    Open {
+        version: u8,
+        id: u64,
+        path: &'a str,
+    },
+    Renamed {
+        version: u8,
+        from: &'a str,
+        to: &'a str,
+    },
+    Exiting {
+        version: u8,
+        reason: &'a str,
+    },
 }
 
 enum Command {
@@ -56,19 +76,59 @@ enum Command {
 }
 
 #[derive(Clone)]
+struct DiagnosticLog(Arc<Mutex<File>>);
+
+impl DiagnosticLog {
+    fn from_env() -> Result<Option<Self>, String> {
+        let Some(path) = std::env::var_os("DOLVIM_EDITOR_LOG") else {
+            return Ok(None);
+        };
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|error| {
+                format!(
+                    "cannot open editor diagnostic log {}: {error}",
+                    Path::new(&path).display()
+                )
+            })?;
+        Ok(Some(Self(Arc::new(Mutex::new(file)))))
+    }
+
+    fn write(&self, message: impl std::fmt::Display) {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        if let Ok(mut file) = self.0.lock() {
+            let _ = writeln!(file, "{millis} pid={} {message}", std::process::id());
+            let _ = file.flush();
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct Handle {
     tx: Sender<Command>,
+    log: Option<DiagnosticLog>,
 }
 
 impl Handle {
     pub fn open(&self, id: u64, path: &Path) -> Result<(), String> {
-        let path = path
-            .to_str()
-            .ok_or_else(|| "Editor integration cannot open a non-UTF-8 path".to_string())?;
+        let path = protocol_utf8_path(path)?;
         self.send(Outgoing::Open {
             version: VERSION,
             id,
             path,
+        })
+    }
+
+    pub fn renamed(&self, from: &Path, to: &Path) -> Result<(), String> {
+        self.send(Outgoing::Renamed {
+            version: VERSION,
+            from: protocol_utf8_path(from)?,
+            to: protocol_utf8_path(to)?,
         })
     }
 
@@ -78,9 +138,22 @@ impl Handle {
             return Err("Editor protocol line is too large".into());
         }
         line.push('\n');
-        self.tx
-            .send(Command::Line(line))
-            .map_err(|_| "Editor connection is closed".into())
+        let kind = match message {
+            Outgoing::Hello { .. } => "hello (token redacted)",
+            Outgoing::Ready { .. } => "ready",
+            Outgoing::Open { .. } => "open",
+            Outgoing::Renamed { .. } => "renamed",
+            Outgoing::Exiting { .. } => "exiting",
+        };
+        if let Some(log) = &self.log {
+            log.write(format_args!("send {kind}"));
+        }
+        self.tx.send(Command::Line(line)).map_err(|_| {
+            if let Some(log) = &self.log {
+                log.write("send failed: worker channel closed");
+            }
+            "Editor connection is closed".into()
+        })
     }
 }
 
@@ -98,16 +171,34 @@ impl Connection {
         let root = root
             .to_str()
             .ok_or_else(|| "Editor integration root is not valid UTF-8".to_string())?;
-        let stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))
-            .map_err(|error| format!("cannot connect to editor at {address}: {error}"))?;
+        let log = DiagnosticLog::from_env()?;
+        if let Some(log) = &log {
+            log.write(format_args!("connecting address={address} root={root}"));
+        }
+        let stream =
+            TcpStream::connect_timeout(&address, Duration::from_secs(2)).map_err(|error| {
+                if let Some(log) = &log {
+                    log.write(format_args!("connect failed: {error}"));
+                }
+                format!("cannot connect to editor at {address}: {error}")
+            })?;
         stream
             .set_read_timeout(Some(Duration::from_millis(40)))
             .map_err(|error| format!("cannot configure editor connection: {error}"))?;
         let (command_tx, command_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
-        let worker = std::thread::spawn(move || socket_worker(stream, command_rx, event_tx));
+        if let Some(log) = &log {
+            log.write("connected");
+        }
+        let worker_log = log.clone();
+        let worker = std::thread::spawn(move || {
+            socket_worker(stream, command_rx, event_tx, worker_log.as_ref())
+        });
         let connection = Self {
-            handle: Handle { tx: command_tx },
+            handle: Handle {
+                tx: command_tx,
+                log,
+            },
             rx: event_rx,
             worker: Some(worker),
         };
@@ -156,7 +247,12 @@ impl Drop for Connection {
     }
 }
 
-fn socket_worker(mut stream: TcpStream, commands: Receiver<Command>, events: Sender<Event>) {
+fn socket_worker(
+    mut stream: TcpStream,
+    commands: Receiver<Command>,
+    events: Sender<Event>,
+    log: Option<&DiagnosticLog>,
+) {
     let mut pending = Vec::new();
     let mut input = [0; 4096];
     loop {
@@ -164,6 +260,9 @@ fn socket_worker(mut stream: TcpStream, commands: Receiver<Command>, events: Sen
             match commands.try_recv() {
                 Ok(Command::Line(line)) => {
                     if let Err(error) = stream.write_all(line.as_bytes()) {
+                        if let Some(log) = log {
+                            log.write(format_args!("write failed: {error}"));
+                        }
                         let _ = events.send(Event::Error(format!(
                             "Editor connection write failed: {error}"
                         )));
@@ -171,15 +270,26 @@ fn socket_worker(mut stream: TcpStream, commands: Receiver<Command>, events: Sen
                     }
                 }
                 Ok(Command::Close) => {
+                    if let Some(log) = log {
+                        log.write("local close requested");
+                    }
                     let _ = stream.flush();
                     return;
                 }
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return,
+                Err(TryRecvError::Disconnected) => {
+                    if let Some(log) = log {
+                        log.write("command channel disconnected");
+                    }
+                    return;
+                }
             }
         }
         match stream.read(&mut input) {
             Ok(0) => {
+                if let Some(log) = log {
+                    log.write("peer closed connection (EOF)");
+                }
                 let _ = events.send(Event::Disconnected);
                 return;
             }
@@ -190,11 +300,17 @@ fn socket_worker(mut stream: TcpStream, commands: Receiver<Command>, events: Sen
                         for line in lines {
                             match parse_message(&line) {
                                 Ok(message) => {
+                                    if let Some(log) = log {
+                                        log.write(format_args!("receive {message:?}"));
+                                    }
                                     if events.send(Event::Message(message)).is_err() {
                                         return;
                                     }
                                 }
                                 Err(error) => {
+                                    if let Some(log) = log {
+                                        log.write(format_args!("protocol error: {error}"));
+                                    }
                                     let _ = events.send(Event::Error(error));
                                     return;
                                 }
@@ -213,6 +329,9 @@ fn socket_worker(mut stream: TcpStream, commands: Receiver<Command>, events: Sen
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) => {}
             Err(error) => {
+                if let Some(log) = log {
+                    log.write(format_args!("read failed: {error}"));
+                }
                 let _ = events.send(Event::Error(format!(
                     "Editor connection read failed: {error}"
                 )));
@@ -264,7 +383,12 @@ fn parse_message(line: &[u8]) -> Result<Incoming, String> {
 pub fn test_handle() -> Handle {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || while rx.recv().is_ok() {});
-    Handle { tx }
+    Handle { tx, log: None }
+}
+
+fn protocol_utf8_path(path: &Path) -> Result<&str, String> {
+    path.to_str()
+        .ok_or_else(|| "Editor integration cannot represent a non-UTF-8 path".to_string())
 }
 
 pub fn protocol_path(path: String) -> Result<PathBuf, String> {
@@ -354,5 +478,18 @@ mod tests {
         assert_eq!(message["version"], VERSION);
         assert_eq!(message["type"], "hello");
         assert_eq!(message["token"], "secret");
+    }
+
+    #[test]
+    fn rename_notification_contains_both_paths() {
+        let message = serde_json::to_value(Outgoing::Renamed {
+            version: VERSION,
+            from: "/root/old",
+            to: "/root/new",
+        })
+        .unwrap();
+        assert_eq!(message["type"], "renamed");
+        assert_eq!(message["from"], "/root/old");
+        assert_eq!(message["to"], "/root/new");
     }
 }

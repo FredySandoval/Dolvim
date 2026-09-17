@@ -211,23 +211,28 @@ impl Watcher {
                 .clone()
                 .unwrap_or_else(|| "watcher is unavailable".into()));
         };
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| "watcher state lock is poisoned".to_string())?;
         if self.watched.as_deref() == Some(path) {
             return Ok(());
         }
         if let Some(old) = self.watched.as_deref() {
+            // notify may wait for its callback while changing a subscription.
+            // Never hold the callback's state mutex across a backend call: a
+            // filesystem event arriving here would otherwise deadlock the UI.
             backend.unwatch(old).map_err(|error| error.to_string())?;
             self.watched = None;
-            state.commit_target(None);
+            self.state
+                .lock()
+                .map_err(|_| "watcher state lock is poisoned".to_string())?
+                .commit_target(None);
         }
         backend
             .watch(path, RecursiveMode::NonRecursive)
             .map_err(|error| error.to_string())?;
         self.watched = Some(path.to_path_buf());
-        state.commit_target(Some(path.to_path_buf()));
+        self.state
+            .lock()
+            .map_err(|_| "watcher state lock is poisoned".to_string())?
+            .commit_target(Some(path.to_path_buf()));
         Ok(())
     }
 
@@ -235,14 +240,15 @@ impl Watcher {
         let Some(backend) = self.notify_watcher.as_mut() else {
             return Ok(());
         };
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| "watcher state lock is poisoned".to_string())?;
         if let Some(old) = self.watched.as_deref() {
+            // See `watch`: the backend is allowed to synchronize with its
+            // callback, which needs the state mutex.
             backend.unwatch(old).map_err(|error| error.to_string())?;
             self.watched = None;
-            state.commit_target(None);
+            self.state
+                .lock()
+                .map_err(|_| "watcher state lock is poisoned".to_string())?
+                .commit_target(None);
         }
         Ok(())
     }

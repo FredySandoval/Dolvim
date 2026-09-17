@@ -291,7 +291,7 @@ fn toolbar(frame: &mut Frame, app: &mut App, area: Rect) {
             clip(&text, crumb_area.width as usize),
             base.bg(config::THEME.view.background),
         );
-        cursor = Some((crumb_area.x + 1 + app.input_cursor as u16, area.y));
+        cursor = input_cursor_position(crumb_area, 1, &app.input, app.input_cursor);
     } else {
         let paths = crumb_paths(app.pane().display_path());
         // Dolphin elides from the left when the trail does not fit.
@@ -1376,8 +1376,33 @@ fn filter_bar(frame: &mut Frame, app: &mut App, area: Rect) {
         .buffer_mut()
         .set_string(area.x, area.y, clip(&label, area.width as usize), st);
     if app.mode == Mode::Filter {
-        frame.set_cursor_position((area.x + 9 + app.input_cursor as u16, area.y));
+        if let Some(position) = input_cursor_position(area, 9, &app.input, app.input_cursor) {
+            frame.set_cursor_position(position);
+        }
     }
+}
+
+/// Keep text-entry cursors inside their rendering rectangle. Besides avoiding
+/// invalid terminal coordinates in narrow editor sidebars, measuring the input
+/// prefix by display width keeps the cursor aligned for wide Unicode names.
+fn input_cursor_position(
+    area: Rect,
+    prefix_width: usize,
+    input: &str,
+    char_cursor: usize,
+) -> Option<(u16, u16)> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    let input_width = input
+        .chars()
+        .take(char_cursor)
+        .map(|character| character.to_string().width())
+        .sum::<usize>();
+    let relative_x = prefix_width
+        .saturating_add(input_width)
+        .min(usize::from(area.width - 1));
+    Some((area.x.saturating_add(relative_x as u16), area.y))
 }
 
 fn status_bar(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -1398,7 +1423,9 @@ fn status_bar(frame: &mut Frame, app: &mut App, area: Rect) {
         frame
             .buffer_mut()
             .set_string(area.x, area.y, clip(&text, area.width as usize), st);
-        frame.set_cursor_position((area.x + 1 + app.input_cursor as u16, area.y));
+        if let Some(position) = input_cursor_position(area, 1, &app.input, app.input_cursor) {
+            frame.set_cursor_position(position);
+        }
         return;
     }
     if let Mode::Rename(_) | Mode::BatchRename | Mode::NewFolder(_) | Mode::NewFile(_) = app.mode {
@@ -1415,10 +1442,11 @@ fn status_bar(frame: &mut Frame, app: &mut App, area: Rect) {
             clip(&text, area.width as usize),
             st.fg(config::THEME.accent),
         );
-        frame.set_cursor_position((
-            area.x + 2 + label.width() as u16 + app.input_cursor as u16,
-            area.y,
-        ));
+        if let Some(position) =
+            input_cursor_position(area, 2 + label.width(), &app.input, app.input_cursor)
+        {
+            frame.set_cursor_position(position);
+        }
         return;
     }
 
@@ -2653,13 +2681,32 @@ mod tests {
         let handle = crate::editor::test_handle();
         let root = std::env::temp_dir();
         let mut app = App::new(root.clone());
-        app.enable_editor(root, handle);
+        app.enable_editor(root.clone(), handle);
         app.set_editor_layout(EditorLayout::Sidebar);
-        for (width, height) in [(1, 1), (4, 2), (18, 4)] {
-            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-            assert_eq!(app.pane().area, Rect::new(0, 0, width, height));
+        for mode in [
+            Mode::Normal,
+            Mode::NewFile(app.reveal_intent_for_pane(0, root.clone())),
+        ] {
+            app.mode = mode;
+            for (width, height) in [(1, 1), (4, 2), (18, 4)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+                let expected_height = if matches!(app.mode, Mode::NewFile(_)) {
+                    height.saturating_sub(1)
+                } else {
+                    height
+                };
+                assert_eq!(app.pane().area, Rect::new(0, 0, width, expected_height));
+            }
         }
+    }
+
+    #[test]
+    fn input_cursor_is_clamped_and_uses_display_width() {
+        let area = Rect::new(7, 3, 4, 1);
+        assert_eq!(input_cursor_position(area, 10, "", 0), Some((10, 3)));
+        assert_eq!(input_cursor_position(area, 0, "界x", 1), Some((9, 3)));
+        assert_eq!(input_cursor_position(Rect::new(0, 0, 0, 1), 0, "", 0), None);
     }
 
     #[test]

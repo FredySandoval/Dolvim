@@ -264,6 +264,12 @@ impl SortKey {
             SortKey::Type => "Type",
         }
     }
+
+    /// Direction used when switching to this key for the first time.
+    /// Dates are most useful newest-first; the other keys read naturally upward.
+    pub fn default_reverse(self) -> bool {
+        self == SortKey::Date
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -276,8 +282,8 @@ pub struct Sort {
 impl Default for Sort {
     fn default() -> Self {
         Sort {
-            key: SortKey::Name,
-            reverse: false,
+            key: SortKey::Date,
+            reverse: true,
             dirs_first: true,
         }
     }
@@ -959,6 +965,17 @@ mod tests {
         let mut names = vec!["file10", "file9", "File2", "a"];
         names.sort_by(|a, b| natural_cmp(a, b));
         assert_eq!(names, vec!["a", "File2", "file9", "file10"]);
+    }
+
+    #[test]
+    fn date_sort_defaults_to_newest_first() {
+        let sort = Sort::default();
+        assert_eq!(sort.key, SortKey::Date);
+        assert!(sort.reverse);
+        assert!(SortKey::Date.default_reverse());
+        assert!(!SortKey::Name.default_reverse());
+        assert!(!SortKey::Size.default_reverse());
+        assert!(!SortKey::Type.default_reverse());
     }
 
     #[test]

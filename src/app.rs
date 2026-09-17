@@ -1176,6 +1176,21 @@ impl App {
         }
     }
 
+    pub fn editor_renamed(&mut self, from: &Path, to: &Path) {
+        let result = self
+            .editor
+            .as_ref()
+            .map(|editor| editor.handle.renamed(from, to));
+        if let Some(Err(error)) = result {
+            self.error(error);
+        }
+        if let Some(editor) = &mut self.editor {
+            if editor.selected_path.as_deref() == Some(from) {
+                editor.selected_path = Some(to.to_path_buf());
+            }
+        }
+    }
+
     pub fn editor_opened(&mut self, id: u64, acknowledged_path: &Path) {
         let path = self.editor.as_mut().and_then(|editor| {
             if editor
@@ -2410,7 +2425,7 @@ impl App {
             pane.sort.reverse = !pane.sort.reverse;
         } else {
             pane.sort.key = key;
-            pane.sort.reverse = false;
+            pane.sort.reverse = key.default_reverse();
         }
         pane.refilter();
     }
@@ -2675,6 +2690,10 @@ mod tests {
 
     fn pane_with(names: &[&str]) -> Pane {
         let mut pane = Pane::new(PathBuf::from("/tmp"));
+        // Most cursor and range tests use synthetic entries with identical
+        // timestamps and reason about their alphabetical positions.
+        pane.sort.key = SortKey::Name;
+        pane.sort.reverse = false;
         pane.entries = entries_named(names);
         pane.refilter();
         pane
