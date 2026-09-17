@@ -197,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "dolvim"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "crossterm",
  "image",
