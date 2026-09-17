@@ -1287,58 +1287,79 @@ fn info_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     let Some(e) = app.pane().current().cloned() else {
         return;
     };
-    let preview = Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), 10);
-    if !(e.is_image() && try_draw_thumbnail(frame, &mut app.thumbs, preview, &e.path)) {
-        centred(
-            frame.buffer_mut(),
-            preview,
-            e.glyph(),
-            Style::default()
-                .bg(config::THEME.panel.background)
-                .fg(icon_color(&e, false)),
-        );
-    }
     let st = Style::default()
         .bg(config::THEME.panel.background)
         .fg(config::THEME.view.foreground);
     let dim = st.fg(config::THEME.view.secondary);
-    let mut y = preview.bottom() + 1;
-    let w = area.width.saturating_sub(2) as usize;
-    let draw_info_line = |frame: &mut Frame, s: String, style: Style, y: &mut u16| {
-        if *y < area.bottom() {
-            frame
-                .buffer_mut()
-                .set_string(area.x + 1, *y, clip(&s, w), style);
-            *y += 1;
+    let x = area.x + 1;
+    let width = area.width.saturating_sub(2);
+    let w = width as usize;
+
+    if area.height > 1 {
+        frame.buffer_mut().set_string(
+            x,
+            area.y + 1,
+            clip(&e.name, w),
+            st.add_modifier(Modifier::BOLD),
+        );
+    }
+
+    // Reserve the final four rows for useful metadata. Everything between the
+    // title and that footer belongs to the preview and grows with the panel.
+    let footer_y = area.bottom().saturating_sub(4).max(area.y + 2);
+    let preview = Rect::new(x, area.y + 2, width, footer_y.saturating_sub(area.y + 2));
+    let drew_image =
+        e.is_image() && try_draw_thumbnail(frame, &mut app.thumbs, preview, e.filesystem_path());
+    if !drew_image {
+        if let Some(lines) = crate::previews::file(e.filesystem_path(), preview.height as usize) {
+            for (row, line) in lines.iter().enumerate() {
+                frame.render_widget(
+                    Paragraph::new(line.clone()).style(st),
+                    Rect::new(preview.x, preview.y + row as u16, preview.width, 1),
+                );
+            }
+        } else {
+            centred(
+                frame.buffer_mut(),
+                preview,
+                e.glyph(),
+                Style::default()
+                    .bg(config::THEME.panel.background)
+                    .fg(icon_color(&e, false)),
+            );
         }
-    };
-    draw_info_line(
-        frame,
-        e.name.clone(),
-        st.add_modifier(Modifier::BOLD),
-        &mut y,
-    );
-    y += 1;
-    draw_info_line(frame, format!("Type      {}", e.type_name()), dim, &mut y);
-    draw_info_line(
-        frame,
-        format!("Size      {}", fs::format_entry_size(&e)),
-        dim,
-        &mut y,
-    );
-    draw_info_line(
-        frame,
+    }
+
+    let footer = [
         format!("Modified  {}", fs::format_time(e.mtime)),
-        dim,
-        &mut y,
-    );
-    draw_info_line(frame, format!("Perms     {}", perms(e.mode)), dim, &mut y);
-    draw_info_line(
-        frame,
-        format!("Path      {}", e.path.display()),
-        dim,
-        &mut y,
-    );
+        format!("Owner:    {}", permission_words((e.mode >> 6) & 7)),
+        format!("Group:    {}", permission_words((e.mode >> 3) & 7)),
+        format!("Everyone: {}", permission_words(e.mode & 7)),
+    ];
+    for (row, line) in footer.iter().enumerate() {
+        let y = footer_y + row as u16;
+        if y < area.bottom() {
+            frame.buffer_mut().set_string(x, y, clip(line, w), dim);
+        }
+    }
+}
+
+fn permission_words(bits: u32) -> String {
+    let mut access = Vec::with_capacity(3);
+    if bits & 4 != 0 {
+        access.push("Read");
+    }
+    if bits & 2 != 0 {
+        access.push("Write");
+    }
+    if bits & 1 != 0 {
+        access.push("Execute");
+    }
+    if access.is_empty() {
+        "No access".to_string()
+    } else {
+        access.join(" + ")
+    }
 }
 
 fn perms(mode: u32) -> String {

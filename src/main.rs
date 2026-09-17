@@ -14,6 +14,7 @@ mod observer;
 mod open;
 mod ops;
 mod places;
+mod previews;
 mod theme;
 mod thumbs;
 mod ui;
