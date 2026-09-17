@@ -3,9 +3,10 @@
 use std::borrow::Cow;
 use std::cmp::{Ordering, Reverse};
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::OnceLock;
 use std::thread;
@@ -419,7 +420,55 @@ pub fn read_dir_as(
     backed: bool,
 ) -> std::io::Result<DirectoryListing> {
     let read_dir = fs::read_dir(physical)?;
-    Ok(collect_entries(read_dir, logical, depth, backed))
+    let mut listing = collect_entries(read_dir, logical, depth, backed);
+    mark_gitignored_hidden(physical, &mut listing.entries);
+    Ok(listing)
+}
+
+/// Mark direct children ignored by this directory's `.gitignore` as hidden.
+/// `git check-ignore` gives us Git's actual pattern, negation, and escaping
+/// semantics rather than an inevitably incomplete second implementation.
+fn mark_gitignored_hidden(directory: &Path, entries: &mut [Entry]) {
+    if !directory.join(".gitignore").is_file() || entries.is_empty() {
+        return;
+    }
+    let Ok(mut child) = Command::new("git")
+        .args(["check-ignore", "--no-index", "-z", "--stdin"])
+        .current_dir(directory)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        return;
+    };
+    for entry in entries.iter() {
+        if stdin.write_all(b"./").is_err()
+            || stdin.write_all(entry.name.as_bytes()).is_err()
+            || stdin.write_all(b"\0").is_err()
+        {
+            return;
+        }
+    }
+    drop(stdin);
+    let Ok(output) = child.wait_with_output() else {
+        return;
+    };
+    if !output.status.success() && output.status.code() != Some(1) {
+        return;
+    }
+    for ignored in output.stdout.split(|byte| *byte == 0) {
+        let ignored = ignored.strip_prefix(b"./").unwrap_or(ignored);
+        if let Some(entry) = entries
+            .iter_mut()
+            .find(|entry| entry.name.as_bytes() == ignored)
+        {
+            entry.hidden = true;
+        }
+    }
 }
 
 fn collect_entries(
@@ -925,6 +974,7 @@ impl Lister {
                         }
                     }
                     if batch.len() == 2000 {
+                        mark_gitignored_hidden(&path, &mut batch);
                         let _ = tx.send(ListingMsg::Batch {
                             path: path.clone(),
                             seq,
@@ -936,6 +986,7 @@ impl Lister {
                 if pending.is_some() {
                     continue;
                 }
+                mark_gitignored_hidden(&path, &mut batch);
                 let _ = tx.send(ListingMsg::Batch {
                     path: path.clone(),
                     seq,
@@ -1049,6 +1100,46 @@ mod tests {
         for (h, expect) in want {
             assert_eq!(hour12(h), expect, "hour {h}");
         }
+    }
+
+    #[test]
+    fn current_gitignore_entries_are_treated_as_hidden() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("dolvim-gitignore-{unique}"));
+        fs::create_dir(&dir).unwrap();
+        fs::write(
+            dir.join(".gitignore"),
+            b"node_modules/\n*.log\n!important.log\n",
+        )
+        .unwrap();
+        fs::create_dir(dir.join("node_modules")).unwrap();
+        fs::write(dir.join("debug.log"), b"").unwrap();
+        fs::write(dir.join("important.log"), b"").unwrap();
+        fs::write(dir.join("visible.txt"), b"").unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .status()
+            .unwrap()
+            .success());
+
+        let listing = read_dir(&dir, 0).unwrap();
+        let hidden = |name| {
+            listing
+                .entries
+                .iter()
+                .find(|entry| entry.name == name)
+                .unwrap()
+                .hidden
+        };
+        assert!(hidden("node_modules"));
+        assert!(hidden("debug.log"));
+        assert!(!hidden("important.log"));
+        assert!(!hidden("visible.txt"));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
