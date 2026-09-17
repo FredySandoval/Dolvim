@@ -1,87 +1,4 @@
-# Dolphin + vim = Dolvim
-
-KDE Dolphin, recreated in the terminal, with vim bindings, written in rust btw.
-
-![dolvim](assets/Dolvim.png)
-
-A file manager that looks and behaves like Dolphin — Places panel, breadcrumb,
-tabs, Details view, thumbnails, drag and drop, trash — driven by vim keys or the
-mouse. Breeze colors, measured off a real Dolphin screenshot.
-
-## Requirements
-
-A Rust toolchain (2021 edition), a truecolor terminal, and a Nerd Font patched
-terminal font — the icons are glyphs from it. Without one they render as tofu;
-swap them for plain Unicode in `src/config.rs` and recompile. A glyph must
-exist in the font you use: one that does not falls back to another face, and a
-proportional fallback shifts every column after it.
-
-Seven crates, no framework, no `build.rs`. `cargo build` on a fresh system is the
-whole story. External file associations use `xdg-mime` and `xdg-open` from
-`xdg-utils`; text files without an association use `$VISUAL`, `$EDITOR`, or
-`vi`, in that order.
-
-## Build
-
-	make            # release build into target/release/dolvim
-	make debug      # unoptimised, for a backtrace worth reading
-
-## Install
-
-	make && sudo make install
-
-Installs to `/usr/local/bin/dolvim`. Build unprivileged and install privileged —
-`make install` deliberately does not build, because under `sudo` cargo runs as
-root, where rustup has no default toolchain.
-
-	sudo make install PREFIX=/usr    # somewhere else
-	make install DESTDIR=/tmp/stage  # stage it, no root needed
-	sudo make uninstall
-
-## Use
-
-	dolvim [DIR]
-
-With no argument it opens the current directory. Press `:help` inside for the key
-list.
-
-### Neovim integration
-
-The companion Lua module in the Neovim configuration makes `nvim DIR` start
-one persistent Dolvim process in the initial window.
-Opening a file turns that same process into a left sidebar and opens the file in
-the parent Neovim. `<leader>e` hides and restores the terminal from either
-normal or terminal mode without discarding selection, expanded folders, or
-history.
-
-The module starts the public integration mode directly:
-
-    dolvim --editor-connect 127.0.0.1:PORT --editor-token TOKEN [DIR]
-
-Both options are required and are intended for an editor-owned localhost
-listener, not interactive use. Protocol paths and the initial root must be
-absolute UTF-8 paths. Standalone invocation and external file opening are
-unchanged.
-
-V1 deliberately rejects background copy, move, restore, and drop transfers in
-integrated mode. This keeps editor shutdown and connection-loss cleanup honest:
-Dolvim can exit promptly without terminating a transfer halfway through a file.
-Standalone transfers remain available.
-
-To diagnose an unexpected integration shutdown, set `DOLVIM_EDITOR_LOG` to an
-append-only log path when the editor starts Dolvim, for example:
-
-    DOLVIM_EDITOR_LOG=/tmp/dolvim-editor.log nvim DIR
-
-The log records timestamps, process IDs, protocol events, transport errors, and
-whether the peer or Dolvim initiated closure. Authentication tokens are always
-redacted. Protocol paths are recorded, so treat the file as private and remove
-it after debugging.
-
-## Keybindings
-
-<details>
-<summary>Show keybindings</summary>
+# Bindings
 
 The current state of the keymap. `src/config.rs` is authoritative:
 `KEY_BINDINGS` contains every exact keybinding with its explicit modes, while
@@ -95,9 +12,14 @@ key still falls through to Dolphin's jump-to-name; text-entry modes insert it.
 
 **Leader is `<Space>`.**
 
+When Dolvim is hosted by the companion Neovim integration, Neovim normal-mode
+`<leader>e` hides or restores the same terminal buffer and process. It does not
+restart the explorer or reset its tree state. Dolvim's own Space leader and
+bindings below are unchanged.
+
 ---
 
-### Motion
+## Motion
 
 | Key                  | Does                                                      |
 |---                   |---                                                        |
@@ -129,7 +51,7 @@ key still falls through to Dolphin's jump-to-name; text-entry modes insert it.
 Directory navigation is view-independent: `H` goes to the parent and `L` opens
 the item under the cursor. Lowercase `h`/`l` remain cursor motions.
 
-### Marks
+## Marks
 
 | Key         | Does                                |
 |---          |---                                  |
@@ -140,7 +62,7 @@ The letter can be anything, including a letter the keymap binds: `md` marks, it
 does not delete. Marks remember a *target*, so the Trash and a saved search can
 be marked as readily as a folder. They last for the session.
 
-### Selection
+## Selection
 
 | Key            | Does                                                       |
 |---             |---                                                         |
@@ -150,7 +72,7 @@ be marked as readily as a folder. They last for the session.
 | `Ctrl+Shift+A` | invert the selection (needs the kitty keyboard protocol)   |
 | `Esc`          | clear the selection, cancel a pending count / chord / mark |
 
-### Files
+## Files
 
 | Key                       | Does                                                        |
 |---                        |---                                                          |
@@ -165,7 +87,7 @@ be marked as readily as a folder. They last for the session.
 | `u`                       | undo                                                        |
 | `Alt+Enter`               | properties                                                  |
 
-### View
+## View
 
 | Key                        | Does                                          |
 |---                         |---                                            |
@@ -183,7 +105,7 @@ be marked as readily as a folder. They last for the session.
 | `Tab`                      | swap panes                                    |
 | `Ctrl+h/j/k/l`              | request focus left/down/up/right               |
 
-### Tabs pane and toolbar row
+## Tabs pane and toolbar row
 
 `Ctrl+h/j/k/l` always requests directional focus from the current region;
 bare `h/j/k/l` remains local to that region. With more than one tab, repeated
@@ -205,7 +127,7 @@ at an outer edge. The Places panel steps up to the navigation buttons.
 Buttons, left to right: Back, Forward, View-mode menu · *breadcrumb* · Split,
 Search, Hamburger menu. The hamburger is where `m` used to go.
 
-### Tabs, search, commands
+## Tabs, search, commands
 
 | Key                      | Does                                              |
 |---                       |---                                                |
@@ -221,7 +143,7 @@ Search, Hamburger menu. The hamburger is where `m` used to go.
 
 ---
 
-### Deliberately unbound
+## Deliberately unbound
 
 Keys whose vim meaning the program cannot honour yet. Each is left free rather
 than given to something else, so that adding the real feature does not have to
@@ -239,23 +161,11 @@ take a key back.
 Drag-out and drop-in still work from the mouse. `Action::DragOut` and `DropIn`
 are still in the code, unbound and marked as such.
 
-### Still missing
+## Still missing
 
 Vim keys a user will reach for and not find: `Ctrl+r` (redo — `u` currently
-undoes with no way back), `.` (repeat), `{` / `}`, `w` / `b`, `''`.
+undoes with no way back), `.` (repeat), `{` / `}`, `w` / `b`, `zz`, `''`.
 
 `H`/`L` are Vimium's, not vim's — vim spells them "cursor to the top / bottom of
 the screen", which leaves `M` stranded with no siblings. `Ctrl+h` / `Ctrl+l` for
 focus are tmux's convention, not vim's `Ctrl+w h`.
-
-</details>
-
-## Configure
-
-Configuration is source code. Colors, glyphs, and keys are `const` tables in
-`src/config.rs` — edit, recompile, done. There is no dotfile and no config
-parser.
-
-## License
-
-MIT.
