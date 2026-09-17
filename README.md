@@ -10,16 +10,47 @@ mouse. Breeze colors, measured off a real Dolphin screenshot.
 
 ## Requirements
 
-A Rust toolchain (2021 edition), a truecolor terminal, and a Nerd Font patched
-terminal font — the icons are glyphs from it. Without one they render as tofu;
-swap them for plain Unicode in `src/config.rs` and recompile. A glyph must
-exist in the font you use: one that does not falls back to another face, and a
-proportional fallback shifts every column after it.
+### Build
 
-Seven crates, no framework, no `build.rs`. `cargo build` on a fresh system is the
-whole story. External file associations use `xdg-mime` and `xdg-open` from
-`xdg-utils`; text files without an association use `$VISUAL`, `$EDITOR`, or
-`vi`, in that order.
+- A Rust toolchain with Cargo (the crate uses Rust 2021)
+- `make`
+- A system linker (normally installed with the platform's C development tools)
+
+The Rust dependencies are fetched by Cargo; there is no `build.rs` and no
+additional library needs to be installed manually. Build through the Makefile
+as shown below.
+
+### Runtime
+
+- A truecolor terminal
+- A Nerd Font patched terminal font — the icons are glyphs from it. Without one
+  they render as tofu; alternatively, replace them with plain Unicode in
+  `src/config.rs` and recompile. Every glyph must exist in the selected font:
+  falling back to a proportional font shifts the columns after it.
+- `xdg-mime` and `xdg-open` from `xdg-utils`, for MIME detection and opening
+  files. Text files without an association use `$VISUAL`, `$EDITOR`, or `vi`,
+  in that order.
+- Standard Linux utilities `date` and `df`, used for local timestamps and disk
+  space.
+
+`bat` is optional rather than a compile requirement. Dolvim uses these optional
+helpers when their corresponding feature is needed:
+
+| Helper | Feature |
+|---|---|
+| `bat` | Syntax-highlighted text previews in the information panel |
+| `pdftotext`, `antiword`, `pandoc` | PDF, `.doc`, and `.docx` previews |
+| `unzip`, `7z`, `bsdtar` | Archive previews |
+| `git` | Treat entries ignored by a local `.gitignore` as hidden |
+| `lsblk`, `udisksctl` | List, mount, and unmount devices in Places |
+| `wl-copy`/`wl-paste`, `xclip`, or `xsel` | Clipboard interoperability with other applications |
+| `ripdrag` or `dragon-drop` (`dragon`) | Drag and drop across the terminal boundary |
+| `xdotool` | Position the drag helper under X11 |
+| `alacritty` | The default `Shift+F4` terminal; change `TERMINAL_COMMAND` in `src/config.rs` to use another terminal |
+
+Missing optional helpers only disable the associated integration. Image
+thumbnails for JPEG, PNG, GIF, BMP, and WebP are built in and need no external
+program.
 
 ## Build
 
