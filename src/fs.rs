@@ -588,11 +588,12 @@ fn entry_from_dir_entry(
     }
     Ok(BuiltEntry {
         entry: Entry {
-            // Keep repository automation and conventional environment files
-            // visible by default, as code editors commonly do. Other dotfiles
+            // Keep repository automation, ignore rules, and conventional environment
+            // files visible by default, as code editors commonly do. Other dotfiles
             // retain the normal hidden behavior.
             hidden: name.starts_with('.')
                 && name != ".github"
+                && name != ".gitignore"
                 && name != ".env"
                 && !name.starts_with(".env."),
             name,
@@ -1258,6 +1259,7 @@ mod tests {
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("dolvim-visible-github-{unique}"));
         fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+        fs::write(dir.join(".gitignore"), b"*.log\n").unwrap();
         fs::write(dir.join(".env"), b"secret").unwrap();
         fs::write(dir.join(".env.local"), b"local secret").unwrap();
         fs::write(dir.join(".environment"), b"still hidden").unwrap();
@@ -1273,6 +1275,7 @@ mod tests {
                 .hidden
         };
         assert!(!hidden(".github"));
+        assert!(!hidden(".gitignore"));
         assert!(!hidden(".env"));
         assert!(!hidden(".env.local"));
         assert!(hidden(".environment"));
