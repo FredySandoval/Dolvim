@@ -53,7 +53,6 @@ pub fn handle_mouse_event(app: &mut App, m: MouseEvent) {
         }
         MouseEventKind::Drag(MouseButton::Left) => handle_left_drag(app, x, y),
         MouseEventKind::Up(MouseButton::Left) => handle_left_release(app, x, y, shift, ctrl),
-        MouseEventKind::Moved => handle_pointer_move(app, x, y),
         _ => {}
     }
 }
@@ -65,34 +64,6 @@ fn menu_button_at(app: &App, x: u16, y: u16) -> Option<MenuKind> {
         Some(MenuKind::Hamburger)
     } else {
         None
-    }
-}
-
-/// The one thing the pointer does without a click: a toolbar button that drops
-/// a menu opens it on the way past, so the row behaves like a menu bar. It only
-/// ever opens — leaving does not close, or the menu would vanish from under a
-/// pointer on its way to the item it wants. Click or Esc dismisses, as before.
-///
-/// This is the single exception to "no hover state" in `docs/DECISIONS.md`.
-/// Nothing else tracks the pointer, and no redraw is added: the loop already
-/// draws every tick and this changes no state unless the pointer is over one
-/// of two buttons.
-fn handle_pointer_move(app: &mut App, x: u16, y: u16) {
-    // Never take a mode that is in the middle of something.
-    if !matches!(app.mode, Mode::Normal | Mode::Buttons(_) | Mode::Menu(_)) {
-        return;
-    }
-    // The caret, not the icon beside it: on a split button the icon is the
-    // action and only the caret drops the list, which is how clicking works too.
-    let menu_to_open = if rect_contains(app.hits.view_menu, x, y) {
-        MenuKind::ViewMode
-    } else if rect_contains(app.hits.menu, x, y) {
-        MenuKind::Hamburger
-    } else {
-        return;
-    };
-    if app.mode != Mode::Menu(menu_to_open) {
-        vim::open_menu(app, menu_to_open);
     }
 }
 
@@ -543,6 +514,29 @@ mod tests {
         assert!(!rect_contains(Rect::new(0, 0, 0, 0), 0, 0));
         assert!(rect_contains(Rect::new(2, 3, 4, 1), 5, 3));
         assert!(!rect_contains(Rect::new(2, 3, 4, 1), 6, 3));
+    }
+
+    #[test]
+    fn toolbar_menus_require_click_not_pointer_motion() {
+        let mut app = App::new(std::env::temp_dir());
+        app.hits.view_menu = Rect::new(2, 0, 1, 1);
+        app.hits.menu = Rect::new(5, 0, 1, 1);
+        for x in [2, 5] {
+            handle_mouse_event(
+                &mut app,
+                MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    column: x,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                },
+            );
+            assert_eq!(app.mode, Mode::Normal);
+        }
+        handle_left_press(&mut app, 2, 0, false, false);
+        assert_eq!(app.mode, Mode::Menu(MenuKind::ViewMode));
+        handle_left_press(&mut app, 5, 0, false, false);
+        assert_eq!(app.mode, Mode::Menu(MenuKind::Hamburger));
     }
 
     #[test]
