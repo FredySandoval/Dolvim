@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::{
-    App, Confirm, Direction, Focus, FocusRegion, MarkPending, MenuKind, Mode, RevealIntent,
-    ViewMode,
+    App, Confirm, Direction, Focus, FocusRegion, FoldKey, MarkPending, MenuKind, Mode,
+    RevealIntent, ViewMode,
 };
 use crate::config;
 use crate::fs::SortKey;
@@ -58,6 +58,13 @@ pub fn handle_key_event(app: &mut App, key_event: KeyEvent) {
                 active_transfer.progress.cancel();
             }
         }
+        return;
+    }
+
+    if app.mode == Mode::Normal && app.search_active && key_event.code == KeyCode::Esc {
+        clear_search_folds(app);
+        app.search_active = false;
+        app.search_last.clear();
         return;
     }
 
@@ -914,7 +921,13 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
         Action::Forward => app.forward(),
         Action::GoUp => app.go_up(),
         Action::GoHome => app.goto(Target::Dir(places::home()), true),
-        Action::Open => app.activate(),
+        Action::Open => {
+            if app.search_active {
+                clear_search_folds(app);
+                app.search_active = false;
+            }
+            app.activate();
+        }
         Action::OpenInNewTab => {
             if let Some(e) = app.pane().current().cloned() {
                 if e.is_dir() {
@@ -1191,7 +1204,11 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
 
         // modes
         Action::EnterCommand => enter_text(app, Mode::Command, String::new()),
-        Action::EnterSearch => enter_text(app, Mode::Search, String::new()),
+        Action::EnterSearch => {
+            clear_search_folds(app);
+            app.search_active = false;
+            enter_text(app, Mode::Search, String::new());
+        }
         Action::SearchNext => search_step(app, 1),
         Action::SearchPrev => search_step(app, -1),
         Action::EnterPathEdit => {
@@ -1389,6 +1406,11 @@ fn search_step(app: &mut App, search_direction: isize) {
 fn handle_text_key(app: &mut App, key_event: KeyEvent) {
     match lookup_binding(app, key_event) {
         Some(Action::Cancel) => {
+            if app.mode == Mode::Search {
+                clear_search_folds(app);
+                app.search_active = false;
+                app.search_last.clear();
+            }
             if app.mode == Mode::Filter {
                 app.pane_mut().filter.clear();
                 app.pane_mut().refilter();
@@ -1458,6 +1480,47 @@ fn byte_at(s: &str, char_idx: usize) -> usize {
         .unwrap_or(s.len())
 }
 
+fn clear_search_folds(app: &mut App) {
+    let folds = std::mem::take(&mut app.search_folds);
+    if !folds.is_empty() {
+        app.pane_mut().expanded.retain(|key| !folds.contains(key));
+        app.pane_mut().refilter();
+    }
+}
+
+fn search_matching_folders(
+    dir: &Path,
+    needle: &str,
+    depth: usize,
+    budget: &mut usize,
+    folders: &mut Vec<PathBuf>,
+) {
+    if depth >= 8 || *budget == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if *budget == 0 {
+            break;
+        }
+        *budget -= 1;
+        let path = entry.path();
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .to_lowercase()
+            .contains(needle)
+        {
+            folders.push(dir.to_path_buf());
+        }
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            search_matching_folders(&path, needle, depth + 1, budget, folders);
+        }
+    }
+}
+
 /// Search and filter act on every keystroke; the rest wait for Enter.
 fn live_update(app: &mut App) {
     match app.mode {
@@ -1466,9 +1529,51 @@ fn live_update(app: &mut App) {
             app.pane_mut().refilter();
         }
         Mode::Search => {
+            clear_search_folds(app);
             let needle = app.input.to_lowercase();
             if needle.is_empty() {
                 return;
+            }
+            // Discover matching descendants without expanding unrelated branches.
+            let roots: Vec<_> = (0..app.pane().len())
+                .filter_map(|i| app.pane().entry_at(i))
+                .filter(|e| e.is_dir())
+                .map(|e| e.path.clone())
+                .collect();
+            let mut budget = 2000;
+            let mut folders = Vec::new();
+            for root in roots {
+                search_matching_folders(&root, &needle, 0, &mut budget, &mut folders);
+            }
+            // Open ancestors first, so every matching folder has a visible row.
+            let mut ancestors = std::collections::HashSet::new();
+            for folder in folders {
+                let mut current = Some(folder.as_path());
+                while let Some(dir) = current {
+                    if dir == app.pane().cwd {
+                        break;
+                    }
+                    ancestors.insert(dir.to_path_buf());
+                    current = dir.parent();
+                }
+            }
+            let mut ancestors: Vec<_> = ancestors.into_iter().collect();
+            ancestors.sort_by_key(|path| path.components().count());
+            for folder in ancestors {
+                if let Some(i) = (0..app.pane().len()).find(|&i| {
+                    app.pane()
+                        .entry_at(i)
+                        .is_some_and(|e| e.path == folder && e.is_dir())
+                }) {
+                    let key = FoldKey::live(folder);
+                    if !app.pane().expanded.contains(&key) {
+                        app.pane_mut().cursor = i;
+                        app.open_fold(false);
+                        if app.pane().expanded.contains(&key) {
+                            app.search_folds.insert(key);
+                        }
+                    }
+                }
             }
             let n = app.pane().len();
             for i in 0..n {
@@ -1526,6 +1631,7 @@ fn commit_text_input(app: &mut App) {
         Mode::Command => run_ex_command(app, &input),
         Mode::Search => {
             app.search_last = input;
+            app.search_active = !app.search_last.is_empty();
         }
         Mode::Filter => {
             // Enter keeps the filter and leaves the bar showing, like Dolphin.
@@ -2097,6 +2203,44 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         panic!("listing did not finish");
+    }
+
+    #[test]
+    fn search_opens_all_matching_branches_and_cancel_restores_them() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base =
+            std::env::temp_dir().join(format!("dolvim-search-{}-{unique}", std::process::id()));
+        for (folder, file) in [("A", "test1.txt"), ("B", "test2.txt"), ("C", "test3.txt")] {
+            std::fs::create_dir_all(base.join(folder)).unwrap();
+            std::fs::write(base.join(folder).join(file), "").unwrap();
+        }
+        let mut app = App::new(base.clone());
+        app.pane_mut()
+            .set_entries(crate::fs::read_dir(&base, 0).unwrap().entries);
+        app.mode = Mode::Search;
+        app.input = "test".into();
+        live_update(&mut app);
+        assert_eq!(
+            (0..app.pane().len())
+                .filter(|&i| app
+                    .pane()
+                    .entry_at(i)
+                    .is_some_and(|e| e.name.starts_with("test")))
+                .count(),
+            3
+        );
+        commit_text_input(&mut app);
+        let first = app.pane().cursor;
+        search_step(&mut app, 1);
+        assert_ne!(app.pane().cursor, first);
+        assert!(app.search_active);
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.search_active);
+        assert_eq!(app.pane().len(), 3);
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

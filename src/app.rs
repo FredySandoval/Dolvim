@@ -303,7 +303,7 @@ impl FoldKey {
         }
     }
 
-    fn live(path: PathBuf) -> Self {
+    pub(crate) fn live(path: PathBuf) -> Self {
         Self {
             selection_key: path.clone(),
             backing_path: path.clone(),
@@ -1054,6 +1054,9 @@ pub struct App {
     /// Kept for the session only, as vim's lowercase marks are kept per file.
     pub marks: HashMap<char, Location>,
     pub search_last: String,
+    pub search_active: bool,
+    /// Folds opened by the current search, to restore on cancellation or navigation.
+    pub search_folds: HashSet<FoldKey>,
     pub drag: Option<Drag>,
     pub hits: Hitboxes,
     pub menu_cursor: usize,
@@ -1109,6 +1112,8 @@ impl App {
             pending_mark: None,
             marks: HashMap::new(),
             search_last: String::new(),
+            search_active: false,
+            search_folds: HashSet::new(),
             drag: None,
             hits: Hitboxes::default(),
             menu_cursor: 0,

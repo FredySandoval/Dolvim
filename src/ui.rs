@@ -792,6 +792,7 @@ fn draw_icons_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, act
     let cut_paths = app.register.cut_paths();
     let cut = !cut_paths.is_empty();
     let p = &app.tabs[active_tab].panes[idx];
+    let needle = search_needle(app).to_owned();
     let thumbs = &mut app.thumbs;
     let first = p.offset * cols as usize;
 
@@ -864,6 +865,7 @@ fn draw_icons_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, act
             }
             let x = body.x + body.width.saturating_sub(part.width() as u16) / 2;
             frame.buffer_mut().set_string(x, y, part, st);
+            highlight_matches(frame.buffer_mut(), x, y, part, body.right(), &needle);
         }
 
         if vis == p.cursor {
@@ -967,6 +969,15 @@ fn draw_compact_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, a
             frame
                 .buffer_mut()
                 .set_string(x, y, clip(&text, w.saturating_sub(1) as usize), st);
+            let name_x = x + (text.width().saturating_sub(e.name.width())) as u16;
+            highlight_matches(
+                frame.buffer_mut(),
+                name_x,
+                y,
+                &e.name,
+                x + w.saturating_sub(1),
+                search_needle(app),
+            );
             if vis == p.cursor {
                 let icon = icon_cell(x, y, e.glyph());
                 cursor_block(
@@ -1047,6 +1058,52 @@ fn scroll_columns(offset: &mut usize, col: usize, widths: &[u16], avail: u16) {
     }
     if start > *offset {
         *offset = start;
+    }
+}
+
+fn search_needle(app: &App) -> &str {
+    if app.mode == Mode::Search {
+        &app.input
+    } else if app.search_active {
+        &app.search_last
+    } else {
+        ""
+    }
+}
+
+/// Highlight every visible occurrence without replacing the row's existing selection styling.
+fn highlight_matches(buf: &mut Buffer, x: u16, y: u16, name: &str, right: u16, needle: &str) {
+    if needle.is_empty() {
+        return;
+    }
+    let chars: Vec<char> = name.chars().collect();
+    let width = needle.chars().count();
+    if width == 0 || width > chars.len() {
+        return;
+    }
+    for start in 0..=chars.len() - width {
+        if chars[start..start + width]
+            .iter()
+            .collect::<String>()
+            .to_lowercase()
+            != needle.to_lowercase()
+        {
+            continue;
+        }
+        let offset = chars[..start].iter().collect::<String>().width() as u16;
+        for column in 0..chars[start..start + width]
+            .iter()
+            .collect::<String>()
+            .width() as u16
+        {
+            let cell_x = x.saturating_add(offset).saturating_add(column);
+            if cell_x < right {
+                if let Some(cell) = buf.cell_mut((cell_x, y)) {
+                    cell.set_bg(config::THEME.selection.background);
+                    cell.set_fg(config::THEME.selection.foreground);
+                }
+            }
+        }
     }
 }
 
@@ -1253,6 +1310,14 @@ fn draw_details_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, a
             e.name
         );
         cols[0].draw_text(frame.buffer_mut(), y, &name, st);
+        highlight_matches(
+            frame.buffer_mut(),
+            cols[0].x + indent + arrow.width() as u16 + 2 + e.glyph().width() as u16,
+            y,
+            &e.name,
+            cols[0].x + cols[0].width,
+            search_needle(app),
+        );
         cols[1].draw_text(frame.buffer_mut(), y, &fs::format_entry_size(e), st);
         cols[2].draw_text(frame.buffer_mut(), y, &fs::format_time(e.mtime), st);
         cols[3].draw_text(frame.buffer_mut(), y, &e.type_name(), st);
@@ -1455,6 +1520,13 @@ fn status_bar(frame: &mut Frame, app: &mut App, area: Rect) {
         if let Some(position) = input_cursor_position(area, 1, &app.input, app.input_cursor) {
             frame.set_cursor_position(position);
         }
+        return;
+    }
+    if app.mode == Mode::Normal && app.search_active {
+        let text = format!("/{}", app.search_last);
+        frame
+            .buffer_mut()
+            .set_string(area.x, area.y, clip(&text, area.width as usize), st);
         return;
     }
     if let Mode::Rename(_) | Mode::BatchRename | Mode::NewFolder(_) | Mode::NewFile(_) = app.mode {
@@ -2357,6 +2429,25 @@ mod tests {
                 right - area.right()
             );
         }
+    }
+
+    #[test]
+    fn search_highlights_each_occurrence_without_touching_other_cells() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+        buf.set_string(0, 0, "test-test", Style::default());
+        highlight_matches(&mut buf, 0, 0, "test-test", 20, "TEST");
+        assert_eq!(
+            buf.cell((0, 0)).unwrap().bg,
+            config::THEME.selection.background
+        );
+        assert_eq!(
+            buf.cell((5, 0)).unwrap().bg,
+            config::THEME.selection.background
+        );
+        assert_ne!(
+            buf.cell((4, 0)).unwrap().bg,
+            config::THEME.selection.background
+        );
     }
 
     fn render_test_entry(name: &str) -> fs::Entry {
