@@ -922,11 +922,12 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
         Action::GoUp => app.go_up(),
         Action::GoHome => app.goto(Target::Dir(places::home()), true),
         Action::Open => {
+            // Keep a match in an expanded search branch selected until activation.
+            app.activate();
             if app.search_active {
                 clear_search_folds(app);
                 app.search_active = false;
             }
-            app.activate();
         }
         Action::OpenInNewTab => {
             if let Some(e) = app.pane().current().cloned() {
@@ -1630,22 +1631,10 @@ fn commit_text_input(app: &mut App) {
     match mode {
         Mode::Command => run_ex_command(app, &input),
         Mode::Search => {
+            // Incremental search already positioned the cursor. Leave the match
+            // selected (and its branches expanded) for a separate Open action.
             app.search_last = input;
             app.search_active = !app.search_last.is_empty();
-            if app.search_active
-                && app.pane().current().is_some_and(|entry| {
-                    entry
-                        .name
-                        .to_lowercase()
-                        .contains(&app.search_last.to_lowercase())
-                })
-            {
-                // The incremental search already positioned the cursor. Activate
-                // before collapsing its folds, or the cursor can land on another row.
-                app.activate();
-                app.search_active = false;
-                app.search_folds.clear();
-            }
         }
         Mode::Filter => {
             // Enter keeps the filter and leaves the bar showing, like Dolphin.
@@ -2258,7 +2247,7 @@ mod tests {
     }
 
     #[test]
-    fn search_enter_activates_highlighted_match_not_next_row() {
+    fn search_enter_selects_match_and_second_enter_opens_it() {
         let base = std::env::temp_dir().join(format!(
             "dolvim-search-enter-{}-{}",
             std::process::id(),
@@ -2276,7 +2265,12 @@ mod tests {
         app.input = "config".into();
         live_update(&mut app);
         assert_eq!(app.pane().current().unwrap().name, "config-folder");
-        commit_text_input(&mut app);
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.pane().cwd, base);
+        assert_eq!(app.pane().current().unwrap().name, "config-folder");
+        assert!(app.search_active);
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.pane().cwd, base.join("config-folder"));
         std::fs::remove_dir_all(base).unwrap();
     }
