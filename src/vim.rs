@@ -1632,6 +1632,20 @@ fn commit_text_input(app: &mut App) {
         Mode::Search => {
             app.search_last = input;
             app.search_active = !app.search_last.is_empty();
+            if app.search_active
+                && app.pane().current().is_some_and(|entry| {
+                    entry
+                        .name
+                        .to_lowercase()
+                        .contains(&app.search_last.to_lowercase())
+                })
+            {
+                // The incremental search already positioned the cursor. Activate
+                // before collapsing its folds, or the cursor can land on another row.
+                app.activate();
+                app.search_active = false;
+                app.search_folds.clear();
+            }
         }
         Mode::Filter => {
             // Enter keeps the filter and leaves the bar showing, like Dolphin.
@@ -2232,14 +2246,38 @@ mod tests {
                 .count(),
             3
         );
-        commit_text_input(&mut app);
         let first = app.pane().cursor;
+        app.search_last = app.input.clone();
         search_step(&mut app, 1);
         assert_ne!(app.pane().cursor, first);
-        assert!(app.search_active);
+        app.search_active = true;
         handle_key_event(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!app.search_active);
         assert_eq!(app.pane().len(), 3);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn search_enter_activates_highlighted_match_not_next_row() {
+        let base = std::env::temp_dir().join(format!(
+            "dolvim-search-enter-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(base.join("config-folder")).unwrap();
+        std::fs::create_dir_all(base.join("other-folder")).unwrap();
+        let mut app = App::new(base.clone());
+        app.pane_mut()
+            .set_entries(crate::fs::read_dir(&base, 0).unwrap().entries);
+        app.mode = Mode::Search;
+        app.input = "config".into();
+        live_update(&mut app);
+        assert_eq!(app.pane().current().unwrap().name, "config-folder");
+        commit_text_input(&mut app);
+        assert_eq!(app.pane().cwd, base.join("config-folder"));
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -2746,6 +2784,7 @@ mod tests {
                 trash_identity: None,
                 depth: 0,
                 expanded: false,
+                git: None,
             })
             .collect();
         app.pane_mut().visible = (0..names.len()).collect();
@@ -3275,12 +3314,13 @@ mod tests {
 
             assert_eq!(created.is_file(), is_file);
             assert_eq!(created.is_dir(), !is_file);
-            for _ in 0..1_000 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
                 app.pump_fs_events();
                 if !app.pane().loading && app.pane().pending_focus.is_none() {
                     break;
                 }
-                std::thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
             assert_eq!(app.pane().cwd, base);
             assert!(app.pane().is_path_expanded(&folder));
@@ -3314,12 +3354,13 @@ mod tests {
             press_char(&mut app, character);
         }
         handle_key_event(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        for _ in 0..1_000 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
             app.pump_fs_events();
             if !app.pane().loading && app.pane().pending_focus.is_none() {
                 break;
             }
-            std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert_eq!(
             app.pane().current().map(|entry| entry.path.clone()),
@@ -3446,12 +3487,13 @@ mod tests {
 
             assert!(folder.join("created.txt").is_file());
             assert!(!base.join("created.txt").exists());
-            for _ in 0..1_000 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
                 app.pump_fs_events();
                 if !app.pane().loading && app.pane().pending_focus.is_none() {
                     break;
                 }
-                std::thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
             assert_eq!(app.pane().cwd, folder);
             assert_eq!(

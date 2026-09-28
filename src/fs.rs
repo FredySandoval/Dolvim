@@ -48,6 +48,8 @@ pub struct Entry {
     /// Depth in an expanded Details tree; 0 for a plain listing.
     pub depth: u16,
     pub expanded: bool,
+    /// Git porcelain status for this row, if changed.
+    pub git: Option<char>,
 }
 
 /// Resolve the owning user and group through the system's local account
@@ -463,6 +465,9 @@ pub fn read_dir_as(
     let read_dir = fs::read_dir(physical)?;
     let mut listing = collect_entries(read_dir, logical, depth, backed);
     mark_gitignored_hidden(physical, &mut listing.entries);
+    if !backed {
+        mark_git_status(physical, &mut listing.entries);
+    }
     Ok(listing)
 }
 
@@ -508,6 +513,86 @@ fn mark_gitignored_hidden(directory: &Path, entries: &mut [Entry]) {
             .find(|entry| entry.name.as_bytes() == ignored)
         {
             entry.hidden = true;
+        }
+    }
+}
+
+/// Query Git once per listing, outside the render loop.
+fn mark_git_status(directory: &Path, entries: &mut [Entry]) {
+    if entries.is_empty() {
+        return;
+    }
+    // Porcelain v1 paths are always relative to the repository root, even
+    // when Git runs from an expanded subdirectory. Strip that prefix before
+    // matching them against this directory's direct children.
+    let Ok(prefix) = Command::new("git")
+        .args(["rev-parse", "--show-prefix"])
+        .current_dir(directory)
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return;
+    };
+    if !prefix.status.success() {
+        return;
+    }
+    let prefix = prefix.stdout.strip_suffix(b"\n").unwrap_or(&prefix.stdout);
+    let Ok(output) = Command::new("git")
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=normal",
+            "--ignored=no",
+            "--",
+            ".",
+        ])
+        .current_dir(directory)
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let mut records = output.stdout.split(|byte| *byte == 0);
+    while let Some(record) = records.next() {
+        if record.len() < 4 || record[2] != b' ' {
+            continue;
+        }
+        let code = &record[..2];
+        if code.contains(&b'R') || code.contains(&b'C') {
+            records.next(); // Porcelain v1 includes the original path.
+        }
+        let Some(path) = record[3..].strip_prefix(prefix) else {
+            continue;
+        };
+        let name = path.split(|byte| *byte == b'/').next().unwrap_or(path);
+        let status = if code == b"??" {
+            'U'
+        } else if code.contains(&b'U') || code == b"AA" || code == b"DD" {
+            'C'
+        } else if code.contains(&b'D') {
+            'D'
+        } else if code.contains(&b'R') {
+            'R'
+        } else if code.contains(&b'A') {
+            'A'
+        } else if code.contains(&b'M') || code.contains(&b'T') {
+            'M'
+        } else {
+            continue;
+        };
+        if let Some(entry) = entries
+            .iter_mut()
+            .find(|entry| entry.name.as_bytes() == name)
+        {
+            entry.git = Some(match (entry.git, status) {
+                (None, value) => value,
+                (Some(previous), value) if previous == value => value,
+                _ => 'M',
+            });
         }
     }
 }
@@ -612,6 +697,7 @@ fn entry_from_dir_entry(
             trash_identity: None,
             depth,
             expanded: false,
+            git: None,
         },
         warning,
     })
@@ -1023,6 +1109,7 @@ impl Lister {
                     }
                     if batch.len() == 2000 {
                         mark_gitignored_hidden(&path, &mut batch);
+                        mark_git_status(&path, &mut batch);
                         let _ = tx.send(ListingMsg::Batch {
                             path: path.clone(),
                             seq,
@@ -1035,6 +1122,7 @@ impl Lister {
                     continue;
                 }
                 mark_gitignored_hidden(&path, &mut batch);
+                mark_git_status(&path, &mut batch);
                 let _ = tx.send(ListingMsg::Batch {
                     path: path.clone(),
                     seq,
@@ -1058,6 +1146,106 @@ impl Lister {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_column_reports_modified_and_untracked_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "dolvim-status-{}-{}",
+            std::process::id(),
+            now_epoch()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let git = |args: &[&str]| {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .unwrap()
+                .success());
+        };
+        git(&["init", "-q"]);
+        fs::write(dir.join("tracked"), "before").unwrap();
+        git(&["add", "tracked"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "initial",
+        ]);
+        fs::write(dir.join("tracked"), "after").unwrap();
+        fs::write(dir.join("new file"), "new").unwrap();
+        let listing = read_dir(&dir, 0).unwrap();
+        let status = |name| listing.entries.iter().find(|e| e.name == name).unwrap().git;
+        assert_eq!(status("tracked"), Some('M'));
+        assert_eq!(status("new file"), Some('U'));
+        fs::create_dir(dir.join("nested")).unwrap();
+        fs::write(dir.join("nested/inside"), "before").unwrap();
+        git(&["add", "nested/inside"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "nested",
+        ]);
+        fs::write(dir.join("nested/inside"), "after").unwrap();
+        let nested = read_dir(&dir.join("nested"), 1).unwrap();
+        assert_eq!(
+            nested
+                .entries
+                .iter()
+                .find(|e| e.name == "inside")
+                .unwrap()
+                .git,
+            Some('M')
+        );
+        let (tx, rx) = channel();
+        let worker = Lister::new(tx);
+        worker.request(dir.clone(), 1);
+        let mut worker_entries = Vec::new();
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
+                ListingMsg::Batch { entries, .. } => worker_entries.extend(entries),
+                ListingMsg::Done { .. } => break,
+                ListingMsg::Listed(_) => panic!("unexpected listing failure"),
+            }
+        }
+        assert_eq!(
+            worker_entries
+                .iter()
+                .find(|e| e.name == "tracked")
+                .unwrap()
+                .git,
+            Some('M')
+        );
+        assert_eq!(
+            worker_entries
+                .iter()
+                .find(|e| e.name == "new file")
+                .unwrap()
+                .git,
+            Some('U')
+        );
+        worker.request(dir.join("nested"), 2);
+        let nested_batch = match rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
+            ListingMsg::Batch { entries, .. } => entries,
+            _ => panic!("missing nested batch"),
+        };
+        assert_eq!(
+            nested_batch
+                .iter()
+                .find(|e| e.name == "inside")
+                .unwrap()
+                .git,
+            Some('M')
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn natural_sort_orders_digit_runs_numerically() {
@@ -1108,6 +1296,7 @@ mod tests {
             trash_identity: None,
             depth: 0,
             expanded: false,
+            git: None,
         };
         assert_eq!(entry.ext().as_deref(), Some("�x"));
         assert_eq!(entry.type_name(), "�X file");
@@ -1300,6 +1489,7 @@ mod tests {
             trash_identity: None,
             depth: 0,
             expanded: false,
+            git: None,
         };
 
         assert_eq!(file("main.rs").glyph(), "");
@@ -1325,6 +1515,7 @@ mod tests {
             trash_identity: None,
             depth: 0,
             expanded: false,
+            git: None,
         };
 
         for key in [SortKey::Name, SortKey::Size, SortKey::Date, SortKey::Type] {
@@ -1363,6 +1554,7 @@ mod tests {
             trash_identity: None,
             depth: 0,
             expanded: false,
+            git: None,
         };
         let mut entries = vec![make_entry("z", Kind::Dir), make_entry("a", Kind::File)];
         sort_entries(&mut entries, Sort::default());

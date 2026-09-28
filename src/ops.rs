@@ -955,6 +955,7 @@ pub fn list_trash() -> Result<Vec<Entry>, String> {
                 trash_identity: Some(TrashIdentity::new(trash_item.id)),
                 depth: 0,
                 expanded: false,
+                git: None,
             }
         })
         .collect())

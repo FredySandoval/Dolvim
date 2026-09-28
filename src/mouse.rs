@@ -568,6 +568,7 @@ mod tests {
             trash_identity: None,
             depth,
             expanded: false,
+            git: None,
         };
         let mut app = App::new(std::env::temp_dir());
         let pane = app.pane_mut();
@@ -642,6 +643,7 @@ mod tests {
                 trash_identity: None,
                 depth: 0,
                 expanded: false,
+                git: None,
             }];
             pane.visible = vec![0];
         }

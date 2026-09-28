@@ -136,10 +136,25 @@ fn sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
             entry.name
         );
         let tree_x = view_area.x.saturating_add(1);
-        let tree_width = view_area.width.saturating_sub(1);
+        // The Neovim companion embeds this view as a terminal. Render Git
+        // decorations here, rather than trying to overlay terminal cells from
+        // Lua. Reserve the rightmost two cells so long names cannot overwrite
+        // the status letter.
+        let git_width = if view_area.width >= 4 { 2 } else { 0 };
+        let tree_width = view_area.width.saturating_sub(1 + git_width);
         frame
             .buffer_mut()
             .set_string(tree_x, y, clip(&text, tree_width as usize), style);
+        if let Some(git) = entry.git.filter(|_| git_width > 0) {
+            frame.buffer_mut().set_string(
+                view_area.right() - 1,
+                y,
+                git.to_string(),
+                Style::default()
+                    .fg(config::THEME.view.secondary)
+                    .bg(style.bg.unwrap_or_default()),
+            );
+        }
         if visible_index == pane.cursor {
             let icon_x = tree_x
                 .saturating_add(entry.depth * 2)
@@ -1159,27 +1174,27 @@ fn time_width(p: &crate::app::Pane) -> u16 {
 ///
 /// `modified_width` is passed rather than taken from config because the width a
 /// timestamp needs depends on the listing — see `time_width`.
-fn detail_columns(area: Rect, modified_width: u16) -> [Col; 4] {
+fn detail_columns(area: Rect, modified_width: u16) -> [Col; 5] {
     let margin = config::VIEW_MARGIN.min(area.width);
-    let gap = if area.width.saturating_sub(margin) >= 3 {
+    let gap = if area.width.saturating_sub(margin) >= 4 {
         DETAIL_GAP
     } else {
         0
     };
-    let available = area.width.saturating_sub(margin + 3 * gap);
-    let preferred = [8, config::SIZE_WIDTH, modified_width, config::TYPE_WIDTH];
-    let mut widths = [0; 4];
+    let available = area.width.saturating_sub(margin + 4 * gap);
+    let preferred = [8, 3, config::SIZE_WIDTH, modified_width, config::TYPE_WIDTH];
+    let mut widths = [0; 5];
 
     // Details may share a narrow body with a second pane and the information
     // panel. Every column must therefore be derived from the pane's rectangle;
     // forcing Name to eight cells after allocating the fixed columns lets the
     // row escape its pane and overwrite its neighbours.
     let mut remaining = available;
-    for (width, minimum) in widths.iter_mut().zip([8, 1, 1, 1]) {
+    for (width, minimum) in widths.iter_mut().zip([8, 1, 1, 1, 1]) {
         *width = minimum.min(remaining);
         remaining -= *width;
     }
-    for i in [1, 2, 3, 0] {
+    for i in [1, 2, 3, 4, 0] {
         let extra = remaining.min(preferred[i].saturating_sub(widths[i]));
         widths[i] += extra;
         remaining -= extra;
@@ -1190,11 +1205,11 @@ fn detail_columns(area: Rect, modified_width: u16) -> [Col; 4] {
         x: 0,
         width: 0,
         right_aligned: false,
-    }; 4];
+    }; 5];
     let mut x = area.x + margin;
     for (col, (width, right_aligned)) in cols
         .iter_mut()
-        .zip(widths.into_iter().zip([false, true, true, false]))
+        .zip(widths.into_iter().zip([false, false, true, true, false]))
     {
         *col = Col {
             x,
@@ -1237,12 +1252,18 @@ fn draw_details_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, a
         Rect::new(area.x, head, area.width, 1),
         config::THEME.toolbar.background,
     );
-    let keys = [SortKey::Name, SortKey::Size, SortKey::Date, SortKey::Type];
+    let keys = [
+        Some(SortKey::Name),
+        None,
+        Some(SortKey::Size),
+        Some(SortKey::Date),
+        Some(SortKey::Type),
+    ];
     // A click anywhere up to the next column sorts by this one: the gaps belong
     // to the column on their left, so no cell of the header row is dead.
     let mut hx = area.x;
     for (col, key) in cols.iter().zip(keys) {
-        let arrow = if sort.key == key {
+        let arrow = if Some(sort.key) == key {
             if sort.reverse {
                 config::glyph::SORT_DESC
             } else {
@@ -1254,13 +1275,19 @@ fn draw_details_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, a
         col.draw_text(
             frame.buffer_mut(),
             head,
-            &format!("{}{}", key.label(), arrow),
+            &if let Some(key) = key {
+                format!("{}{}", key.label(), arrow)
+            } else {
+                "Git".to_string()
+            },
             hst,
         );
         let end = col.x + col.width;
-        app.hits
-            .headers
-            .push((Rect::new(hx, head, end - hx, 1), idx, key));
+        if let Some(key) = key {
+            app.hits
+                .headers
+                .push((Rect::new(hx, head, end - hx, 1), idx, key));
+        }
         hx = end;
     }
 
@@ -1318,9 +1345,15 @@ fn draw_details_view(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, a
             cols[0].x + cols[0].width,
             search_needle(app),
         );
-        cols[1].draw_text(frame.buffer_mut(), y, &fs::format_entry_size(e), st);
-        cols[2].draw_text(frame.buffer_mut(), y, &fs::format_time(e.mtime), st);
-        cols[3].draw_text(frame.buffer_mut(), y, &e.type_name(), st);
+        cols[1].draw_text(
+            frame.buffer_mut(),
+            y,
+            &e.git.map(|c| c.to_string()).unwrap_or_default(),
+            st,
+        );
+        cols[2].draw_text(frame.buffer_mut(), y, &fs::format_entry_size(e), st);
+        cols[3].draw_text(frame.buffer_mut(), y, &fs::format_time(e.mtime), st);
+        cols[4].draw_text(frame.buffer_mut(), y, &e.type_name(), st);
 
         if vis == p.cursor {
             // The tree column pushes the icon right: indent, arrow, one blank.
@@ -2465,6 +2498,7 @@ mod tests {
             trash_identity: None,
             depth: 0,
             expanded: false,
+            git: None,
         }
     }
 
@@ -2564,6 +2598,7 @@ mod tests {
             trash_identity: None,
             depth: 2,
             expanded: false,
+            git: None,
         };
         let text = compact_entry_text(&entry);
         assert!(text.starts_with("    "), "compact entry was: {text:?}");
@@ -2857,6 +2892,30 @@ mod tests {
         assert_eq!(
             terminal.backend().buffer().cell((0, 0)).unwrap().symbol(),
             "*"
+        );
+    }
+
+    #[test]
+    fn sidebar_shows_git_status_at_right_edge() {
+        let handle = crate::editor::test_handle();
+        let root = std::env::temp_dir();
+        let mut app = App::new(root.clone());
+        app.enable_editor(root, handle);
+        app.set_editor_layout(EditorLayout::Sidebar);
+        let mut entry = render_test_entry("a-long-name-that-fills-the-sidebar.txt");
+        entry.git = Some('M');
+        app.pane_mut().entries = vec![entry];
+        app.pane_mut().visible = vec![0];
+        app.pane_mut().loading = false;
+        let mut terminal = Terminal::new(TestBackend::new(25, 3)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(
+            terminal.backend().buffer().cell((24, 0)).unwrap().symbol(),
+            "M"
+        );
+        assert_eq!(
+            terminal.backend().buffer().cell((23, 0)).unwrap().symbol(),
+            " "
         );
     }
 

@@ -2722,6 +2722,7 @@ mod tests {
                 trash_identity: None,
                 depth: 0,
                 expanded: false,
+                git: None,
             })
             .collect()
     }
