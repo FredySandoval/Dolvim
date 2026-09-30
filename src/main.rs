@@ -15,6 +15,7 @@ mod open;
 mod ops;
 mod places;
 mod previews;
+mod shared_register;
 mod theme;
 mod thumbs;
 mod ui;
@@ -578,6 +579,16 @@ fn finish_transfer(app: &mut App) -> bool {
         _ => {}
     }
 
+    let mut register_error = None;
+    if let (Some(store), Some(revision)) = (&app.shared_register, &progress.shared_revision) {
+        if progress.kind == ops::TransferKind::Move {
+            let moved: Vec<_> = committed_sources.iter().cloned().collect();
+            if let Err(error) = store.finish_cut(revision, &moved) {
+                register_error = Some(error);
+            }
+        }
+    }
+
     if progress.expected_register.as_ref() == Some(&app.register) {
         match (&progress.kind, &progress.expected_register) {
             (ops::TransferKind::Move, Some(ops::UnnamedRegister::Live { paths, cut: true })) => {
@@ -675,6 +686,12 @@ fn finish_transfer(app: &mut App) -> bool {
         app.error(message);
     } else {
         app.info(format!("{} — {committed} done", progress.label));
+    }
+    if let Some(error) = register_error {
+        app.error(format!(
+            "{}; shared register update failed: {error}",
+            app.status
+        ));
     }
     let reveal_pane_id = reveal.as_ref().map(|intent| intent.pane_id);
     let partial_move = progress.kind == ops::TransferKind::Move
@@ -775,6 +792,64 @@ mod cli_tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn older_background_completion_preserves_republished_shared_selection() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "dolvim-newer-selection-{}-{unique}",
+            std::process::id()
+        ));
+        let destination = root.join("destination");
+        std::fs::create_dir_all(&destination).unwrap();
+        let source = root.join("source.txt");
+        std::fs::write(&source, b"older transfer").unwrap();
+        let store = crate::shared_register::Store::new(root.join("state"));
+        let older = store
+            .publish(
+                crate::shared_register::Intent::Cut,
+                std::slice::from_ref(&source),
+            )
+            .unwrap();
+        let mut progress = ops::start_transfer(
+            vec![source.clone()],
+            destination.clone(),
+            ops::TransferKind::Move,
+        );
+        progress.expected_register = Some(ops::UnnamedRegister::Live {
+            paths: vec![source.clone()],
+            cut: true,
+        });
+        progress.shared_revision = Some(older.revision.clone());
+        let mut app = App::new(root.clone());
+        app.register = progress.expected_register.clone().unwrap();
+        app.shared_register = Some(store);
+        app.begin_observed_transfer(progress, None, destination.clone(), 1);
+        while !app.active_transfer.as_ref().unwrap().progress.is_finished() {
+            std::thread::yield_now();
+        }
+        // Withhold the event-loop reducer until another instance republishes
+        // exactly the same paths. Equality of paths must not consume it.
+        let producer = crate::shared_register::Store::new(root.join("state"));
+        let newer = producer
+            .publish(
+                crate::shared_register::Intent::Cut,
+                std::slice::from_ref(&source),
+            )
+            .unwrap();
+        assert_ne!(older.revision, newer.revision);
+        assert!(finish_transfer(&mut app));
+        assert_eq!(producer.read().unwrap(), Some(newer));
+        assert_eq!(
+            std::fs::read(destination.join("source.txt")).unwrap(),
+            b"older transfer"
+        );
+        assert!(!source.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

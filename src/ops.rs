@@ -134,11 +134,15 @@ const CLIPBOARD_READ_TOOLS: [(&str, &[&str]); 3] = [
 /// Whichever of wl-copy/xclip/xsel exists wins; if none does, OSC 52 puts at
 /// least the newline-joined paths on the terminal's clipboard. No crate, no
 /// daemon — see docs/DECISIONS.md.
-fn export_uris(paths: &[PathBuf]) {
-    let uris: String = paths
+pub fn clipboard_text(paths: &[PathBuf]) -> String {
+    paths
         .iter()
         .map(|p| format!("file://{}\n", percent_encode(&p.to_string_lossy())))
-        .collect();
+        .collect()
+}
+
+fn export_uris(paths: &[PathBuf]) {
+    let uris = clipboard_text(paths);
     for (bin, args) in CLIPBOARD_WRITE_TOOLS {
         if which(bin).is_none() {
             continue;
@@ -154,8 +158,12 @@ fn export_uris(paths: &[PathBuf]) {
             if let Some(mut child_stdin) = clipboard_child.stdin.take() {
                 let _ = child_stdin.write_all(uris.as_bytes());
             }
-            // Selection owners must outlive us; do not wait on them.
-            return;
+            // These tools fork a persistent selection owner by default. Wait
+            // for the launcher to finish acquiring the clipboard, not the
+            // background owner, so an immediate paste cannot see old contents.
+            if clipboard_child.wait().is_ok_and(|status| status.success()) {
+                return;
+            }
         }
     }
     osc52(&uris);
@@ -219,6 +227,49 @@ pub fn which(bin: &str) -> Option<PathBuf> {
 
 /// Read `text/uri-list` back out of the system clipboard, for Paste of files
 /// copied in another application.
+/// None means no readable clipboard, not an externally emptied clipboard.
+pub fn read_clipboard() -> Option<String> {
+    for (bin, args) in CLIPBOARD_READ_TOOLS {
+        if which(bin).is_none() {
+            continue;
+        }
+        if let Ok(output) = std::process::Command::new(bin).args(args).output() {
+            if output.status.success() {
+                return Some(String::from_utf8_lossy(&output.stdout).into_owned());
+            }
+        }
+        // A selection may offer plain text but not URI data. Ask the same
+        // backend before falling back: xsel reports success with empty output
+        // even when X11 has no selection owner, which is not an external clear.
+        let plain_args: &[&str] = match bin {
+            "xclip" => &["-selection", "clipboard", "-o"],
+            "wl-paste" => &["--no-newline"],
+            _ => continue,
+        };
+        if let Ok(output) = std::process::Command::new(bin).args(plain_args).output() {
+            if output.status.success() {
+                return Some(String::from_utf8_lossy(&output.stdout).into_owned());
+            }
+        }
+        return None;
+    }
+    None
+}
+
+pub fn clipboard_paths(text: &str) -> Vec<PathBuf> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if let Some(uri) = line.strip_prefix("file://") {
+                Some(PathBuf::from(percent_decode(uri)))
+            } else {
+                let path = PathBuf::from(line);
+                path.is_absolute().then_some(path)
+            }
+        })
+        .collect()
+}
+
 pub fn import_uris() -> Vec<PathBuf> {
     for (bin, args) in CLIPBOARD_READ_TOOLS {
         if which(bin).is_none() {
@@ -1448,6 +1499,7 @@ pub struct Progress {
     worker: Option<thread::JoinHandle<TransferCompletion>>,
     /// Register state this paste was derived from. Drag transfers leave it None.
     pub expected_register: Option<UnnamedRegister>,
+    pub shared_revision: Option<String>,
     affected_paths: Vec<PathBuf>,
 }
 
@@ -1600,7 +1652,9 @@ pub fn start_transfer(sources: Vec<PathBuf>, dest: PathBuf, kind: TransferKind) 
                 result.cancelled = true;
                 break;
             }
-            let target = match unique_target(&dest.join(file_name_of(source))) {
+            // Display names may contain replacement characters. Destination
+            // identity must use the original native filename instead.
+            let target = match unique_target(&dest.join(source.file_name().unwrap_or_default())) {
                 Ok(target) => target,
                 Err(error) => {
                     result.failed.push(ItemFailure {
@@ -1753,6 +1807,7 @@ fn new_progress(kind: TransferKind, label: String) -> Progress {
         state: Arc::new(TransferState::new()),
         worker: None,
         expected_register: None,
+        shared_revision: None,
         affected_paths: Vec::new(),
     }
 }
@@ -1858,16 +1913,16 @@ fn unique_target(path: &Path) -> io::Result<PathBuf> {
     if !path.exists() {
         return Ok(path.to_path_buf());
     }
-    let stem = path
-        .file_stem()
-        .map(|stem_os| stem_os.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let ext = path
-        .extension()
-        .map(|ext_os| format!(".{}", ext_os.to_string_lossy()))
-        .unwrap_or_default();
+    let stem = path.file_stem().unwrap_or_default();
+    let ext = path.extension();
     for suffix_number in 1..10_000 {
-        let candidate = path.with_file_name(format!("{stem} ({suffix_number}){ext}"));
+        let mut name = stem.to_os_string();
+        name.push(format!(" ({suffix_number})"));
+        if let Some(ext) = ext {
+            name.push(".");
+            name.push(ext);
+        }
+        let candidate = path.with_file_name(name);
         if !candidate.exists() {
             return Ok(candidate);
         }
@@ -2468,6 +2523,37 @@ mod tests {
             failure.remaining,
             Some(UndoOp::RetryCleanup { .. })
         ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transfer_and_collision_preserve_native_filename_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = tmpdir("native-transfer");
+        let name = std::ffi::OsString::from_vec(b"native-\xff.\xfe".to_vec());
+        let source = root.join(&name);
+        let destination = root.join("destination");
+        fs::create_dir(&destination).unwrap();
+        fs::write(&source, b"native contents").unwrap();
+        for kind in [TransferKind::Copy, TransferKind::Copy, TransferKind::Move] {
+            let mut progress = start_transfer(vec![source.clone()], destination.clone(), kind);
+            while !progress.is_finished() {
+                std::thread::yield_now();
+            }
+            let outcome = progress.join().unwrap().expect_completed();
+            assert!(outcome.failed.is_empty());
+            assert_eq!(outcome.committed.len(), 1);
+        }
+        for name in [
+            b"native-\xff.\xfe".as_slice(),
+            b"native-\xff (1).\xfe",
+            b"native-\xff (2).\xfe",
+        ] {
+            let target = destination.join(std::ffi::OsString::from_vec(name.to_vec()));
+            assert_eq!(fs::read(target).unwrap(), b"native contents");
+        }
+        assert!(!source.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

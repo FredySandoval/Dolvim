@@ -313,6 +313,17 @@ fn write_live_register(app: &mut App, cut: bool, verb: &str, empty_message: &str
         return;
     }
     let count = paths.len();
+    if let Some(store) = &app.shared_register {
+        let intent = if cut {
+            crate::shared_register::Intent::Cut
+        } else {
+            crate::shared_register::Intent::Copy
+        };
+        if let Err(error) = store.publish(intent, &paths) {
+            app.error(format!("Cannot publish shared register: {error}"));
+            return;
+        }
+    }
     app.register.set(paths, cut);
     app.info(format!("{verb} {count} item(s)"));
     app.leave_visual();
@@ -1348,12 +1359,56 @@ fn paste_clipboard(app: &mut App) {
         return;
     }
 
-    // Prefer our own clipboard: it knows cut-vs-copy, which uri-list cannot say.
+    let mut shared_revision = None;
+    if let Some(store) = &app.shared_register {
+        let selection = match store.read() {
+            Ok(selection) => selection,
+            Err(error) => {
+                app.error(format!("Cannot read shared register: {error}"));
+                return;
+            }
+        };
+        if let Some(selection) = selection {
+            let clipboard = ops::read_clipboard();
+            let external = selection.clipboard_changed(clipboard.as_deref());
+            if external {
+                let paths = ops::clipboard_paths(clipboard.as_deref().unwrap_or_default());
+                app.register = ops::UnnamedRegister::Live { paths, cut: false };
+            } else {
+                let paths = match selection
+                    .paths
+                    .iter()
+                    .map(|path| path.decode())
+                    .collect::<std::io::Result<Vec<_>>>()
+                {
+                    Ok(paths) => paths,
+                    Err(error) => {
+                        app.error(format!("Cannot decode shared register: {error}"));
+                        return;
+                    }
+                };
+                shared_revision = Some(selection.revision);
+                app.register = ops::UnnamedRegister::Live {
+                    paths,
+                    cut: selection.intent == crate::shared_register::Intent::Cut,
+                };
+            }
+        } else {
+            app.register = ops::UnnamedRegister::Live {
+                paths: ops::read_clipboard()
+                    .as_deref()
+                    .map(ops::clipboard_paths)
+                    .unwrap_or_default(),
+                cut: false,
+            };
+        }
+    }
+
     let (mut paths, cut) = match &app.register {
         ops::UnnamedRegister::Live { paths, cut } => (paths.clone(), *cut),
         ops::UnnamedRegister::Empty | ops::UnnamedRegister::Deleted { .. } => (Vec::new(), false),
     };
-    if paths.is_empty() {
+    if paths.is_empty() && app.shared_register.is_none() {
         paths = ops::import_uris();
     }
     paths = ops::normalize_operands(paths);
@@ -1370,6 +1425,7 @@ fn paste_clipboard(app: &mut App) {
     let item_count = paths.len();
     let mut progress = ops::start_transfer(paths, destination.clone(), transfer_kind);
     progress.expected_register = Some(app.register.clone());
+    progress.shared_revision = shared_revision;
     app.begin_observed_transfer(progress, Some(reveal), destination, item_count);
     // The completion reducer removes only committed move sources from a cut
     // register; failed and cancelled sources stay retryable.
@@ -2800,6 +2856,15 @@ mod tests {
     #[test]
     fn visual_line_yank_commits_register_and_consumes_range() {
         let mut app = test_app();
+        let directory = std::env::temp_dir().join(format!(
+            "dolvim-yank-register-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        app.shared_register = Some(crate::shared_register::Store::new(directory.clone()));
         install_test_entries(&mut app, &["a", "b", "c"]);
         app.pane_mut().view = ViewMode::Compact;
         app.pane_mut().grid_rows = 3;
@@ -2813,6 +2878,19 @@ mod tests {
         assert_eq!(app.mode, Mode::Normal);
         assert!(app.pane().selected.is_empty());
         assert_eq!(app.status, "Yanked 1 item(s)");
+        let published = app
+            .shared_register
+            .as_ref()
+            .unwrap()
+            .read()
+            .unwrap()
+            .unwrap();
+        assert_eq!(published.intent, crate::shared_register::Intent::Copy);
+        assert_eq!(
+            published.paths[0].decode().unwrap(),
+            PathBuf::from("/tmp/b")
+        );
+        std::fs::remove_dir_all(directory).unwrap();
         assert_eq!(
             app.register,
             ops::UnnamedRegister::Live {
