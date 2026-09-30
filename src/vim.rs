@@ -319,7 +319,14 @@ fn write_live_register(app: &mut App, cut: bool, verb: &str, empty_message: &str
         } else {
             crate::shared_register::Intent::Copy
         };
-        if let Err(error) = store.publish(intent, &paths) {
+        let result = if cut {
+            // Preserve the clipboard as-is. If it later changes, paste treats
+            // that as an external copy instead of guessing desktop cut intent.
+            store.publish_with_clipboard(intent, &paths, ops::read_clipboard())
+        } else {
+            store.publish(intent, &paths)
+        };
+        if let Err(error) = result {
             app.error(format!("Cannot publish shared register: {error}"));
             return;
         }

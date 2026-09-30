@@ -198,6 +198,19 @@ impl Store {
     /// Generates the revision internally: publishing identical paths is still
     /// a new selection, not permission for an older paste to consume them.
     pub fn publish(&self, intent: Intent, paths: &[PathBuf]) -> io::Result<Selection> {
+        let clipboard = Some(crate::ops::clipboard_text(paths));
+        self.publish_with_clipboard(intent, paths, clipboard)
+    }
+
+    /// Publishes while recording the desktop clipboard contents associated
+    /// with this selection. Cuts use the pre-existing clipboard snapshot
+    /// because Dolvim deliberately does not export ambiguous desktop cuts.
+    pub fn publish_with_clipboard(
+        &self,
+        intent: Intent,
+        paths: &[PathBuf],
+        clipboard: Option<String>,
+    ) -> io::Result<Selection> {
         static SERIAL: AtomicU64 = AtomicU64::new(0);
         let revision = format!(
             "{}-{}-{}",
@@ -209,7 +222,7 @@ impl Store {
             SERIAL.fetch_add(1, Ordering::Relaxed)
         );
         let mut selection = Selection::new(revision, intent, paths);
-        selection.clipboard = Some(crate::ops::clipboard_text(paths));
+        selection.clipboard = clipboard;
         self.publish_selection(&selection)?;
         Ok(selection)
     }

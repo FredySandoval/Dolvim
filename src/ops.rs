@@ -66,7 +66,12 @@ pub enum UnnamedRegister {
 
 impl UnnamedRegister {
     pub fn set(&mut self, paths: Vec<PathBuf>, cut: bool) {
-        export_uris(&paths);
+        // Desktop file managers use incompatible private formats for cut
+        // intent. Export copies only; Dolvim cuts travel through the shared
+        // register so they can never be mistaken for an external copy.
+        if !cut {
+            export_uris(&paths);
+        }
         *self = if paths.is_empty() {
             Self::Empty
         } else {
