@@ -230,6 +230,10 @@ pub struct Pane {
     /// The Places target this pane is showing, when it is not a plain dir.
     pub target: Target,
     pub entries: Vec<Entry>,
+    pub action_records: Vec<crate::action_history::Record>,
+    pub action_cursor: usize,
+    pub action_detail: bool,
+    pub action_offset: usize,
     /// Indices into `entries`, after hidden/filter, in sort order.
     pub visible: Vec<usize>,
     pub cursor: usize,
@@ -504,6 +508,10 @@ impl Pane {
         Pane {
             id: NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed),
             target: Target::Dir(cwd.clone()),
+            action_records: Vec::new(),
+            action_cursor: 0,
+            action_detail: false,
+            action_offset: 0,
             history: vec![Target::Dir(cwd.clone())],
             place: Target::Dir(cwd.clone()),
             place_histories: Vec::new(),
@@ -547,7 +555,6 @@ impl Pane {
         self.visible.len()
     }
 
-    #[cfg(test)]
     pub fn is_path_expanded(&self, path: &Path) -> bool {
         self.expanded.iter().any(|key| key.path == path)
     }
@@ -1037,6 +1044,7 @@ pub struct App {
     pub input_cursor: usize,
     pub register: UnnamedRegister,
     pub shared_register: Option<crate::shared_register::Store>,
+    pub action_history: Option<crate::action_history::Store>,
     pub undo: Vec<UndoOp>,
     pub status: String,
     pub status_is_error: bool,
@@ -1083,6 +1091,21 @@ pub struct App {
 }
 
 impl App {
+    pub fn record_action(
+        &mut self,
+        operation: crate::action_history::Operation,
+        items: Vec<crate::action_history::Item>,
+    ) {
+        if self.action_history.is_none() || items.is_empty() {
+            return;
+        }
+        let result = crate::action_history::Record::completed(operation, false, items)
+            .and_then(|record| self.action_history.as_ref().unwrap().append(&record));
+        if let Err(error) = result {
+            self.error(format!("{}; history write failed: {error}", self.status));
+        }
+    }
+
     pub fn new(start: PathBuf) -> App {
         let (listing_tx, listing_rx) = channel();
         let lister = Lister::new(listing_tx);
@@ -1103,6 +1126,7 @@ impl App {
             input_cursor: 0,
             register: UnnamedRegister::default(),
             shared_register: crate::shared_register::Store::for_app(),
+            action_history: crate::action_history::Store::for_app(),
             undo: Vec::new(),
             status: String::new(),
             status_is_error: false,
@@ -1429,7 +1453,7 @@ impl App {
     /// tab changes while the worker runs.
     pub fn reveal_intent_for_pane(&self, pane_index: usize, directory: PathBuf) -> RevealIntent {
         let pane = self.pane_at(pane_index);
-        let mode = if pane.view == ViewMode::Compact
+        let mode = if (pane.view == ViewMode::Compact || pane.is_path_expanded(&directory))
             && directory != pane.cwd
             && directory.starts_with(&pane.cwd)
         {
@@ -1572,6 +1596,35 @@ impl App {
                     self.error(message);
                 }
             },
+            Target::History => {
+                let result = self
+                    .action_history
+                    .as_ref()
+                    .map_or(Ok(Vec::new()), |store| store.read());
+                let pane = self.pane_mut();
+                pane.loading = false;
+                pane.entries.clear();
+                pane.visible.clear();
+                pane.selected.clear();
+                match result {
+                    Ok(mut records) => {
+                        records.sort_by(|a, b| {
+                            b.completed_unix_ms
+                                .cmp(&a.completed_unix_ms)
+                                .then_with(|| b.id.cmp(&a.id))
+                        });
+                        pane.action_records = records;
+                        pane.action_cursor = pane
+                            .action_cursor
+                            .min(pane.action_records.len().saturating_sub(1));
+                        pane.error = None;
+                    }
+                    Err(error) => {
+                        pane.action_records.clear();
+                        pane.error = Some(format!("Cannot read History: {error}"));
+                    }
+                }
+            }
             Target::Network => {
                 self.apply_listing(
                     seq,
@@ -1851,6 +1904,7 @@ impl App {
             Target::Trash => PathBuf::from("trash:/"),
             Target::TrashDir { original, .. } => original.clone(),
             Target::Network => PathBuf::from("remote:/"),
+            Target::History => PathBuf::from("history:/"),
             Target::RecentDays(1) => PathBuf::from("recent:/today"),
             Target::RecentDays(_) => PathBuf::from("recent:/yesterday"),
         };
@@ -1875,6 +1929,8 @@ impl App {
             }
             pane.cwd = cwd;
             pane.target = target.clone();
+            pane.action_detail = false;
+            pane.action_offset = 0;
             pane.cursor = 0;
             pane.offset = 0;
             pane.selected.clear();
@@ -2650,16 +2706,33 @@ impl App {
     }
 }
 
-/// Files under `root` modified within `days`, shallow-recursive like Dolphin's
-/// baloo-free fallback. Depth is capped so `Recent` cannot walk a whole disk.
+/// Files under `root` modified on today (1) or yesterday (2), using local
+/// calendar boundaries. Depth is capped so `Recent` cannot walk a whole disk.
 fn recent(root: &Path, days: u32) -> fs::DirectoryListing {
-    let cutoff = fs::now_epoch() - (days as i64) * 86400;
+    let (start, end) = match fs::recent_day_window(days) {
+        Ok(window) => window,
+        Err(error) => {
+            return fs::DirectoryListing {
+                entries: Vec::new(),
+                error: Some(error),
+            }
+        }
+    };
+    recent_in_window(root, start, end)
+}
+
+fn recent_in_window(root: &Path, start: i64, end: i64) -> fs::DirectoryListing {
     let mut out = Vec::new();
     let mut first_error = None;
     let mut queue = vec![(root.to_path_buf(), 0u32)];
     while let Some((dir, depth)) = queue.pop() {
-        if depth > config::RECENT_MAX_DEPTH || out.len() > config::RECENT_MAX_ITEMS {
+        if out.len() >= config::RECENT_MAX_ITEMS {
             break;
+        }
+        if depth > config::RECENT_MAX_DEPTH {
+            // Skip this branch, not the entire search: other queued folders
+            // may still contain eligible files within the depth limit.
+            continue;
         }
         let listing = match fs::read_dir(&dir, 0) {
             Ok(listing) => listing,
@@ -2679,7 +2752,7 @@ fn recent(root: &Path, days: u32) -> fs::DirectoryListing {
             }
             if entry.is_dir() {
                 queue.push((entry.path.clone(), depth + 1));
-            } else if entry.mtime >= cutoff {
+            } else if entry.mtime >= start && entry.mtime < end {
                 out.push(entry);
             }
         }
@@ -2727,6 +2800,62 @@ mod tests {
                 git: None,
             })
             .collect()
+    }
+
+    #[test]
+    fn recent_deep_branch_does_not_skip_shallow_siblings() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "dolvim-recent-depth-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("a-shallow")).unwrap();
+        std::fs::create_dir_all(root.join("z-deep/one/two/three/four")).unwrap();
+        let wanted = root.join("a-shallow/new.txt");
+        std::fs::write(&wanted, "created today").unwrap();
+        let listing = recent_in_window(&root, 0, i64::MAX);
+        assert!(listing.error.is_none());
+        assert!(listing.entries.iter().any(|entry| entry.path == wanted));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recent_filter_includes_start_and_excludes_end() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "dolvim-recent-boundary-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let start = 1_735_776_000;
+        let end = start + 86400;
+        for (name, timestamp) in [
+            ("before", start - 1),
+            ("midnight", start),
+            ("last-second", end - 1),
+            ("next-day", end),
+        ] {
+            let file = std::fs::File::create(root.join(name)).unwrap();
+            file.set_times(std::fs::FileTimes::new().set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(timestamp as u64),
+            ))
+            .unwrap();
+        }
+        let listing = recent_in_window(&root, start, end);
+        assert!(listing.error.is_none());
+        let names: Vec<_> = listing
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["last-second", "midnight"]);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

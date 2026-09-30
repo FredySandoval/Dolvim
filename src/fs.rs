@@ -318,8 +318,8 @@ pub struct Sort {
 impl Default for Sort {
     fn default() -> Self {
         Sort {
-            key: SortKey::Date,
-            reverse: true,
+            key: SortKey::Name,
+            reverse: false,
             dirs_first: true,
         }
     }
@@ -828,6 +828,63 @@ fn civil(epoch: i64) -> CivilTime {
     }
 }
 
+/// Calendar-day boundaries for the Recent views. GNU date handles local
+/// timezone/DST transitions; subtracting 86,400 seconds cannot do that safely.
+pub fn recent_day_window(days: u32) -> Result<(i64, i64), String> {
+    recent_day_window_at(now_epoch(), days, None)
+}
+
+fn recent_day_window_at(now: i64, days: u32, timezone: Option<&str>) -> Result<(i64, i64), String> {
+    let date = |spec: &str, format: &str| -> Result<String, String> {
+        let mut command = Command::new("date");
+        command.args(["--date", spec, format]);
+        if let Some(timezone) = timezone {
+            command.env("TZ", timezone);
+        }
+        let output = command
+            .output()
+            .map_err(|error| format!("Cannot determine local date: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "Cannot determine local date: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+    // Anchor all conversions to one calendar date, even if midnight passes
+    // while the commands run. Midnight conversions use the offset of each day.
+    let today = date(&format!("@{now}"), "+%F")?;
+    let (start, end) = match days {
+        1 => (today.clone(), format!("{today} tomorrow")),
+        2 => (format!("{today} yesterday"), today),
+        _ => return Err("Unsupported Recent calendar-day range".into()),
+    };
+    let parse = |spec: &str| {
+        date(spec, "+%s")?
+            .parse::<i64>()
+            .map_err(|_| "Invalid local midnight timestamp".to_string())
+    };
+    Ok((parse(&start)?, parse(&end)?))
+}
+
+/// Explicit local date heading for the read-only action History view.
+pub fn history_date(epoch: i64) -> String {
+    let date = civil(epoch);
+    let now = now_epoch();
+    let today = civil(now);
+    let yesterday = civil(now - 86400);
+    let key = |d: &CivilTime| (d.year, d.month, d.day);
+    let prefix = if key(&date) == key(&today) {
+        "Today — "
+    } else if key(&date) == key(&yesterday) {
+        "Yesterday — "
+    } else {
+        ""
+    };
+    format!("{prefix}{:04}-{:02}-{:02}", date.year, date.month, date.day)
+}
+
 /// The local calendar year `epoch` falls in.
 pub fn year_of(epoch: i64) -> i64 {
     civil(epoch).year
@@ -1255,10 +1312,11 @@ mod tests {
     }
 
     #[test]
-    fn date_sort_defaults_to_newest_first() {
+    fn default_sort_is_name_ascending_with_directories_first() {
         let sort = Sort::default();
-        assert_eq!(sort.key, SortKey::Date);
-        assert!(sort.reverse);
+        assert_eq!(sort.key, SortKey::Name);
+        assert!(!sort.reverse);
+        assert!(sort.dirs_first);
         assert!(SortKey::Date.default_reverse());
         assert!(!SortKey::Name.default_reverse());
         assert!(!SortKey::Size.default_reverse());
@@ -1312,6 +1370,34 @@ mod tests {
 
     /// The zone is the machine's, so assert the parts the epoch fixes rather
     /// than a rendered string that moves with the tester's `date +%z`.
+    #[test]
+    fn recent_ranges_are_calendar_days_not_rolling_windows() {
+        let now = 1_735_819_200; // Jan 2, 2025 at noon UTC
+        assert_eq!(
+            recent_day_window_at(now, 1, Some("UTC")).unwrap(),
+            (1_735_776_000, 1_735_862_400)
+        );
+        assert_eq!(
+            recent_day_window_at(now, 2, Some("UTC")).unwrap(),
+            (1_735_689_600, 1_735_776_000)
+        );
+    }
+
+    #[test]
+    fn recent_calendar_ranges_follow_daylight_saving_transitions() {
+        for (now, hours) in [(1_743_336_000, 23), (1_761_480_000, 25)] {
+            let (start, end) = recent_day_window_at(now, 1, Some("Europe/Berlin")).unwrap();
+            assert_eq!(end - start, hours * 3600);
+            let (_, yesterday_end) = recent_day_window_at(now, 2, Some("Europe/Berlin")).unwrap();
+            assert_eq!(yesterday_end, start);
+            // On the following date, Yesterday must cover that same short/long day.
+            assert_eq!(
+                recent_day_window_at(end + 12 * 3600, 2, Some("Europe/Berlin")).unwrap(),
+                (start, end)
+            );
+        }
+    }
+
     #[test]
     fn epoch_converts_to_civil_time() {
         let utc = |epoch| {

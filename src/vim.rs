@@ -99,6 +99,35 @@ fn handle_normal_key(app: &mut App, key_event: KeyEvent) {
         return;
     }
 
+    if app.pane().target == Target::History {
+        if key_event.modifiers.is_empty()
+            && matches!(
+                key_event.code,
+                KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('h')
+            )
+        {
+            if app.pane().action_detail {
+                app.pane_mut().action_detail = false;
+                app.pane_mut().action_offset = 0;
+            } else {
+                app.back();
+            }
+        } else if key_event.modifiers.is_empty() && key_event.code == KeyCode::Char('r') {
+            app.reload();
+        } else if key_event.modifiers.is_empty() && key_event.code == KeyCode::Char('g') {
+            if app.pending_chord_leader.take() == Some('g') {
+                app.pane_mut().action_cursor = 0;
+                app.pane_mut().action_offset = 0;
+            } else {
+                app.pending_chord_leader = Some('g');
+            }
+        } else if let Some(action) = lookup_binding(app, key_event) {
+            app.pending_chord_leader = None;
+            run_action(app, action, 1);
+        }
+        return;
+    }
+
     if key_event.code == KeyCode::Esc {
         app.count.clear();
         app.pending_chord_leader = None;
@@ -377,6 +406,35 @@ fn apply_trash_outcome(
     trash_listing: Option<Result<Vec<crate::fs::Entry>, String>>,
     write_register: bool,
 ) {
+    let mut history_items: Vec<_> = outcome
+        .committed
+        .iter()
+        .map(|item| {
+            history_item(
+                crate::action_history::ItemStatus::Succeeded,
+                &item.original_path,
+                None,
+                None,
+            )
+        })
+        .chain(outcome.committed_untracked.iter().map(|item| {
+            history_item(
+                crate::action_history::ItemStatus::Succeeded,
+                &item.path,
+                None,
+                None,
+            )
+        }))
+        .collect();
+    history_items.extend(outcome.failed.iter().map(|failure| {
+        history_item(
+            crate::action_history::ItemStatus::Failed,
+            &failure.path,
+            None,
+            Some(failure.message.clone()),
+        )
+    }));
+    app.record_action(crate::action_history::Operation::Trash, history_items);
     if outcome.committed_len() == 0 {
         let reasons = outcome
             .failed
@@ -920,6 +978,89 @@ pub const fn chord(
 }
 
 pub fn run_action(app: &mut App, action: Action, count: usize) {
+    if app.pane().target == Target::History {
+        match action {
+            Action::Open | Action::MoveRight => {
+                if !app.pane().action_records.is_empty() {
+                    app.pane_mut().action_detail = true;
+                    app.pane_mut().action_offset = 0;
+                }
+                return;
+            }
+            Action::Back | Action::BackOrUp | Action::GoUp | Action::MoveLeft
+                if app.pane().action_detail =>
+            {
+                app.pane_mut().action_detail = false;
+                app.pane_mut().action_offset = 0;
+                return;
+            }
+            Action::MoveDown
+            | Action::MoveUp
+            | Action::PageDown
+            | Action::PageUp
+            | Action::HalfPageDown
+            | Action::HalfPageUp
+            | Action::Top
+            | Action::Bottom => {
+                let pane = app.pane_mut();
+                let step = if matches!(
+                    action,
+                    Action::PageDown | Action::PageUp | Action::HalfPageDown | Action::HalfPageUp
+                ) {
+                    pane.area.height.max(1) as usize
+                } else {
+                    count
+                };
+                let up = matches!(action, Action::MoveUp | Action::PageUp | Action::HalfPageUp);
+                if pane.action_detail {
+                    pane.action_offset = if up {
+                        pane.action_offset.saturating_sub(step)
+                    } else {
+                        pane.action_offset.saturating_add(step)
+                    };
+                } else {
+                    pane.action_cursor = match action {
+                        Action::Top => 0,
+                        Action::Bottom => pane.action_records.len().saturating_sub(1),
+                        _ if up => pane.action_cursor.saturating_sub(step),
+                        _ => pane
+                            .action_cursor
+                            .saturating_add(step)
+                            .min(pane.action_records.len().saturating_sub(1)),
+                    };
+                }
+                return;
+            }
+            Action::Yank
+            | Action::Copy
+            | Action::Cut
+            | Action::DeleteOp
+            | Action::DeleteSelection
+            | Action::Paste
+            | Action::Trash
+            | Action::DeletePerm
+            | Action::Rename
+            | Action::NewFolder
+            | Action::NewFile
+            | Action::Undo
+            | Action::EmptyTrash
+            | Action::EnterVisual
+            | Action::EnterVisualLine
+            | Action::EnterVisualBlock
+            | Action::ToggleSelect
+            | Action::SelectAll
+            | Action::InvertSelect
+            | Action::EnterSearch
+            | Action::SearchNext
+            | Action::SearchPrev
+            | Action::ToggleFilterBar
+            | Action::Properties => {
+                app.error("History is read-only");
+                return;
+            }
+            _ => {}
+        }
+    }
     let extend = app.mode.is_visual();
     let sidebar = app.editor_layout() == Some(crate::editor::Layout::Sidebar);
     let stride = if sidebar {
@@ -1684,6 +1825,73 @@ fn complete_path(app: &mut App) {
     }
 }
 
+fn history_item(
+    status: crate::action_history::ItemStatus,
+    source: &Path,
+    destination: Option<&Path>,
+    error: Option<String>,
+) -> crate::action_history::Item {
+    crate::action_history::Item {
+        status,
+        source: crate::shared_register::NativePath::encode(source),
+        destination: destination.map(crate::shared_register::NativePath::encode),
+        error,
+    }
+}
+
+fn rename_history_effects(op: &ops::UndoOp) -> Vec<crate::action_history::Item> {
+    use crate::action_history::ItemStatus;
+    match op {
+        ops::UndoOp::Rename { from, to } => {
+            vec![history_item(ItemStatus::Succeeded, from, Some(to), None)]
+        }
+        ops::UndoOp::Move { moved_pairs } => moved_pairs
+            .iter()
+            .map(|(from, to)| history_item(ItemStatus::Succeeded, from, Some(to), None))
+            .collect(),
+        ops::UndoOp::UnresolvedRename { effects, operation } => {
+            let mut items: Vec<_> = effects
+                .iter()
+                .map(|effect| {
+                    history_item(
+                        ItemStatus::Incomplete,
+                        &effect.source,
+                        Some(&effect.target),
+                        Some(effect.message.clone()),
+                    )
+                })
+                .collect();
+            if let Some(operation) = operation {
+                items.extend(rename_history_effects(operation));
+            }
+            items
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn record_rename_failure(app: &mut App, paths: &[PathBuf], failure: &ops::OperationFailure) {
+    let mut items = failure
+        .remaining
+        .as_ref()
+        .map(rename_history_effects)
+        .unwrap_or_default();
+    for path in paths {
+        if !items
+            .iter()
+            .any(|item| item.source == crate::shared_register::NativePath::encode(path))
+        {
+            items.push(history_item(
+                crate::action_history::ItemStatus::Failed,
+                path,
+                None,
+                Some(failure.message.clone()),
+            ));
+        }
+    }
+    app.record_action(crate::action_history::Operation::Rename, items);
+}
+
 fn commit_text_input(app: &mut App) {
     let input = app.input.clone();
     let mode = app.mode.clone();
@@ -1723,9 +1931,19 @@ fn commit_text_input(app: &mut App) {
                 app.refresh_in_place();
                 app.select_by_path(&to);
                 app.info(format!("Renamed to {input}"));
+                app.record_action(
+                    crate::action_history::Operation::Rename,
+                    vec![history_item(
+                        crate::action_history::ItemStatus::Succeeded,
+                        &from,
+                        Some(&to),
+                        None,
+                    )],
+                );
             }
             Err(failure) => {
-                app.error(failure.message);
+                app.error(failure.message.clone());
+                record_rename_failure(app, std::slice::from_ref(&from), &failure);
                 if let Some(remaining) = failure.remaining {
                     let affected = ops::unresolved_rename_paths(&remaining);
                     app.undo.push(remaining);
@@ -1737,13 +1955,29 @@ fn commit_text_input(app: &mut App) {
             let rename_paths = app.pane().selected_paths();
             match ops::batch_rename(&rename_paths, &input) {
                 Ok(op) => {
+                    let items = match &op {
+                        ops::UndoOp::Move { moved_pairs } => moved_pairs
+                            .iter()
+                            .map(|(from, to)| {
+                                history_item(
+                                    crate::action_history::ItemStatus::Succeeded,
+                                    from,
+                                    Some(to),
+                                    None,
+                                )
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    app.record_action(crate::action_history::Operation::Rename, items);
                     app.undo.push(op);
                     app.pane_mut().selected.clear();
                     app.refresh_in_place();
                     app.info(format!("Renamed {} item(s)", rename_paths.len()));
                 }
                 Err(failure) => {
-                    app.error(failure.message);
+                    app.error(failure.message.clone());
+                    record_rename_failure(app, &rename_paths, &failure);
                     if let Some(remaining) = failure.remaining {
                         let affected = ops::unresolved_rename_paths(&remaining);
                         app.undo.push(remaining);
@@ -1756,8 +1990,17 @@ fn commit_text_input(app: &mut App) {
             Ok(op) => {
                 let created = intent.directory.join(&input);
                 app.undo.push(op);
-                app.reveal_completed(intent, created);
+                app.reveal_completed(intent, created.clone());
                 app.info(format!("Created {input}"));
+                app.record_action(
+                    crate::action_history::Operation::CreateDirectory,
+                    vec![history_item(
+                        crate::action_history::ItemStatus::Succeeded,
+                        &created,
+                        None,
+                        None,
+                    )],
+                );
             }
             Err(e) => app.error(e),
         },
@@ -1765,8 +2008,17 @@ fn commit_text_input(app: &mut App) {
             Ok(op) => {
                 let created = intent.directory.join(&input);
                 app.undo.push(op);
-                app.reveal_completed(intent, created);
+                app.reveal_completed(intent, created.clone());
                 app.info(format!("Created {input}"));
+                app.record_action(
+                    crate::action_history::Operation::CreateFile,
+                    vec![history_item(
+                        crate::action_history::ItemStatus::Succeeded,
+                        &created,
+                        None,
+                        None,
+                    )],
+                );
             }
             Err(e) => app.error(e),
         },
@@ -1832,6 +2084,7 @@ fn run_ex_command(app: &mut App, line: &str) {
         }
         "hidden" => app.toggle_hidden(),
         "trash" => app.goto(Target::Trash, true),
+        "history" => app.goto(Target::History, true),
         "help" => app.mode = Mode::Help,
         "" => {}
         _ => app.error(format!("Not a command: {cmd}")),
@@ -2269,6 +2522,79 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         panic!("listing did not finish");
+    }
+
+    #[test]
+    fn history_is_persistent_selectable_and_read_only() {
+        use crate::action_history::{ItemStatus, Operation, Record, Store};
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "dolvim-history-view-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::new(root.join("state")).unwrap();
+        let first = Record::completed(
+            Operation::CreateFile,
+            false,
+            vec![history_item(
+                ItemStatus::Succeeded,
+                &root.join("first"),
+                None,
+                None,
+            )],
+        )
+        .unwrap();
+        let mut second = Record::completed(
+            Operation::Trash,
+            false,
+            vec![history_item(
+                ItemStatus::Succeeded,
+                &root.join("second"),
+                None,
+                None,
+            )],
+        )
+        .unwrap();
+        second.completed_unix_ms = first.completed_unix_ms + 1;
+        store.append(&first).unwrap();
+        store.append(&second).unwrap();
+        let mut app = App::new(root.clone());
+        app.action_history = Some(store.clone());
+        run_ex_command(&mut app, "history");
+        assert_eq!(app.pane().action_records, vec![second, first]);
+        run_action(&mut app, Action::MoveDown, 1);
+        assert_eq!(app.pane().action_cursor, 1);
+        run_action(&mut app, Action::Open, 1);
+        assert!(app.pane().action_detail);
+        run_action(&mut app, Action::Back, 1);
+        assert!(!app.pane().action_detail);
+        for action in [
+            Action::Trash,
+            Action::DeletePerm,
+            Action::Paste,
+            Action::Rename,
+            Action::NewFile,
+            Action::NewFolder,
+            Action::Cut,
+            Action::Undo,
+        ] {
+            run_action(&mut app, action, 1);
+            assert_eq!(app.status, "History is read-only");
+            assert_eq!(app.mode, Mode::Normal);
+        }
+        assert_eq!(store.read().unwrap().len(), 2);
+        for (width, height) in [(120, 35), (2, 2), (1, 1)] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| crate::ui::draw(frame, &mut app))
+                .unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4142,6 +4468,51 @@ mod tests {
         assert!(created.is_dir());
         assert!(!root.join("nested").exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn paste_on_expanded_child_preserves_the_tree_in_every_view() {
+        for view in [ViewMode::Details, ViewMode::Compact, ViewMode::Icons] {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "dolvim-expanded-paste-{}-{unique}",
+                std::process::id()
+            ));
+            let folder = root.join("folder");
+            let child = folder.join("test1.txt");
+            let pasted = folder.join("test1 (1).txt");
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(&child, b"payload").unwrap();
+            let mut app = App::new(root.clone());
+            app.pane_mut().view = view;
+            app.pane_mut().expand_live_path(folder.clone());
+            app.pane_mut()
+                .set_entries(crate::fs::read_dir(&root, 0).unwrap().entries);
+            app.pane_mut().cursor = app
+                .pane()
+                .visible
+                .iter()
+                .position(|&i| app.pane().entries[i].path == child)
+                .unwrap();
+            app.register = ops::UnnamedRegister::Live {
+                paths: vec![child.clone()],
+                cut: false,
+            };
+
+            press_char(&mut app, 'p');
+            finish_test_transfer(&mut app);
+            finish_test_listing(&mut app);
+
+            assert_eq!(std::fs::read(&pasted).unwrap(), b"payload");
+            assert_eq!(std::fs::read(&child).unwrap(), b"payload");
+            assert_eq!(app.pane().cwd, root);
+            assert!(app.pane().is_path_expanded(&folder));
+            assert_eq!(app.pane().current().map(|e| &e.path), Some(&pasted));
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

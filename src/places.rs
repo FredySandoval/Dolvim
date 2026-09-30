@@ -18,6 +18,8 @@ pub enum Target {
         backing: PathBuf,
     },
     Network,
+    /// Read-only completed file operations, separate from navigation history.
+    History,
     /// A saved search: entries under `home` modified within N days.
     RecentDays(u32),
 }
@@ -132,6 +134,7 @@ pub fn build() -> Vec<Row> {
     rows.push(place_row("Network", glyph::NETWORK, Target::Network));
 
     section(&mut rows, "Recent");
+    rows.push(place_row("History", glyph::CLOCK, Target::History));
     rows.push(place_row(
         "Modified Today",
         glyph::CLOCK,

@@ -4,6 +4,7 @@
 
 #![forbid(unsafe_code)]
 
+mod action_history;
 mod app;
 mod config;
 mod drag;
@@ -502,6 +503,83 @@ fn transfer_failure_message(
     )
 }
 
+fn append_transfer_history(
+    app: &mut App,
+    kind: ops::TransferKind,
+    affected: &[PathBuf],
+    outcome: &ops::TransferOutcome,
+    panic_message: Option<&str>,
+) -> io::Result<()> {
+    use action_history::{Item, ItemStatus, Operation, Record};
+    let operation = match kind {
+        ops::TransferKind::Copy => Operation::Copy,
+        ops::TransferKind::Move => Operation::Move,
+        ops::TransferKind::Restore => Operation::Restore,
+    };
+    let mut accounted = std::collections::HashSet::new();
+    let mut items = Vec::new();
+    for effect in &outcome.committed {
+        accounted.insert(effect.source.clone());
+        items.push(Item {
+            status: if kind == ops::TransferKind::Move && !effect.source_removed {
+                ItemStatus::Incomplete
+            } else {
+                ItemStatus::Succeeded
+            },
+            source: shared_register::NativePath::encode(&effect.source),
+            destination: Some(shared_register::NativePath::encode(&effect.target)),
+            error: (kind == ops::TransferKind::Move && !effect.source_removed)
+                .then(|| "Destination committed; source remains".into()),
+        });
+    }
+    for failure in outcome.failed.iter().chain(&outcome.cleanup_failed) {
+        accounted.insert(failure.path.clone());
+        items.push(Item {
+            status: ItemStatus::Failed,
+            source: shared_register::NativePath::encode(&failure.path),
+            destination: None,
+            error: Some(failure.message.clone()),
+        });
+    }
+    for retained in &outcome.retained_output {
+        items.push(Item {
+            status: ItemStatus::Incomplete,
+            source: shared_register::NativePath::encode(&retained.source),
+            destination: Some(shared_register::NativePath::encode(&retained.target)),
+            error: Some(retained.message.clone()),
+        });
+        accounted.insert(retained.source.clone());
+    }
+    if outcome.cancelled || panic_message.is_some() {
+        items.extend(
+            // affected_paths includes the destination as its final element;
+            // it is not an unattempted source item.
+            affected[..affected.len().saturating_sub(1)]
+                .iter()
+                .filter(|path| !accounted.contains(*path))
+                .map(|path| Item {
+                    status: ItemStatus::Incomplete,
+                    source: shared_register::NativePath::encode(path),
+                    destination: None,
+                    error: panic_message
+                        .map(|message| format!("Worker panicked: {message}; outcome unknown")),
+                }),
+        );
+    }
+    if items.is_empty() {
+        return Ok(());
+    }
+    let mut record = Record::completed(operation, outcome.cancelled, items)?;
+    if let Some(message) = panic_message {
+        record.diagnostics.push(format!(
+            "Worker panicked: {message}; filesystem may contain untracked effects"
+        ));
+    }
+    app.action_history
+        .as_ref()
+        .map_or(Ok(()), |store| store.append(&record))
+}
+
 /// Collect a finished background transfer: journal it, report it, relist.
 fn finish_transfer(app: &mut App) -> bool {
     let done = app
@@ -692,6 +770,15 @@ fn finish_transfer(app: &mut App) -> bool {
             "{}; shared register update failed: {error}",
             app.status
         ));
+    }
+    if let Err(error) = append_transfer_history(
+        app,
+        progress.kind,
+        &affected_paths,
+        &outcome,
+        panic_message.as_deref(),
+    ) {
+        app.error(format!("{}; history write failed: {error}", app.status));
     }
     let reveal_pane_id = reveal.as_ref().map(|intent| intent.pane_id);
     let partial_move = progress.kind == ops::TransferKind::Move

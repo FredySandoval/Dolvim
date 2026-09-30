@@ -29,6 +29,12 @@ lint:
 test:
 	cargo test
 
+shared-register-test: build
+	python3 tests/shared_register_tmux.py
+
+history-test: build
+	python3 tests/history_tmux.py
+
 behavioral: debug
 	python3 tests/behavioral/run.py --unit
 	python3 tests/behavioral/run.py
@@ -68,4 +74,4 @@ uninstall:
 clean:
 	cargo clean
 
-.PHONY: all build debug run fmt lint test behavioral behavioral-prototype dataflow dataflow.svg check install uninstall clean
+.PHONY: all build debug run fmt lint test shared-register-test history-test behavioral behavioral-prototype dataflow dataflow.svg check install uninstall clean

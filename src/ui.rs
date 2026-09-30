@@ -661,6 +661,10 @@ fn draw_pane(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
         p.area = area;
     }
 
+    if app.pane_at(pane_index).target == crate::places::Target::History {
+        draw_action_history(frame, app, area, pane_index, is_active);
+        return;
+    }
     let mode = app.pane_at(pane_index).view;
     match mode {
         ViewMode::Icons => draw_icons_view(frame, app, area, pane_index, is_active),
@@ -701,6 +705,134 @@ fn draw_pane(frame: &mut Frame, app: &mut App, area: Rect, pane_index: usize) {
             Style::default()
                 .fg(config::THEME.view.secondary)
                 .bg(config::THEME.view.background),
+        );
+    }
+}
+
+fn draw_action_history(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, active: bool) {
+    let pane = app.pane_at_mut(idx);
+    let normal = Style::default()
+        .fg(config::THEME.view.foreground)
+        .bg(config::THEME.view.background);
+    let dim = normal.fg(config::THEME.view.secondary);
+    let selected = if active {
+        config::THEME.selection
+    } else {
+        config::THEME.inactive_selection
+    };
+    let mut lines: Vec<(String, bool, bool)> = Vec::new();
+    let mut cursor_line = 0;
+    if let Some(error) = &pane.error {
+        lines.push((error.clone(), false, false));
+    } else if pane.action_records.is_empty() {
+        lines.push((
+            "No recorded operations yet. Yank selects files; paste records the transfer.".into(),
+            false,
+            false,
+        ));
+    } else if pane.action_detail {
+        let record = &pane.action_records[pane.action_cursor];
+        lines.push((record.summary(), false, true));
+        lines.push((
+            format!(
+                "Completed: {}",
+                fs::format_time((record.completed_unix_ms / 1000) as i64)
+            ),
+            false,
+            false,
+        ));
+        lines.push((
+            format!(
+                "Operation: {:?}  Cancelled: {}",
+                record.operation, record.cancelled
+            ),
+            false,
+            false,
+        ));
+        lines.push((String::new(), false, false));
+        for diagnostic in &record.diagnostics {
+            lines.push((diagnostic.clone(), false, false));
+        }
+        for item in &record.items {
+            let path = item
+                .source
+                .decode()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "[foreign path encoding]".into());
+            lines.push((format!("{:?}: {path}", item.status), false, false));
+            if let Some(destination) = &item.destination {
+                let path = destination
+                    .decode()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| "[foreign path encoding]".into());
+                lines.push((format!("  → {path}"), false, false));
+            }
+            if let Some(error) = &item.error {
+                lines.push((format!("  {error}"), false, false));
+            }
+            lines.push((String::new(), false, false));
+        }
+        lines.push(("Esc / h / Backspace: back to History".into(), false, true));
+    } else {
+        lines.push((
+            "History — Enter: details   r: refresh   Read-only".into(),
+            false,
+            true,
+        ));
+        let mut previous_date = String::new();
+        for (index, record) in pane.action_records.iter().enumerate() {
+            let epoch = (record.completed_unix_ms / 1000) as i64;
+            let date = fs::history_date(epoch);
+            if date != previous_date {
+                lines.push((date.clone(), false, true));
+                previous_date = date;
+            }
+            let focused = index == pane.action_cursor;
+            if focused {
+                cursor_line = lines.len();
+            }
+            lines.push((
+                format!(
+                    "{} {}  {}",
+                    if focused { ">" } else { " " },
+                    record.summary(),
+                    fs::format_time(epoch)
+                ),
+                focused,
+                false,
+            ));
+        }
+        let height = area.height.max(1) as usize;
+        if cursor_line < pane.action_offset {
+            pane.action_offset = cursor_line;
+        }
+        if cursor_line >= pane.action_offset + height {
+            pane.action_offset = cursor_line + 1 - height;
+        }
+    }
+    pane.action_offset = pane
+        .action_offset
+        .min(lines.len().saturating_sub(area.height as usize));
+    for (row, (text, focused, heading)) in lines
+        .iter()
+        .skip(pane.action_offset)
+        .take(area.height as usize)
+        .enumerate()
+    {
+        let style = if *focused {
+            Style::default()
+                .fg(selected.foreground)
+                .bg(selected.background)
+        } else if *heading {
+            dim
+        } else {
+            normal
+        };
+        frame.buffer_mut().set_string(
+            area.x,
+            area.y + row as u16,
+            clip(text, area.width as usize),
+            style,
         );
     }
 }
@@ -1598,6 +1730,11 @@ fn status_bar(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let left = if !app.status.is_empty() {
         app.status.clone()
+    } else if app.pane().target == crate::places::Target::History {
+        format!(
+            "{} recorded operations — read-only",
+            app.pane().action_records.len()
+        )
     } else {
         let p = app.pane();
         let counts = p.counts();
