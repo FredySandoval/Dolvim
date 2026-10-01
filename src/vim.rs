@@ -1347,11 +1347,7 @@ pub fn run_action(app: &mut App, action: Action, count: usize) {
             let k = app.pane().sort.key;
             app.set_sort(k);
         }
-        Action::ToggleDirsFirst => {
-            let p = app.pane_mut();
-            p.sort.dirs_first = !p.sort.dirs_first;
-            p.refilter();
-        }
+        Action::ToggleDirsFirst => app.toggle_dirs_first(),
 
         // tabs
         Action::NewTab => {

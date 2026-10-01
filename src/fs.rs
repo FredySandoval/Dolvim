@@ -283,7 +283,8 @@ fn extension_eq(left: &str, right: &str) -> bool {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SortKey {
     Name,
     Size,
@@ -308,7 +309,7 @@ impl SortKey {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Sort {
     pub key: SortKey,
     pub reverse: bool,

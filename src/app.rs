@@ -1044,6 +1044,8 @@ pub struct App {
     pub input_cursor: usize,
     pub register: UnnamedRegister,
     pub shared_register: Option<crate::shared_register::Store>,
+    pub folder_preferences: Option<crate::folder_preferences::Store>,
+    folder_sorts: HashMap<PathBuf, Sort>,
     pub action_history: Option<crate::action_history::Store>,
     pub undo: Vec<UndoOp>,
     pub status: String,
@@ -1126,6 +1128,8 @@ impl App {
             input_cursor: 0,
             register: UnnamedRegister::default(),
             shared_register: crate::shared_register::Store::for_app(),
+            folder_preferences: crate::folder_preferences::Store::for_app(),
+            folder_sorts: HashMap::new(),
             action_history: crate::action_history::Store::for_app(),
             undo: Vec::new(),
             status: String::new(),
@@ -1159,6 +1163,7 @@ impl App {
             observation_events: Vec::new(),
             next_operation_id: 1,
         };
+        app.restore_folder_sort();
         app.reload();
         app
     }
@@ -1944,6 +1949,7 @@ impl App {
                 pane.pending_focus = None;
             }
         }
+        self.restore_folder_sort();
         if let Some(i) = places::index_of(&self.places, &target) {
             self.places_cursor = i;
         }
@@ -2491,6 +2497,48 @@ impl App {
             pane.sort.reverse = key.default_reverse();
         }
         pane.refilter();
+        self.save_folder_sort();
+    }
+
+    pub fn toggle_dirs_first(&mut self) {
+        let pane = self.pane_mut();
+        pane.sort.dirs_first = !pane.sort.dirs_first;
+        pane.refilter();
+        self.save_folder_sort();
+    }
+
+    fn restore_folder_sort(&mut self) {
+        let sort = if let Target::Dir(path) = &self.pane().target {
+            let path = crate::folder_preferences::directory_key(path);
+            if let Some(store) = &self.folder_preferences {
+                match store.get(&path) {
+                    Ok(sort) => sort,
+                    Err(error) => {
+                        self.error(format!("Cannot load folder sorting: {error}"));
+                        self.folder_sorts.get(&path).copied().unwrap_or_default()
+                    }
+                }
+            } else {
+                self.folder_sorts.get(&path).copied().unwrap_or_default()
+            }
+        } else {
+            Sort::default()
+        };
+        self.pane_mut().sort = sort;
+    }
+
+    fn save_folder_sort(&mut self) {
+        let Target::Dir(path) = &self.pane().target else {
+            return;
+        };
+        let path = crate::folder_preferences::directory_key(path);
+        let sort = self.pane().sort;
+        self.folder_sorts.insert(path.clone(), sort);
+        if let Some(store) = &self.folder_preferences {
+            if let Err(error) = store.set(&path, sort) {
+                self.error(format!("Cannot save folder sorting: {error}"));
+            }
+        }
     }
 
     pub fn toggle_split(&mut self) {
@@ -2546,6 +2594,7 @@ impl App {
     pub fn new_tab(&mut self, dir: PathBuf) {
         self.tabs.push(Tab::new(dir));
         self.active_tab = self.tabs.len() - 1;
+        self.restore_folder_sort();
         self.reload();
     }
 

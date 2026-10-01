@@ -9,6 +9,7 @@ mod app;
 mod config;
 mod drag;
 mod editor;
+mod folder_preferences;
 mod fs;
 mod mouse;
 mod observer;
