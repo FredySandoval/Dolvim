@@ -107,6 +107,7 @@ pub enum Error {
         reason: String,
     },
     NoAssociation(String),
+    NoHeadlessHandler(String),
 }
 
 impl fmt::Display for Error {
@@ -119,6 +120,10 @@ impl fmt::Display for Error {
                 write!(formatter, "Invalid ${variable} command: {reason}")
             }
             Self::NoAssociation(mime) => write!(formatter, "No application associated with {mime}"),
+            Self::NoHeadlessHandler(mime) => write!(
+                formatter,
+                "No terminal application available for {mime}; no graphical display detected"
+            ),
         }
     }
 }
@@ -141,11 +146,19 @@ pub fn resolve(path: &Path) -> Result<Plan, Error> {
         validate_desktop_id(desktop_id)?;
     }
 
-    match route(&mime, default.as_deref())? {
-        Route::System(desktop_id) => Ok(Plan {
+    let terminal = default
+        .as_deref()
+        .and_then(desktop_entry)
+        .is_some_and(|entry| terminal_entry(&entry));
+    let graphical = graphical_display(
+        std::env::var_os("DISPLAY").as_deref(),
+        std::env::var_os("WAYLAND_DISPLAY").as_deref(),
+    );
+    match route_for_session(&mime, default.as_deref(), graphical, terminal)? {
+        Route::System(_) => Ok(Plan {
             program: "xdg-open".into(),
             args: vec![path.as_os_str().to_owned()],
-            terminal: desktop_entry(desktop_id).is_some_and(|entry| terminal_entry(&entry)),
+            terminal,
         }),
         Route::Editor => editor_plan(path),
     }
@@ -166,6 +179,29 @@ fn file_mime(path: &Path) -> Result<String, Error> {
     .ok_or_else(|| Error::MimeQuery("xdg-mime returned no MIME type".into()))?;
     validate_mime(&mime)?;
     Ok(mime)
+}
+
+fn graphical_display(display: Option<&OsStr>, wayland: Option<&OsStr>) -> bool {
+    [display, wayland]
+        .into_iter()
+        .flatten()
+        .any(|value| !value.is_empty())
+}
+
+fn route_for_session<'a>(
+    mime: &str,
+    default: Option<&'a str>,
+    graphical: bool,
+    terminal: bool,
+) -> Result<Route<'a>, Error> {
+    if !graphical && !terminal {
+        return if is_editor_mime(mime) {
+            Ok(Route::Editor)
+        } else {
+            Err(Error::NoHeadlessHandler(mime.to_owned()))
+        };
+    }
+    route(mime, default)
 }
 
 fn route<'a>(mime: &str, default: Option<&'a str>) -> Result<Route<'a>, Error> {
@@ -332,6 +368,36 @@ fn terminal_entry(contents: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn headless_sessions_use_editors_instead_of_graphical_defaults() {
+        for mime in ["text/plain", "application/json", "text/x-rust"] {
+            assert_eq!(
+                route_for_session(mime, Some("gui.desktop"), false, false).unwrap(),
+                Route::Editor
+            );
+        }
+        assert!(matches!(
+            route_for_session("image/png", Some("gui.desktop"), false, false),
+            Err(Error::NoHeadlessHandler(_))
+        ));
+        assert_eq!(
+            route_for_session("image/png", Some("terminal.desktop"), false, true).unwrap(),
+            Route::System("terminal.desktop")
+        );
+        assert_eq!(
+            route_for_session("text/plain", Some("gui.desktop"), true, false).unwrap(),
+            Route::System("gui.desktop")
+        );
+    }
+
+    #[test]
+    fn display_detection_supports_forwarding_and_wayland() {
+        assert!(!graphical_display(None, None));
+        assert!(!graphical_display(Some(OsStr::new("")), None));
+        assert!(graphical_display(Some(OsStr::new("localhost:10.0")), None));
+        assert!(graphical_display(None, Some(OsStr::new("wayland-0"))));
+    }
 
     #[test]
     fn registered_default_always_wins() {
